@@ -180,8 +180,9 @@ std::vector<at::Tensor> token_scan(
                 highp[base+high_offset+prefix]=int8_t((dot-int32_t(low))/65536);
               }
             } else {
-              if(lane==0) overflow_mask=maskp[(int64_t(tile)*N+block)*32+i];
-              overflow_mask=sycl::group_broadcast(sg,overflow_mask,0);
+              // The address is subgroup-uniform. Reading it directly keeps
+              // prefix state independent of a masked source work-item.
+              overflow_mask=maskp[(int64_t(tile)*N+block)*32+i];
               if(valid) {
                 const uint16_t low=lowp[offset];
                 dot=int32_t(low)-((low&0x8000u)?65536:0);
