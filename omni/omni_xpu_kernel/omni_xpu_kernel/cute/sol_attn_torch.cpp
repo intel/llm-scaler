@@ -461,7 +461,7 @@ at::Tensor forward_cute_prepared_impl(
     if constexpr (SelectedOnly) return selected_state;
     else return output;
   };
-  if constexpr (!SelectedOnly && !TokenAugmented && !RowTail) {
+  if constexpr (!SelectedOnly && !TokenAugmented) {
     const auto& queue = c10::xpu::getCurrentXPUStream(q.device().index()).queue();
     const auto selection = omni_xpu::device::get_bmg_selection_unwarned(queue);
     if (selection.physical_sku == omni_xpu::device::BmgSku::b70 && !selection.forced) {
