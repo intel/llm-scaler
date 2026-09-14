@@ -7,6 +7,8 @@
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
 #include <unordered_map>
 #include <vector>
+#include <cstdlib>
+#include <cstring>
 
 using fp16 = sycl::half;
 using namespace sycl::ext::intel::esimd;
@@ -62,6 +64,8 @@ SYCL_ESIMD_FUNCTION simd<fp16, 256> load_tile(
     return vnni<NK>(raw);
 }
 
+#include "qwen38_fp8_grouped_up.h"
+
 void router(sycl::queue& q, const fp16* x, const fp16* w,
             const fp16* sw, fp16* logits, fp16* gate, int m) {
     q.parallel_for<class Q38Fp8Router>(sycl::range<2>(m, E+1),
@@ -87,15 +91,22 @@ void topk(sycl::queue& q, const fp16* logits, int* indices,
             int t = id[0];
             simd<float, E> scores = convert<float>(block_load<fp16, E>(logits+t*E));
             simd<int, E> ids(0, 1);
+            simd<int, E> available = ids;
             simd<float, 16> picked(0.0f);
             float maximum = hmax<float>(scores);
             float sum = 0.0f;
             for (int r = 0; r < K; ++r) {
                 float value = hmax<float>(scores);
                 simd<int, E> candidates(E);
-                candidates.merge(ids, scores == value);
+                candidates.merge(available, scores == value);
                 int index = hmin<int>(candidates);
+                // A NaN maximum matches no lane. Dummy runs (or invalid model
+                // activations) must not turn that into expert E and an OOB read.
+                // Keep distinct, in-range routes even for all -inf/NaN logits;
+                // probabilities still propagate the non-finite arithmetic.
+                if (index == E) index = hmin<int>(available);
                 indices[t*K+r] = index;
+                available.merge(simd<int, E>(E), ids == index);
                 float p = exp(simd<float, 1>(value-maximum))[0];
                 picked[r] = p;
                 sum += p;
@@ -192,6 +203,7 @@ void reduce(sycl::queue& q, const fp16* partial, fp16* out, int m) {
         });
 }
 
+
 bool tensor_ok(const torch::Tensor& t, const torch::Device& dev, at::ScalarType dt) {
     return t.defined() && t.device() == dev && t.scalar_type() == dt &&
         t.layout() == c10::kStrided && t.is_contiguous() &&
@@ -209,7 +221,16 @@ struct Scratch {
 
 class Workspace {
     std::unordered_map<c10::xpu::XPUStream, std::vector<Scratch>> buffers;
+    bool use_grouped_up;
 public:
+    explicit Workspace(int grouped_up_ = -1) {
+        TORCH_CHECK(grouped_up_ >= -1 && grouped_up_ <= 1,
+                    "grouped_up must be -1 (environment), 0, or 1");
+        const char* env = std::getenv("VLLM_XPU_QWEN38_FP8_MOE_GROUPED_UP");
+        TORCH_CHECK(!env || std::strcmp(env, "0") == 0 || std::strcmp(env, "1") == 0,
+                    "VLLM_XPU_QWEN38_FP8_MOE_GROUPED_UP must be 0 or 1");
+        use_grouped_up = grouped_up_ >= 0 ? grouped_up_ != 0 : env && env[0] == '1';
+    }
     // weights: routed up/scale/down/scale, shared up/scale/down/scale, shared gate.
     std::optional<torch::Tensor> try_run(
         const torch::Tensor& x, const torch::Tensor& rw,
@@ -269,8 +290,12 @@ public:
         router(q, half(x), half(rw), half(w[8]), half(b->logits), half(b->gate), m);
         topk(q, half(b->logits), b->indices.data_ptr<int>(), b->probs.data_ptr<float>(), m);
         auto launch = [&]<int I>() {
-            up<I>(q, half(x), byte(w[0]), w[1].data_ptr<float>(), byte(w[4]),
-                  w[5].data_ptr<float>(), b->indices.data_ptr<int>(), half(b->hidden), m);
+            if (use_grouped_up && m >= 2 && m <= 8)
+                grouped_up<I>(q, half(x), byte(w[0]), w[1].data_ptr<float>(), byte(w[4]),
+                      w[5].data_ptr<float>(), b->indices.data_ptr<int>(), half(b->hidden), m);
+            else
+                up<I>(q, half(x), byte(w[0]), w[1].data_ptr<float>(), byte(w[4]),
+                      w[5].data_ptr<float>(), b->indices.data_ptr<int>(), half(b->hidden), m);
             down<I>(q, half(b->hidden), byte(w[2]), w[3].data_ptr<float>(), byte(w[6]),
                     w[7].data_ptr<float>(), b->indices.data_ptr<int>(), b->probs.data_ptr<float>(),
                     half(b->gate), half(b->partial), m);
@@ -285,6 +310,6 @@ public:
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     pybind11::class_<Workspace>(m, "Workspace")
-        .def(pybind11::init<>())
+        .def(pybind11::init<int>(), pybind11::arg("grouped_up") = -1)
         .def("try_run", &Workspace::try_run);
 }
