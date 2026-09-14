@@ -170,6 +170,26 @@ ext_modules.append(
 )
 ### MoE Batch kernels (FP8)
 
+# Qwen3.8 native-width FP8 decode. Separate modules keep the existing model
+# kernels and their ABI unchanged; each can be validated with build-only.
+for module, source in (
+    ("qwen38_fp8_moe_ops", "csrc/moe_batch/qwen38_fp8_moe.sycl"),
+    ("qwen38_fp8_linear_ops", "csrc/xpu/qwen38_fp8_linear.sycl"),
+):
+    ext_modules.append(
+        SyclExtension(
+            name=f"custom_esimd_kernels_vllm.{module}",
+            sources=[source],
+            extra_compile_args={
+                "cxx": ["-O3", "-std=c++20"],
+                "sycl": ["-std=c++20", "-fsycl-targets=spir64",
+                         "-fsycl-device-code-split=per_kernel",
+                         f"-I{torch_include}"],
+            },
+            extra_link_args=["-Wl,-rpath,$ORIGIN/../torch/lib"],
+        )
+    )
+
 ### MoE INT4 Batch kernels (Router, TopK, Up/Down, Finalize) — INT4
 ext_modules.append(
     SyclExtension(

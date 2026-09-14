@@ -29,3 +29,12 @@ def test_sycl_dlink_uses_extension_target_override(monkeypatch):
     assert "-fsycl-targets=spir64_gen" in flags
     assert "-fsycl-targets=spir64_gen,spir64" not in flags
     assert flags.count("-fsycl-targets=spir64_gen") == 1
+
+
+def test_sycl_jit_image_does_not_embed_offline_device_option(monkeypatch):
+    monkeypatch.setenv("TORCH_XPU_ARCH_LIST", "pvc,bmg")
+    flags = build_extension._get_sycl_dlink_flags(
+        [*build_extension._COMMON_SYCL_FLAGS, "-fsycl-targets=spir64"]
+    )
+    assert "-fsycl-targets=spir64" in flags
+    assert not any("-Xs" in flag or "-device" in flag for flag in flags)
