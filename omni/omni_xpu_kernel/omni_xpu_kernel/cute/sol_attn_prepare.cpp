@@ -522,13 +522,6 @@ at::Tensor materialize_routes(
 }
 
 }  // namespace
-
-// Internal cross-translation-unit entry for the optional token composition.
-// Keep the original cutoff implementation and its SYCL kernel unchanged.
-at::Tensor token_cutoff_for_scan(const at::Tensor& hist, int64_t budget) {
-  return token_bin_cutoff(hist, budget);
-}
-
 }  // namespace omni_xpu_sol_attn
 
 TORCH_LIBRARY_FRAGMENT(omni_xpu_sol_attn, m) {

@@ -2,23 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Token selection keeps the maintained CUTE QK fragment. A single subgroup
 // owns its eight query-group rows and streams K64 tiles; no NG x T score
-// matrix or global partial histogram is materialized in the streaming APIs.
-// The optional composition retains exact integer dots in a compact call-local
-// cache, then reconstructs the original FP32 score operations.
+// matrix or global partial histogram is materialized.
 
 template <bool WriteTail> struct SolTokenScanKernel;
-template <bool WriteTail, int CacheMode> struct SolTokenCompactCacheKernel;
 
-template <bool WriteTail, int CacheMode = 0>
+template <bool WriteTail>
 std::vector<at::Tensor> token_scan(
     const at::Tensor& q, const at::Tensor& qs, const at::Tensor& refs,
     const at::Tensor& k, const at::Tensor& ks, const at::Tensor& common, double scale,
-    const at::Tensor& v, const at::Tensor& cutoff, int64_t budget, bool tail,
-    const at::Tensor& low_cache = at::Tensor{},
-    const at::Tensor& high_cache = at::Tensor{},
-    const at::Tensor& mask_cache = at::Tensor{}) {
-  static_assert(CacheMode == 0 || (!WriteTail && CacheMode == 1) ||
-      (WriteTail && CacheMode == 2));
+    const at::Tensor& v, const at::Tensor& cutoff, int64_t budget, bool tail) {
   TORCH_CHECK(q.device().is_xpu() && q.scalar_type()==at::kChar && q.is_contiguous() &&
       q.dim()==4 && q.size(3)==128 && q.size(0)>0 && q.size(1)>0 && q.size(2)>0,
       "Sol token Q must be contiguous INT8 [B,H,NG,128] on XPU");
@@ -65,23 +57,10 @@ std::vector<at::Tensor> token_scan(
   const int vt=WriteTail?checked_int(v.stride(1),"V token stride"):128;
   const float log2scale=float(scale)*1.4426950408889634f;
   const int groups=(NG+7)/8;
-  uint16_t* lowp = nullptr;
-  int8_t* highp = nullptr;
-  uint32_t* maskp = nullptr;
-  if constexpr (CacheMode != 0) {
-    check(low_cache,at::kShort,{B,H,groups,N,512});
-    check(high_cache,at::kChar,{B,H,groups,N,512});
-    check(mask_cache,at::kInt,{B,H,groups,N,32});
-    lowp=reinterpret_cast<uint16_t*>(low_cache.data_ptr<int16_t>());
-    highp=high_cache.data_ptr<int8_t>();
-    maskp=reinterpret_cast<uint32_t*>(mask_cache.data_ptr<int32_t>());
-  }
-  using ScanKernel = std::conditional_t<CacheMode == 0,
-      SolTokenScanKernel<WriteTail>, SolTokenCompactCacheKernel<WriteTail,CacheMode>>;
   auto& queue=c10::xpu::getCurrentXPUStream(q.device().index()).queue();
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<uint32_t,1> counts(sycl::range<1>(WriteTail?8:8*128),cgh);
-    cgh.parallel_for<ScanKernel>(
+    cgh.parallel_for<SolTokenScanKernel<WriteTail>>(
         sycl::nd_range<1>(sycl::range<1>(int64_t(B)*H*groups*16),sycl::range<1>(16)),
         sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>},
         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
@@ -115,10 +94,8 @@ std::vector<at::Tensor> token_scan(
       fill(maximum,std::numeric_limits<float>::lowest());
       typename Collective::FragSPartialRow partial_sum; clear(partial_sum);
       std::array<decltype(aq),4> qregs;
-      if constexpr (CacheMode != 2) {
-        CUTLASS_PRAGMA_UNROLL
-        for(int d=0;d<4;++d) { copy(cq,sq(_,_,_,d),rq); reorder(rq,qregs[d]); }
-      }
+      CUTLASS_PRAGMA_UNROLL
+      for(int d=0;d<4;++d) { copy(cq,sq(_,_,_,d),rq); reorder(rq,qregs[d]); }
       typename Collective::FragARow qscale,reference;
       qscale(0)=lane<8 && q0+lane<NG?qsp[bh*NG+q0+lane]*log2scale:0;
       reference(0)=lane<8 && q0+lane<NG?rp[bh*NG+q0+lane]:-INFINITY;
@@ -130,11 +107,8 @@ std::vector<at::Tensor> token_scan(
         const bool candidate=lane<8 && q0+lane<NG && cp[(int64_t(bh)*NG+q0+lane)*N+block]!=0;
         if(!sycl::any_of_group(sg,candidate)) continue;
         typename Base::FragS acc; clear(acc);
-        static_assert(decltype(acc.size())::value * 16 == 512);
-        if constexpr (CacheMode != 2) {
-          CUTLASS_PRAGMA_UNROLL
-          for(int d=0;d<4;++d) { copy(ck,sk(_,_,_,block,d),rk); reorder(rk,ak); cute::gemm(mma,qregs[d],ak,acc); }
-        }
+        CUTLASS_PRAGMA_UNROLL
+        for(int d=0;d<4;++d) { copy(ck,sk(_,_,_,block,d),rk); reorder(rk,ak); cute::gemm(mma,qregs[d],ak,acc); }
         typename Collective::FragSColumn kscale;
         CUTLASS_PRAGMA_UNROLL
         for(int i=0;i<kscale.size();++i) {
@@ -144,71 +118,24 @@ std::vector<at::Tensor> token_scan(
         auto gc=local_tile(make_identity_tensor(make_shape(NG-q0,T)),make_shape(_64{},_64{}),make_coord(0,block));
         auto coords=tm.partition_C(gc);
         typename Collective::FragS softmax_scores;
-        uint32_t high_offset=0;
         CUTLASS_PRAGMA_UNROLL
         for(int i=0;i<acc.size();++i) {
           const int row=get<0>(coords(i)),key=get<1>(coords(i)),query=q0+row;
           const float ks0=broadcast<1>(kscale,acc,i);
-          float cached_qscale=0,cached_reference=0,cached_cutoff=0;
-          if constexpr (CacheMode != 0) {
-            // All lanes must participate before masked/overflow branches.
-            // A source lane can itself have a masked key in this fragment.
-            cached_qscale=broadcast<0>(qscale,acc,i);
-            cached_reference=broadcast<0>(reference,acc,i);
-            if constexpr (WriteTail) cached_cutoff=broadcast<0>(cutbin,acc,i);
-          }
           float kept_score=-INFINITY;
-          const bool valid=query<NG && key<T && ks0>0 && cp[(int64_t(bh)*NG+query)*N+block];
-          int32_t dot=0;
-          if constexpr (CacheMode != 2) dot=int32_t(acc(i));
-          if constexpr (CacheMode != 0) {
-            const int64_t base=(int64_t(tile)*N+block)*512;
-            const int64_t offset=base+i*16+lane;
-            uint32_t overflow_mask=0;
-            if constexpr (CacheMode == 1) {
-              const uint16_t low=uint16_t(dot);
-              const int32_t extended=int32_t(low)-((low&0x8000u)?65536:0);
-              const bool overflow=valid && dot!=extended;
-              // The entire subgroup participates, including invalid score lanes.
-              sycl::ext::oneapi::group_ballot(sg,overflow).extract_bits(overflow_mask);
-              if(lane==0) maskp[(int64_t(tile)*N+block)*32+i]=overflow_mask;
-              if(valid) lowp[offset]=low;
-              if(overflow) {
-                const uint32_t prefix=sycl::popcount(overflow_mask&((uint32_t(1)<<lane)-1));
-                // A D128 signed-byte dot has magnitude at most2^21, so this
-                // exact high part always fits int8. Division avoids signed shifts.
-                highp[base+high_offset+prefix]=int8_t((dot-int32_t(low))/65536);
-              }
-            } else {
-              // The address is subgroup-uniform. Reading it directly keeps
-              // prefix state independent of a masked source work-item.
-              overflow_mask=maskp[(int64_t(tile)*N+block)*32+i];
-              if(valid) {
-                const uint16_t low=lowp[offset];
-                dot=int32_t(low)-((low&0x8000u)?65536:0);
-                if((overflow_mask>>lane)&1u) {
-                  const uint32_t prefix=sycl::popcount(overflow_mask&((uint32_t(1)<<lane)-1));
-                  dot=int32_t(highp[base+high_offset+prefix])*65536+int32_t(low);
-                }
-              }
-            }
-            high_offset+=sycl::popcount(overflow_mask);
-          }
-          if(valid) {
+          if(query<NG && key<T && ks0>0 && cp[(int64_t(bh)*NG+query)*N+block]) {
             // Histogram and remainder must assign identical bins. Contracting
             // the final score multiply with reference subtraction only in the
             // histogram can move a boundary token and exceed the whole-bin
             // budget. Preserve the shared FP32 rounding sequence in this block.
             #pragma clang fp contract(off)
-            const float score=float(dot)*(CacheMode == 0 ?
-                broadcast<0>(qscale,acc,i) : cached_qscale)*ks0;
+            const float score=float(acc(i))*broadcast<0>(qscale,acc,i)*ks0;
             kept_score=score;
-            const float rel=score-(CacheMode == 0 ?
-                broadcast<0>(reference,acc,i) : cached_reference)+8.0f;
+            const float rel=score-broadcast<0>(reference,acc,i)+8.0f;
             if(rel>=0) {
               const int bin=rel<24.0f?int(rel*4.0f):sycl::min(127,96+int((rel-24.0f)*0.5f));
               if constexpr (WriteTail) {
-                if(bin>=int(CacheMode == 0 ? broadcast<0>(cutbin,acc,i) : cached_cutoff)) {
+                if(bin>=int(broadcast<0>(cutbin,acc,i))) {
                   sycl::atomic_ref<uint32_t,sycl::memory_order::relaxed,sycl::memory_scope::work_group,
                       sycl::access::address_space::local_space> counter(counts[row]);
                   const uint32_t slot=counter.fetch_add(1);
@@ -275,51 +202,4 @@ std::vector<at::Tensor> token_remainder(const at::Tensor& q,const at::Tensor& qs
     const at::Tensor& k,const at::Tensor& ks,const at::Tensor& v,const at::Tensor& common,
     const at::Tensor& cutoff,double scale,int64_t budget,bool tail) {
   return token_scan<true>(q,qs,refs,k,ks,common,scale,v,cutoff,budget,tail);
-}
-
-std::vector<at::Tensor> token_select_remainder(
-    const at::Tensor& q,const at::Tensor& qs,const at::Tensor& refs,
-    const at::Tensor& k,const at::Tensor& ks,const at::Tensor& v,
-    const at::Tensor& common,double scale,int64_t budget,bool tail) {
-  // Validate the complete boundary before sizing or allocating scratch.
-  TORCH_CHECK(q.device().is_xpu() && q.scalar_type()==at::kChar && q.is_contiguous() &&
-      q.dim()==4 && q.size(3)==128 && q.size(0)>0 && q.size(1)>0 && q.size(2)>0,
-      "Sol token Q must be contiguous INT8 [B,H,NG,128] on XPU");
-  const int B=checked_int(q.size(0),"batch"),H=checked_int(q.size(1),"heads"),NG=checked_int(q.size(2),"token groups");
-  TORCH_CHECK(k.device()==q.device() && k.scalar_type()==at::kChar && k.dim()==4 &&
-      k.size(0)==B && k.size(2)==H && k.size(3)==128 && k.stride(3)==1 && k.size(1)>0,
-      "Sol token K must be INT8 [B,T,H,128] with contiguous D on the Q device");
-  const int T=checked_int(k.size(1),"tokens"),N=int((int64_t(T)+63)/64);
-  TORCH_CHECK(NG==(N+1)/2 && std::isfinite(scale),"Sol token groups or scale mismatch");
-  TORCH_CHECK(v.device()==q.device() && v.scalar_type()==at::kChar &&
-      v.sizes()==k.sizes() && v.stride(3)==1,"Sol token V must match the INT8 K carrier");
-  TORCH_CHECK(budget>0 && budget<=256 && budget%64==0,
-      "Sol token budget must be a multiple of 64 through 256");
-  auto check=[&](const at::Tensor& x,at::ScalarType type,at::IntArrayRef shape) {
-    TORCH_CHECK(x.device()==q.device() && x.scalar_type()==type && x.is_contiguous() &&
-        x.sizes()==shape,"Sol token carrier contract mismatch");
-  };
-  check(qs,at::kFloat,{B,H,NG}); check(refs,at::kFloat,{B,H,NG});
-  check(ks,at::kFloat,{B,H,T}); check(common,at::kByte,{B,H,NG,N});
-  auto& queue=c10::xpu::getCurrentXPUStream(q.device().index()).queue();
-  const auto selection=omni_xpu::device::get_bmg_selection_unwarned(queue);
-  if (selection.physical_sku==omni_xpu::device::BmgSku::b70 && !selection.forced) {
-    const uint64_t groups=uint64_t(B)*H*((NG+7)/8);
-    const uint64_t bytes_per_group=uint64_t(N)*(512*3+32*sizeof(uint32_t));
-    const uint64_t memory=queue.get_device().get_info<sycl::info::device::global_mem_size>();
-    // Division avoids overflow for large runtime shapes. Larger calls retain
-    // streaming behavior; no model or captured-sequence dispatch whitelist.
-    if (groups <= (memory/8)/bytes_per_group) {
-      auto low=at::empty({B,H,(NG+7)/8,N,512},q.options().dtype(at::kShort));
-      auto high=at::empty({B,H,(NG+7)/8,N,512},q.options().dtype(at::kChar));
-      auto masks=at::empty({B,H,(NG+7)/8,N,32},q.options().dtype(at::kInt));
-      auto hist=token_scan<false,1>(q,qs,refs,k,ks,common,scale,
-          at::Tensor{},at::Tensor{},0,false,low,high,masks)[0];
-      auto cutoff=omni_xpu_sol_attn::token_cutoff_for_scan(hist,budget);
-      return token_scan<true,2>(q,qs,refs,k,ks,common,scale,v,cutoff,budget,tail,low,high,masks);
-    }
-  }
-  auto hist=token_histogram(q,qs,refs,k,ks,common,scale);
-  auto cutoff=omni_xpu_sol_attn::token_cutoff_for_scan(hist,budget);
-  return token_remainder(q,qs,refs,k,ks,v,common,cutoff,scale,budget,tail);
 }
