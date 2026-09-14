@@ -110,7 +110,6 @@ The focused image installs pinned revisions of:
 - CacheDiT;
 - ComfyUI-GGUF-XPU;
 - ComfyUI-nunchaku-XPU;
-- ComfyUI-SolAttn;
 - ControlNet auxiliary nodes;
 - ComfyUI-OmniXPU.
 
@@ -118,10 +117,18 @@ The Dockerfile is the source of truth for exact revisions. Installing or
 updating nodes through ComfyUI Manager changes the running container and is
 not part of the reproducible image build.
 
-The image enables the Sol-Attn XPU adapter and uses the Sol-Attn implementation
-packaged in `omni_xpu_kernel`; it does not install Triton for the XPU path. Add
-**Patch Sol-Attn** after the model loader to opt a workflow into sparse
-attention. Unsupported tensor contracts retain the original dense path.
+## Sparse attention
+
+Use the built-in **Model Sparse Attention** node (`BlockSparseAttention`) to
+select SOL, SLA or VSA. Connect it after the model loader and any model LoRA
+or sampling-shift nodes, then pass its model output to the guider/sampler.
+ComfyUI-OmniXPU enables eligible XPU calls through Kitchen and the packaged
+native kernels. See [native sparse attention](SPARSE_ATTENTION.md) for the
+matching weights, parameters, execution checks and legacy-node migration.
+
+The old **Patch Sol-Attn** custom node is deprecated for this integration and
+is no longer installed by the focused image build. Existing workflows must
+be migrated explicitly.
 
 ## Omni XPU switches
 
@@ -131,6 +138,7 @@ ComfyUI path when a capability or input is unsupported. Common switches are:
 ```bash
 OMNIXPU_ENABLE=0
 OMNIXPU_ATTENTION=0
+OMNIXPU_SPARSE_ATTENTION=0
 OMNIXPU_NORM=0
 OMNIXPU_FP8_GEMM=0
 OMNIXPU_INT8_FFN=0

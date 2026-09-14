@@ -415,5 +415,7 @@ Portable 的 `python_embeded\Library\bin` 和
   dtype、layout、mask、head dimension 或 GQA contract 回退到 dense
   attention。
 - CUTE 是 build-time 和 runtime 双重 opt-in。
-- Sol-Attn 还需要固定版本的 ComfyUI custom node 和
-  `SOL_ATTN_XPU_EXPERIMENTAL=1`。
+- 旧 Sol custom node 和实验 gate 已退出新集成；使用
+  [ComfyUI 原生 Model Sparse Attention](../docs/SPARSE_ATTENTION.md) 及匹配的
+  Kitchen XPU provider 和完整 sparse API。本文历史 Windows wheel 验收
+  不等于新版原生 SOL/SLA/VSA 的 Windows 验收。

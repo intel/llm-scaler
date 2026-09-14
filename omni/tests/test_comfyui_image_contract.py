@@ -124,14 +124,6 @@ COMPONENT_PINS = {
         "cc0f6236b6c329178ad4ef58452a874e774c7b8e",
     ),
     "COMFY_NUNCHAKU_VERSION": ("NUNCHAKU_VERSION", "1.2.1+xpu.3"),
-    "COMFY_SOL_ATTN_REPOSITORY": (
-        "SOL_ATTN_REPOSITORY",
-        "https://github.com/xiangyuT/ComfyUI-SolAttn_xpu.git",
-    ),
-    "COMFY_SOL_ATTN_COMMIT": (
-        "SOL_ATTN_COMMIT",
-        "5f1c4aac3ca32a00b0b4c15ddbb7cb53fa43344d",
-    ),
 }
 
 
@@ -263,30 +255,21 @@ class ComfyUIImageContractTest(unittest.TestCase):
             dockerfile,
         )
 
-    def test_sol_attn_custom_node_uses_packaged_xpu_backend(self):
-        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    def test_native_sparse_image_has_no_legacy_custom_node_dependency(self):
         validator = load_validator()
-
-        self.assertIn(
-            '"${COMFY_SOL_ATTN_REPOSITORY}" ComfyUI-SolAttn',
-            dockerfile,
-        )
-        self.assertIn(
-            'git -C ComfyUI-SolAttn checkout --detach FETCH_HEAD',
-            dockerfile,
-        )
-        self.assertNotIn("ComfyUI-SolAttn/requirements.txt", dockerfile)
-        self.assertIn("SOL_ATTN_XPU_EXPERIMENTAL=1", dockerfile)
-        self.assertEqual(
-            validator.PINNED_CHECKOUTS["Sol-Attn custom node"],
-            (
-                Path("/llm/ComfyUI/custom_nodes/ComfyUI-SolAttn"),
-                "OMNI_COMFY_SOL_ATTN_REVISION",
-            ),
+        for path in (DOCKERFILE, BUILD_SCRIPT, VALIDATOR):
+            with self.subTest(path=path):
+                content = path.read_text(encoding="utf-8")
+                for legacy in ("ComfyUI-SolAttn", "COMFY_SOL_ATTN", "SOL_ATTN_XPU_EXPERIMENTAL"):
+                    self.assertNotIn(legacy, content)
+        self.assertNotIn("Sol-Attn custom node", validator.PINNED_CHECKOUTS)
+        self.assertTrue(
+            {"sol_attn", "sol_attn_chunked"}
+            <= validator.REQUIRED_KITCHEN_CAPABILITIES
         )
         self.assertEqual(
-            validator.SOL_ATTN_XPU_ADAPTER,
-            Path("/llm/ComfyUI/custom_nodes/ComfyUI-SolAttn/_xpu_fwd.py"),
+            validator.SPARSE_ATTENTION_XPU_ADAPTER,
+            validator.OMNIXPU_ROOT / "adapters" / "sparse_attention.py",
         )
 
     def test_root_readme_omni_links_resolve_to_current_docs_and_assets(self):
@@ -452,7 +435,6 @@ class ComfyUIImageContractTest(unittest.TestCase):
                 "Comfy AIMDO",
                 "GGUF custom node",
                 "combined Nunchaku custom node/runtime",
-                "Sol-Attn custom node",
             },
         )
         self.assertIn(
