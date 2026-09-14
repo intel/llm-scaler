@@ -1057,7 +1057,7 @@ TORCH_LIBRARY_FRAGMENT(omni_xpu_sol_attn, m) {
         "Tensor routes, Tensor tail, Tensor row_state, float scale, Tensor? bias=None, bool fp16=False) -> Tensor");
   m.def("token_remainder(Tensor q, Tensor qs, Tensor refs, Tensor k, Tensor ks, Tensor v, Tensor common, Tensor cutoff, float scale, int budget, bool tail) -> Tensor[]");
   m.def("token_histogram(Tensor q, Tensor qs, Tensor refs, Tensor k, Tensor ks, Tensor common, float scale) -> Tensor");
-  m.def("token_select_remainder(Tensor q, Tensor qs, Tensor refs, Tensor k, Tensor ks, Tensor v, Tensor common, float scale, int budget, bool tail, bool return_cache=False) -> Tensor[]");
+  m.def("token_select_remainder(Tensor q, Tensor qs, Tensor refs, Tensor k, Tensor ks, Tensor v, Tensor common, float scale, int budget, bool tail) -> Tensor[]");
   m.def("centroid_scores(Tensor q, Tensor k, Tensor qs, Tensor ks, float scale) -> Tensor");
   m.def("forward_cute_prepared(Tensor q, Tensor k, Tensor v, Tensor q_scale, "
         "Tensor k_scale, Tensor v_scale, Tensor routes, Tensor tail_state, float scale, "
