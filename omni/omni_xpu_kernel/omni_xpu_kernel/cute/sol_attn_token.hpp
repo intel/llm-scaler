@@ -149,6 +149,14 @@ std::vector<at::Tensor> token_scan(
         for(int i=0;i<acc.size();++i) {
           const int row=get<0>(coords(i)),key=get<1>(coords(i)),query=q0+row;
           const float ks0=broadcast<1>(kscale,acc,i);
+          float cached_qscale=0,cached_reference=0,cached_cutoff=0;
+          if constexpr (CacheMode != 0) {
+            // All lanes must participate before masked/overflow branches.
+            // A source lane can itself have a masked key in this fragment.
+            cached_qscale=broadcast<0>(qscale,acc,i);
+            cached_reference=broadcast<0>(reference,acc,i);
+            if constexpr (WriteTail) cached_cutoff=broadcast<0>(cutbin,acc,i);
+          }
           float kept_score=-INFINITY;
           const bool valid=query<NG && key<T && ks0>0 && cp[(int64_t(bh)*NG+query)*N+block];
           int32_t dot=0;
@@ -191,13 +199,15 @@ std::vector<at::Tensor> token_scan(
             // histogram can move a boundary token and exceed the whole-bin
             // budget. Preserve the shared FP32 rounding sequence in this block.
             #pragma clang fp contract(off)
-            const float score=float(dot)*broadcast<0>(qscale,acc,i)*ks0;
+            const float score=float(dot)*(CacheMode == 0 ?
+                broadcast<0>(qscale,acc,i) : cached_qscale)*ks0;
             kept_score=score;
-            const float rel=score-broadcast<0>(reference,acc,i)+8.0f;
+            const float rel=score-(CacheMode == 0 ?
+                broadcast<0>(reference,acc,i) : cached_reference)+8.0f;
             if(rel>=0) {
               const int bin=rel<24.0f?int(rel*4.0f):sycl::min(127,96+int((rel-24.0f)*0.5f));
               if constexpr (WriteTail) {
-                if(bin>=int(broadcast<0>(cutbin,acc,i))) {
+                if(bin>=int(CacheMode == 0 ? broadcast<0>(cutbin,acc,i) : cached_cutoff)) {
                   sycl::atomic_ref<uint32_t,sycl::memory_order::relaxed,sycl::memory_scope::work_group,
                       sycl::access::address_space::local_space> counter(counts[row]);
                   const uint32_t slot=counter.fetch_add(1);
