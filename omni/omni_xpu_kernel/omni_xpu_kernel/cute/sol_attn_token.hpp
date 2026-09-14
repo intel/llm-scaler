@@ -317,7 +317,10 @@ std::vector<at::Tensor> token_select_remainder(
           at::Tensor{},at::Tensor{},0,false,low,high,masks)[0];
       auto cutoff=omni_xpu_sol_attn::token_cutoff_for_scan(hist,budget);
       auto result=token_scan<true,2>(q,qs,refs,k,ks,common,scale,v,cutoff,budget,tail,low,high,masks);
-      if(return_cache) { result.push_back(low);result.push_back(high);result.push_back(masks); }
+      if(return_cache) {
+        result.push_back(low);result.push_back(high);result.push_back(masks);
+        result.push_back(hist);result.push_back(cutoff);
+      }
       return result;
     }
   }
