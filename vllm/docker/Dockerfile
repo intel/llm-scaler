@@ -240,16 +240,14 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     pip install torch==2.12.0+xpu torchaudio torchvision \
         --index-url https://download.pytorch.org/whl/xpu
 
-# --- patched source trees (vLLM, vllm-xpu-kernels, LMCache, KVWeave, and the
-#     ESIMD kernels) kept in the shipped image for reference / editable-install
-#     dev workflows. These are plain COPY (not bind-mounted): unlike the wheels
+# --- patched source trees (vLLM, vllm-xpu-kernels, and the ESIMD kernels) kept
+#     in the shipped image for reference / editable-install dev workflows.
+#     These are plain COPY (not bind-mounted): unlike the wheels
 #     below, they're meant to persist in the final image. ---
 COPY --from=builder /src/vllm ./vllm
 COPY --from=builder /src/vllm-xpu-kernels ./vllm-xpu-kernels
 COPY --from=builder /src/custom-esimd-kernels-vllm ./custom-esimd-kernels-vllm
-COPY --from=builder /src/LMCache ./lmcache-source
-COPY --from=builder /src/edge-ai-libraries/libraries/kv-quant-offload ./kvweave-source
-COPY ./docker/lmcache_constraints.txt /tmp/lmcache_constraints.txt
+COPY ./docker/lmcache_xpu_runtime_requirements.txt /tmp/lmcache_xpu_runtime_requirements.txt
 
 # --- thin runtime OS deps, vLLM + kernel wheels, lean-core serving deps, and the
 #     triton-xpu fix/shrink all in ONE layer: cleanup must happen in the same RUN
@@ -306,11 +304,7 @@ RUN --mount=type=bind,from=builder,source=/wheels,target=/wheels \
     ln -sf /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so && \
     ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl_openmp.so.0.1 /opt/venv/lib/libccl_openmp.so.0 && \
     ln -sf /opt/venv/lib/libccl_openmp.so.0 /opt/venv/lib/libccl_openmp.so && \
-    sed '/^[[:space:]]*torch[[:space:]]*$/d' \
-        /llm-scaler/vllm/lmcache-source/requirements/common.txt \
-        > /tmp/lmcache-common-no-torch.txt && \
-    pip install -c /tmp/lmcache_constraints.txt \
-        -r /tmp/lmcache-common-no-torch.txt grpcio-tools==1.76.0 && \
+    pip install --no-deps -r /tmp/lmcache_xpu_runtime_requirements.txt && \
     pip install --no-deps --force-reinstall \
         /wheels/kvweave-*.whl \
         /wheels/lmcache-*.whl && \
