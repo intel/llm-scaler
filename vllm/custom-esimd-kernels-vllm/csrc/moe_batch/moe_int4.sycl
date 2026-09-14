@@ -6100,6 +6100,7 @@ torch::Tensor moe_forward_gelu_tanh_int4_decode(
 
 #include "moe_compact160.h"
 #include "moe_m1_workspace.h"
+#include "moe_multi_workspace.h"
 
 TORCH_LIBRARY_FRAGMENT(moe_int4_ops, m) {
     m.def("qwen38_moe_compact160_weight_contract_v1(Tensor[] weights, Device device) -> int", &qwen38_moe_compact160_weight_contract_v1);
@@ -6215,6 +6216,9 @@ TORCH_LIBRARY_IMPL(moe_int4_ops, XPU, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    pybind11::class_<Qwen38MoeMultiWorkspace>(m, "Qwen38MultiWorkspaceDirectV1")
+        .def(pybind11::init<>())
+        .def("try_run", &Qwen38MoeMultiWorkspace::try_run);
     // Direct binding only changes host marshalling; try_run owns all checks.
     pybind11::class_<Qwen38MoeM1Workspace>(m, "Qwen38M1WorkspaceDirectV1")
         .def(pybind11::init<>())

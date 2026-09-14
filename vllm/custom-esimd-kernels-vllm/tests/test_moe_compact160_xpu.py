@@ -81,6 +81,111 @@ def workspace_reference(compact, x, router, scale, weights):
         x, router, scale, *weights, torch.empty_like(x), 10, 1, 512)
 
 
+def multi_workspace():
+    from custom_esimd_kernels_vllm import moe_int4_ops
+    return moe_int4_ops.Qwen38MultiWorkspaceDirectV1()
+
+
+def multi_reference(compact, x, router, scale, weights, grouped):
+    logits = torch.empty(x.shape[0], 512, device=x.device, dtype=x.dtype)
+    torch.ops.custom_esimd_kernels_vllm.esimd_gemm_int4_pgrp(x, router, scale, logits)
+    name = ('moe_forward_compact160_out_v1' if compact == 160 else
+            'moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_compact80' +
+            ('_grouped' if grouped else '') + '_out_v1')
+    return getattr(torch.ops.moe_int4_ops, name)(
+        x, logits, *weights, torch.empty_like(x), 10, 1, 512)
+
+
+@pytest.mark.parametrize('rows', range(2, 9))
+@pytest.mark.parametrize('grouped', (False, True))
+def test_multi_workspace_preserves_router_and_existing_moe(workspace_case, rows, grouped):
+    compact, weights, router, scale, _ = workspace_case
+    workspace = multi_workspace()
+    x = inputs(rows)[0].to('xpu')
+    expected = multi_reference(compact, x, router, scale, weights, grouped)
+    actual = workspace.try_run(x, router, scale, weights, compact, grouped)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_multi_workspace_live_parameter_rebind(workspace_case):
+    compact, weights, router, scale, _ = workspace_case
+    workspace = multi_workspace()
+    live = list(weights)
+    live[0] = torch.nn.Parameter(weights[0].view(torch.int8), requires_grad=False)
+    x = inputs(5)[0].to('xpu')
+    for rebind in (False, True):
+        if rebind:
+            live[0].data = torch.zeros_like(live[0])
+        expected = multi_reference(compact, x, router, scale,
+                                   (live[0].view(torch.uint8), *live[1:]), True)
+        actual = workspace.try_run(x, router, scale, live, compact, True)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_multi_workspace_async_stream_m_and_dlpack_alias(workspace_case):
+    compact, weights, router, scale, _ = workspace_case
+    workspace = multi_workspace()
+    xs = {m: inputs(m)[0].to('xpu') for m in (2, 5, 8)}
+    streams = [torch.xpu.Stream(), torch.xpu.Stream()]
+    parent = torch.xpu.current_stream()
+    for stream in streams:
+        stream.wait_stream(parent)
+    observations, pointers = [], {}
+    for _ in range(3):
+        for s, stream in enumerate(streams):
+            with torch.xpu.stream(stream):
+                for m, x in xs.items():
+                    expected = multi_reference(compact, x, router, scale, weights, True)
+                    actual = workspace.try_run(x, router, scale, weights, compact, True)
+                    pointers[s, m] = actual.data_ptr()
+                    observations.append((actual.clone(), expected))
+    for stream in streams:
+        parent.wait_stream(stream)
+    assert len(set(pointers.values())) == 6
+    for actual, expected in observations:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    previous = workspace.try_run(xs[5], router, scale, weights, compact, True)
+    alias = torch.utils.dlpack.from_dlpack(previous.detach())
+    expected = multi_reference(compact, alias, router, scale, weights, True)
+    actual = workspace.try_run(alias, router, scale, weights, compact, True)
+    assert actual.data_ptr() != alias.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('bad', ('m1', 'm9', 'dtype', 'negative', 'shape', 'alignment', 'device'))
+def test_multi_workspace_rejects_before_modifying_scratch(workspace_case, bad):
+    compact, weights, router, scale, _ = workspace_case
+    workspace = multi_workspace()
+    x = inputs(5)[0].to('xpu')
+    output = workspace.try_run(x, router, scale, weights, compact, True)
+    before = output.clone()
+    if bad in ('m1', 'm9'):
+        x = inputs(int(bad[1:]))[0].to('xpu')
+    elif bad == 'dtype':
+        x = x.float()
+    elif bad == 'negative':
+        scale = torch._neg_view(scale)
+    elif bad == 'shape':
+        weights = (weights[0][:, :-1], *weights[1:])
+    elif bad == 'alignment':
+        x = torch.empty(x.numel() + 1, device=x.device, dtype=x.dtype)[1:].view(x.shape)
+    else:
+        x = x.cpu()
+    assert workspace.try_run(x, router, scale, weights, compact, True) is None
+    torch.testing.assert_close(output, before, rtol=0, atol=0)
+
+
+def test_multi_workspace_detects_modified_output_metadata(workspace_case):
+    compact, weights, router, scale, _ = workspace_case
+    workspace = multi_workspace()
+    x = inputs(5)[0].to('xpu')
+    output = workspace.try_run(x, router, scale, weights, compact, True)
+    torch.xpu.synchronize()
+    output.resize_(1, 2560)
+    with pytest.raises(RuntimeError, match='output cache is inconsistent'):
+        workspace.try_run(x, router, scale, weights, compact, True)
+
+
 def test_m1_workspace_matches_existing_kernels_and_live_rebind(workspace_case):
     compact, weights, router, scale, x = workspace_case
     workspace = make_workspace()
