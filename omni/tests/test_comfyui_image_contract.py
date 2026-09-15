@@ -263,10 +263,8 @@ class ComfyUIImageContractTest(unittest.TestCase):
                 for legacy in ("ComfyUI-SolAttn", "COMFY_SOL_ATTN", "SOL_ATTN_XPU_EXPERIMENTAL"):
                     self.assertNotIn(legacy, content)
         self.assertNotIn("Sol-Attn custom node", validator.PINNED_CHECKOUTS)
-        self.assertTrue(
-            {"sol_attn", "sol_attn_chunked"}
-            <= validator.REQUIRED_KITCHEN_CAPABILITIES
-        )
+        self.assertIn("sol_attn", validator.REQUIRED_KITCHEN_CAPABILITIES)
+        self.assertNotIn("sol_attn_chunked", validator.REQUIRED_KITCHEN_CAPABILITIES)
         self.assertEqual(
             validator.SPARSE_ATTENTION_XPU_ADAPTER,
             validator.OMNIXPU_ROOT / "adapters" / "sparse_attention.py",

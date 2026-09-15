@@ -24,7 +24,22 @@ def installed(monkeypatch, tmp_path):
         __file__=str(package / "__init__.py"),
         _find_extension=lambda: str(library), sol_attn_v2=native,
     )
-    kitchen = SimpleNamespace(sol_attn_is_available=lambda device: device == "xpu")
+    kitchen = SimpleNamespace(
+        sol_attn_is_available=lambda device: device == "xpu",
+        sol_attn_chunked=lambda *args, **kwargs: None,
+    )
+    kitchen_xpu = SimpleNamespace(sol_attn_chunked=lambda *args, **kwargs: None)
+    # Kitchen 0.2.33 registers sol_attn; the chunked entry point bypasses the
+    # registry. Keep this fixture independent of the validator's required set.
+    backend = {
+        "available": True,
+        "capabilities": [
+            "dequantize_gguf", "dequantize_int8_simple",
+            "dequantize_int8_simple_dtype", "int8_linear", "mm_int8",
+            "quantize_int8_rowwise", "quantize_int8_tensorwise",
+            "svdquant_w4a16_linear", "sol_attn",
+        ],
+    }
     upstream = SimpleNamespace(
         __file__=str(validator.COMFYUI_ROOT / "comfy_extras/nodes_sparse_attention.py"),
         BlockSparseAttention=SimpleNamespace(
@@ -37,6 +52,8 @@ def installed(monkeypatch, tmp_path):
     for name, module in (
         ("torch", SimpleNamespace(device=lambda name: name)),
         ("comfy_kitchen", kitchen),
+        ("comfy_kitchen.backends", SimpleNamespace(xpu=kitchen_xpu)),
+        ("comfy_kitchen.backends.xpu", kitchen_xpu),
         ("omni_xpu_kernel", SimpleNamespace(cute=cute)),
         ("omni_xpu_kernel.cute", cute),
         ("_test_sparse_adapter", adapter),
@@ -46,11 +63,13 @@ def installed(monkeypatch, tmp_path):
         monkeypatch.delenv(switch, raising=False)
     return SimpleNamespace(
         validator=validator, native=native, cute=cute, kitchen=kitchen,
+        kitchen_xpu=kitchen_xpu, backend=backend,
         upstream=upstream, adapter=adapter, adapter_path=adapter_path, library=library,
     )
 
 
 def test_native_admission_succeeds_without_legacy_node_or_gate(installed):
+    installed.validator.require_kitchen_xpu_capabilities(installed.backend)
     result = installed.validator.require_native_sparse_attention_backend(installed.adapter_path)
     assert result == {
         "node_id": "BlockSparseAttention",
@@ -58,6 +77,31 @@ def test_native_admission_succeeds_without_legacy_node_or_gate(installed):
         "library": str(installed.library),
         "library_sha256": hashlib.sha256(installed.library.read_bytes()).hexdigest(),
     }
+
+
+def test_unavailable_kitchen_backend_cannot_pass(installed):
+    installed.backend["available"] = False
+    with pytest.raises(RuntimeError, match="Kitchen XPU backend is unavailable"):
+        installed.validator.require_kitchen_xpu_capabilities(installed.backend)
+
+
+@pytest.mark.parametrize("capability", ["sol_attn", "mm_int8"])
+def test_missing_registered_capability_cannot_pass(installed, capability):
+    installed.backend["capabilities"].remove(capability)
+    with pytest.raises(RuntimeError, match=capability):
+        installed.validator.require_kitchen_xpu_capabilities(installed.backend)
+
+
+@pytest.mark.parametrize("layer", ["kitchen", "kitchen_xpu"])
+@pytest.mark.parametrize("missing", [False, True])
+def test_missing_or_noncallable_chunked_entry_point_cannot_pass(installed, layer, missing):
+    module = getattr(installed, layer)
+    if missing:
+        del module.sol_attn_chunked
+    else:
+        module.sol_attn_chunked = None
+    with pytest.raises(RuntimeError, match="sol_attn_chunked"):
+        installed.validator.require_native_sparse_attention_backend(installed.adapter_path)
 
 
 @pytest.mark.parametrize("switch", ["OMNIXPU_ENABLE", "OMNIXPU_SPARSE_ATTENTION"])

@@ -36,7 +36,6 @@ REQUIRED_KITCHEN_CAPABILITIES = {
     "quantize_int8_tensorwise",
     "svdquant_w4a16_linear",
     "sol_attn",
-    "sol_attn_chunked",
 }
 
 PINNED_CHECKOUTS = {
@@ -240,6 +239,17 @@ def add_comfyui_to_import_path() -> None:
         sys.path.insert(0, comfyui_root)
 
 
+def require_kitchen_xpu_capabilities(backend: dict) -> None:
+    if not backend["available"]:
+        raise RuntimeError(f"Kitchen XPU backend is unavailable: {backend}")
+    missing = REQUIRED_KITCHEN_CAPABILITIES - set(backend["capabilities"])
+    if missing:
+        raise RuntimeError(
+            "Kitchen XPU backend is missing required capabilities: "
+            + ", ".join(sorted(missing))
+        )
+
+
 def require_native_sparse_attention_backend(
     adapter_path: Path = SPARSE_ATTENTION_XPU_ADAPTER,
 ) -> dict[str, str]:
@@ -251,6 +261,7 @@ def require_native_sparse_attention_backend(
     """
     import torch
     import comfy_kitchen
+    from comfy_kitchen.backends import xpu as kitchen_xpu
     from omni_xpu_kernel import cute
     from omni_xpu_kernel.cute import sol_attn_v2
 
@@ -261,6 +272,10 @@ def require_native_sparse_attention_backend(
         raise RuntimeError("packaged complete quantized Sol/SLA/VSA API is unavailable")
     if not comfy_kitchen.sol_attn_is_available(torch.device("xpu")):
         raise RuntimeError("Kitchen native sparse attention is unavailable on XPU")
+    # Chunked dispatch is a direct API, not a registered Kitchen capability.
+    for label, module in (("Kitchen", comfy_kitchen), ("Kitchen XPU", kitchen_xpu)):
+        if not callable(getattr(module, "sol_attn_chunked", None)):
+            raise RuntimeError(f"{label} sol_attn_chunked entry point is unavailable")
 
     extension = cute._find_extension()
     library = Path(extension).resolve()
@@ -836,18 +851,7 @@ def main() -> None:
 
     require_aimdo_xpu_devices(comfy_aimdo.control)
 
-    backend = comfy_kitchen.list_backends()["xpu"]
-    if not backend["available"]:
-        raise RuntimeError(f"Kitchen XPU backend is unavailable: {backend}")
-
-    capabilities = set(backend["capabilities"])
-    missing = REQUIRED_KITCHEN_CAPABILITIES - capabilities
-    if missing:
-        raise RuntimeError(
-            "Kitchen XPU backend is missing required capabilities: "
-            + ", ".join(sorted(missing))
-        )
-
+    require_kitchen_xpu_capabilities(comfy_kitchen.list_backends()["xpu"])
     sol_attn_backend = require_native_sparse_attention_backend()
 
     audio = torch.linspace(-1.0, 1.0, 1600, device="xpu").unsqueeze(0)

@@ -201,8 +201,9 @@ the managed Kitchen GGUF/W4A16 capabilities. It additionally fails closed if
 the oneDNN manifest, checked-in patch, installed runtime DSO, or
 `libdnnl.so.3` symlink does not match the identities recorded by the image.
 On XPU it also requires the native `BlockSparseAttention` source/schema,
-compatible OmniXPU eligibility adapter, Kitchen `sol_attn` and
-`sol_attn_chunked` capabilities, and the complete packaged quantized
+compatible OmniXPU eligibility adapter, Kitchen's registered `sol_attn`
+capability, callable `sol_attn_chunked` entry points in Kitchen and its XPU
+backend, and the complete packaged quantized
 SOL/SLA/VSA API. It records the installed CUTE DSO hash and rejects an external
 library override. Actual node registration and generated media remain workflow
 lifecycle checks. The legacy Sol custom node, its source pins and experimental
