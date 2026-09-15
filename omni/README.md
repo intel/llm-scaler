@@ -56,7 +56,7 @@ IMAGE=llm-scaler-omni:0.2.0-b2-comfyui-bmg
 sudo docker run --rm \
     --device=/dev/dri \
     "$IMAGE" \
-    python /llm/tools/validate_comfyui_image.py
+    /llm/entrypoints/validate_comfyui_image.sh
 ```
 
 The check verifies package identity, the Torch ABI, native AOT target, clean

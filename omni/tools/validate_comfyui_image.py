@@ -83,9 +83,11 @@ REQUIRED_MINIMAX_H3_TEMPLATES = {
 }
 PINNED_MINIMAX_H3_TEMPLATE_HASHES = {
     "video_minimax_h3_t2v.json": (
-        "eb9cc8c78a4e83a2657c9926677b6353db0ed2947d91da736e9cdae194a3db4a"
+        "2400b01a7c8acae3fed038c0372f08bacb90d2cdf915febadbe7e3f9802506ea"
     ),
 }
+
+EXPECTED_LINUX_AIMDO_ALLOCATOR_MODE = "native_hook"
 
 COMFYUI_ROOT = Path("/llm/ComfyUI")
 COMFYUI_DATABASE_DIRECTORY = COMFYUI_ROOT / "user"
@@ -676,7 +678,7 @@ def main() -> None:
         require_equal(
             "Comfy AIMDO Linux allocator mode",
             str(comfy_aimdo.control.get_xpu_allocator_mode()),
-            "global",
+            EXPECTED_LINUX_AIMDO_ALLOCATOR_MODE,
         )
         if not getattr(comfy_aimdo.control, "_xpu_allocator_ready", False):
             raise RuntimeError("Comfy AIMDO Linux allocator takeover is not ready")
