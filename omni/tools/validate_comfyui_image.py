@@ -684,8 +684,14 @@ def main() -> None:
             raise RuntimeError("Comfy AIMDO Linux allocator takeover is not ready")
         if getattr(comfy_aimdo.control, "lib", None) is None:
             raise RuntimeError("Comfy AIMDO Linux native runtime is not loaded")
-        if getattr(comfy_aimdo.control, "_torch_allocator", None) is None:
-            raise RuntimeError("Comfy AIMDO Linux Torch allocator is not installed")
+        torch_allocator = getattr(comfy_aimdo.control, "_torch_allocator", None)
+        if EXPECTED_LINUX_AIMDO_ALLOCATOR_MODE == "global":
+            if torch_allocator is None:
+                raise RuntimeError("Comfy AIMDO Linux Torch allocator is not installed")
+        elif torch_allocator is not None:
+            raise RuntimeError(
+                "Comfy AIMDO Linux native_hook must retain Torch's allocator"
+            )
     missing_aimdo_tests = sorted(
         name
         for name in AIMDO_REQUIRED_XPU_TESTS

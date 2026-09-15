@@ -584,6 +584,10 @@ class ComfyUIImageContractTest(unittest.TestCase):
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
         validator = load_validator()
         self.assertEqual(
+            validator.EXPECTED_LINUX_AIMDO_ALLOCATOR_MODE,
+            "native_hook",
+        )
+        self.assertEqual(
             validator.PINNED_MINIMAX_H3_TEMPLATE_HASHES[
                 "video_minimax_h3_t2v.json"
             ],
