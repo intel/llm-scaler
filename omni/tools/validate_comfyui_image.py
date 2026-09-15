@@ -35,6 +35,7 @@ REQUIRED_KITCHEN_CAPABILITIES = {
     "quantize_int8_rowwise",
     "quantize_int8_tensorwise",
     "svdquant_w4a16_linear",
+    "sol_attn",
 }
 
 PINNED_CHECKOUTS = {
@@ -57,10 +58,6 @@ PINNED_CHECKOUTS = {
     "combined Nunchaku custom node/runtime": (
         Path("/llm/ComfyUI/custom_nodes/ComfyUI-nunchaku-XPU"),
         "OMNI_COMFY_NUNCHAKU_REVISION",
-    ),
-    "Sol-Attn custom node": (
-        Path("/llm/ComfyUI/custom_nodes/ComfyUI-SolAttn"),
-        "OMNI_COMFY_SOL_ATTN_REVISION",
     ),
 }
 
@@ -122,9 +119,7 @@ ONEDNN_PROVENANCE_FIELDS = {
     "library_path",
     "library_sha256",
 }
-SOL_ATTN_XPU_ADAPTER = (
-    Path("/llm/ComfyUI/custom_nodes/ComfyUI-SolAttn") / "_xpu_fwd.py"
-)
+SPARSE_ATTENTION_XPU_ADAPTER = OMNIXPU_ROOT / "adapters" / "sparse_attention.py"
 
 
 def require_equal(label: str, actual: str, expected: str) -> None:
@@ -244,44 +239,81 @@ def add_comfyui_to_import_path() -> None:
         sys.path.insert(0, comfyui_root)
 
 
-def require_sol_attn_xpu_backend(
-    adapter_path: Path = SOL_ATTN_XPU_ADAPTER,
-) -> dict[str, str]:
-    """Require the installed custom node to use the packaged CUTE backend."""
+def require_kitchen_xpu_capabilities(backend: dict) -> None:
+    if not backend["available"]:
+        raise RuntimeError(f"Kitchen XPU backend is unavailable: {backend}")
+    missing = REQUIRED_KITCHEN_CAPABILITIES - set(backend["capabilities"])
+    if missing:
+        raise RuntimeError(
+            "Kitchen XPU backend is missing required capabilities: "
+            + ", ".join(sorted(missing))
+        )
 
-    require_equal(
-        "Sol-Attn XPU experimental gate",
-        os.environ.get("SOL_ATTN_XPU_EXPERIMENTAL", ""),
-        "1",
-    )
+
+def require_native_sparse_attention_backend(
+    adapter_path: Path = SPARSE_ATTENTION_XPU_ADAPTER,
+) -> dict[str, str]:
+    """Check the built-in node and its complete packaged Kitchen XPU backend.
+
+    This runs after XPU admission. It checks adapter compatibility and native
+    availability; actual node registration and video execution remain workflow
+    lifecycle gates.
+    """
+    import torch
+    import comfy_kitchen
+    from comfy_kitchen.backends import xpu as kitchen_xpu
+    from omni_xpu_kernel import cute
+    from omni_xpu_kernel.cute import sol_attn_v2
+
+    for switch in ("OMNIXPU_ENABLE", "OMNIXPU_SPARSE_ATTENTION"):
+        if os.environ.get(switch, "1") == "0":
+            raise RuntimeError(f"native sparse attention is disabled by {switch}")
+    if not sol_attn_v2.is_available():
+        raise RuntimeError("packaged complete quantized Sol/SLA/VSA API is unavailable")
+    if not comfy_kitchen.sol_attn_is_available(torch.device("xpu")):
+        raise RuntimeError("Kitchen native sparse attention is unavailable on XPU")
+    # Chunked dispatch is a direct API, not a registered Kitchen capability.
+    for label, module in (("Kitchen", comfy_kitchen), ("Kitchen XPU", kitchen_xpu)):
+        if not callable(getattr(module, "sol_attn_chunked", None)):
+            raise RuntimeError(f"{label} sol_attn_chunked entry point is unavailable")
+
+    extension = cute._find_extension()
+    library = Path(extension).resolve()
+    package_directory = Path(cute.__file__).resolve().parent
+    if (
+        not extension
+        or not library.is_file()
+        or not library.is_relative_to(package_directory)
+    ):
+        raise RuntimeError(
+            "sparse attention DSO must belong to the installed CUTE package: "
+            f"{library}"
+        )
     if not adapter_path.is_file():
-        raise RuntimeError(f"Sol-Attn XPU adapter is missing: {adapter_path}")
+        raise RuntimeError(f"OmniXPU sparse attention adapter is missing: {adapter_path}")
     spec = importlib.util.spec_from_file_location(
-        "_omni_installed_sol_attn_xpu_adapter",
-        adapter_path,
+        "_omni_installed_sparse_attention_adapter", adapter_path,
     )
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load Sol-Attn XPU adapter: {adapter_path}")
+        raise RuntimeError(f"cannot load OmniXPU sparse attention adapter: {adapter_path}")
     adapter = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(adapter)
-    if not adapter.backend_available():
-        raise RuntimeError(
-            "installed Sol-Attn XPU backend is unavailable: "
-            f"{adapter.backend_error()}"
-        )
-    require_equal("Sol-Attn XPU backend", adapter._BACKEND, "omni-cute")
-    library = Path(adapter._LOADED_LIBRARY).resolve()
-    if not library.is_file():
-        raise RuntimeError(f"Sol-Attn packaged CUTE DSO is missing: {library}")
+    applied, reason = adapter.apply()
+    if not applied:
+        raise RuntimeError(f"native sparse attention adapter is unavailable: {reason}")
+    upstream = adapter._upstream_module()
     require_equal(
-        "Sol-Attn packaged CUTE DSO SHA256",
-        file_sha256(library),
-        adapter._LOADED_LIBRARY_SHA256,
+        "native sparse node source",
+        str(Path(upstream.__file__).resolve()),
+        str((COMFYUI_ROOT / "comfy_extras" / "nodes_sparse_attention.py").resolve()),
     )
+    schema = upstream.BlockSparseAttention.define_schema()
+    require_equal("native sparse node ID", schema.node_id, "BlockSparseAttention")
     return {
-        "backend": adapter._BACKEND,
+        "node_id": schema.node_id,
+        "backend": "kitchen-xpu/omni-cute",
         "library": str(library),
-        "library_sha256": adapter._LOADED_LIBRARY_SHA256,
+        "library_sha256": file_sha256(library),
     }
 
 
@@ -558,7 +590,6 @@ def main() -> None:
         require_equal("llm-scaler source dirty", source_dirty, "false")
     for label, (path, environment_variable) in PINNED_CHECKOUTS.items():
         require_checkout_revision(label, path, os.environ[environment_variable])
-    sol_attn_backend = require_sol_attn_xpu_backend()
 
     require_equal(
         "Comfy AIMDO distribution version",
@@ -820,17 +851,8 @@ def main() -> None:
 
     require_aimdo_xpu_devices(comfy_aimdo.control)
 
-    backend = comfy_kitchen.list_backends()["xpu"]
-    if not backend["available"]:
-        raise RuntimeError(f"Kitchen XPU backend is unavailable: {backend}")
-
-    capabilities = set(backend["capabilities"])
-    missing = REQUIRED_KITCHEN_CAPABILITIES - capabilities
-    if missing:
-        raise RuntimeError(
-            "Kitchen XPU backend is missing required capabilities: "
-            + ", ".join(sorted(missing))
-        )
+    require_kitchen_xpu_capabilities(comfy_kitchen.list_backends()["xpu"])
+    sol_attn_backend = require_native_sparse_attention_backend()
 
     audio = torch.linspace(-1.0, 1.0, 1600, device="xpu").unsqueeze(0)
     resampled_audio = torchaudio.functional.resample(audio, 16000, 24000)

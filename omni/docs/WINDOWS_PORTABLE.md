@@ -1,6 +1,20 @@
 # Windows Intel XPU ComfyUI Portable 部署
 
-本文定义当前 ComfyUI Intel Portable 的安装、运行时策略和验收合同。
+本文保留 ComfyUI Intel Portable 0.34.0 的安装、运行时策略和历史验收记录。
+
+升级到 ComfyUI 0.35.0 或更高版本时，可以参考本文的 Windows 安装与运行时
+配置，并结合 Ubuntu 侧的 [ComfyUI 更新说明](COMFYUI.md#omni-xpu-switches)、
+[组件构建配置](IMAGE_BUILD.md#build-inputs) 和
+[原生稀疏节点指南](SPARSE_ATTENTION.md) 尝试迁移。根据目标版本选择配套的
+Kitchen/AIMDO providers、Omni native wheel 和 ComfyUI-OmniXPU，使用对应的
+Windows 构建，并按本文第 10、11 节完成安装态检查和工作流验证。
+
+> **稀疏节点迁移。** ComfyUI 0.35.0 或更高版本搭配匹配的 Omni XPU 栈，
+> 使用原生 **Model Sparse Attention**，见 [使用及迁移指南](SPARSE_ATTENTION.md)。
+> 本页固定的 0.34.0 / Kitchen 0.2.31 / 历史 wheel 不能作为新原生
+> SOL/SLA/VSA 路径的 Windows 验收依据。旧 custom-node 安装和 gate 步骤
+> 已退出当前使用指导；原版本、revision、wheel hash 和测试结果仍保留。
+> 新原生路径的 Windows provider、wheel 和工作流需单独配套验证。
 
 > [!IMPORTANT]
 > 当前目标必须保留 Portable 自带的 Python 3.13.14、Torch 2.13.0+xpu、
@@ -27,7 +41,7 @@
 | official comfy-aimdo | `0.4.15` |
 | comfy-aimdo XPU provider | `0.4.15` / `4972231de3141ccaf26cb44818a4977fcecf55ab` |
 | ComfyUI-OmniXPU | 当前 `llm-scaler` source |
-| ComfyUI-SolAttn | `5f1c4aac3ca32a00b0b4c15ddbb7cb53fa43344d` |
+| 旧 Sol custom node（历史，已过时） | `5f1c4aac3ca32a00b0b4c15ddbb7cb53fa43344d` |
 
 当前 kernel wheel：
 
@@ -48,7 +62,6 @@ oneDNN runtime。
 | Official API | `comfy-kitchen`、`comfy-aimdo` | ComfyUI 使用的官方 package contract |
 | XPU providers | `comfy-kitchen-xpu-runtime`、`comfy-aimdo-xpu-runtime` | 与官方版本共存的 Intel XPU implementation |
 | ComfyUI adapter | `ComfyUI-OmniXPU` | provider bootstrap、attention、norm、FP8 和 INT8 路由 |
-| Sol-Attn dispatch | `ComfyUI-SolAttn` | workflow 级 sparse attention patch |
 | Application | ComfyUI Intel Portable 0.34.0 | UI、workflow、模型和设备管理 |
 
 Kitchen/AIMDO provider 不覆盖官方 package 文件。`ComfyUI-OmniXPU` 在
@@ -312,29 +325,14 @@ if (Test-Path $omniNodeTarget) {
 Copy-Item -Recurse -Force $omniNodeSource $omniNodeTarget
 ```
 
-### 7.2 ComfyUI-SolAttn
+### 7.2 稀疏节点迁移
 
-Sol-Attn custom node 只负责 ComfyUI dispatch。不要安装它的 Triton/native
-requirements；Windows native implementation 已位于 `omni_xpu_kernel`
-CUTE sidecar。
-
-```powershell
-$solAttnTarget = Join-Path $customNodesRoot "ComfyUI-SolAttn"
-$solAttnCommit = "5f1c4aac3ca32a00b0b4c15ddbb7cb53fa43344d"
-
-if (Test-Path $solAttnTarget) {
-    throw "Move the existing ComfyUI-SolAttn directory out of custom_nodes first"
-}
-
-git clone --filter=blob:none --no-checkout `
-    "https://github.com/xiangyuT/ComfyUI-SolAttn_xpu.git" `
-    $solAttnTarget
-git -C $solAttnTarget fetch --depth 1 origin $solAttnCommit
-git -C $solAttnTarget checkout --detach $solAttnCommit
-```
-
-Workflow 必须在 model loader 后添加 **Patch Sol-Attn** 才会启用 sparse
-attention。未使用该 node 的 workflow 继续走 CUTE dense route。
+旧 `ComfyUI-SolAttn_xpu` / **Patch Sol-Attn** 已过时，不再作为新安装步骤。
+新工作流使用 [ComfyUI 原生 Model Sparse Attention](SPARSE_ATTENTION.md)。
+本页的历史 Portable 和 provider pins 保持原样，不能据此认定新版原生节点
+可用；需要匹配的 ComfyUI、Kitchen provider、完整 sparse native wheel 和
+Windows 工作流验证。迁移时备份旧图，替换节点并重新连线，不要直接改
+旧节点的名称或复制其 widget 数组。
 
 ### 7.3 其他 Dockerfile custom nodes
 
@@ -396,7 +394,6 @@ if not defined OMNIXPU_ENABLE set "OMNIXPU_ENABLE=1"
 if not defined OMNIXPU_PROVIDER_BOOTSTRAP set "OMNIXPU_PROVIDER_BOOTSTRAP=required"
 if not defined OMNI_IMAGE_XPU_TARGET set "OMNI_IMAGE_XPU_TARGET=bmg"
 if not defined OMNI_ATTN_BACKEND set "OMNI_ATTN_BACKEND=cute"
-if not defined SOL_ATTN_XPU_EXPERIMENTAL set "SOL_ATTN_XPU_EXPERIMENTAL=1"
 if not defined OMNIXPU_INTERPOLATE_FIX set "OMNIXPU_INTERPOLATE_FIX=0"
 if not defined OMNI_COMFYUI_RESERVE_VRAM_GB set "OMNI_COMFYUI_RESERVE_VRAM_GB=4"
 
@@ -416,8 +413,6 @@ pause
 - `OMNIXPU_PROVIDER_BOOTSTRAP=required`：Kitchen/AIMDO 任一 provider
   未激活就直接失败。
 - `OMNI_ATTN_BACKEND=cute`：显式启用 Windows CUTE route。
-- `SOL_ATTN_XPU_EXPERIMENTAL=1`：允许固定 custom node 使用 packaged
-  Sol-Attn operators。
 - `--enable-dynamic-vram`：AIMDO XPU provider 的必要条件。
 - `--reserve-vram 4`：为模型切换保留 4 GiB，可按 workload 调整。
 
@@ -494,7 +489,6 @@ $env:OMNIXPU_ENABLE = "1"
 $env:OMNIXPU_PROVIDER_BOOTSTRAP = "required"
 $env:OMNI_IMAGE_XPU_TARGET = "bmg"
 $env:OMNI_ATTN_BACKEND = "cute"
-$env:SOL_ATTN_XPU_EXPERIMENTAL = "1"
 
 & $embeddedPython (Join-Path $comfyRoot "main.py") `
     --windows-standalone-build `
@@ -513,10 +507,9 @@ $env:SOL_ATTN_XPU_EXPERIMENTAL = "1"
 - `ComfyUI-OmniXPU` 只导入一次；
 - Kitchen 和 AIMDO providers 都在 `required` mode 激活；
 - CUTE `.pyd` 成功加载；
-- `ComfyUI-SolAttn` 成功导入；
 - 没有 fallback-shaped provider success、DLL load error 或 package mismatch。
 
-当前 Windows 回归结论：
+历史 Windows 回归结论（旧 BF16 Sol custom-node 路径；不是新原生节点验收）：
 
 - kernel packaging 和 Sol-Attn API tests：36 passed，4 skipped；
 - ComfyUI attention routing tests：160 passed；
@@ -537,7 +530,7 @@ $env:SOL_ATTN_XPU_EXPERIMENTAL = "1"
 3. 重新安装相同版本的 official Kitchen/AIMDO 和 matching provider wheels；
 4. 重新安装当前 kernel wheel；
 5. 更新 `ComfyUI-OmniXPU` source copy；
-6. 确认 `ComfyUI-SolAttn` 仍为固定 revision；
+6. 若迁移原生稀疏节点，单独确认配套 provider、完整 sparse API 和节点生效；
 7. 运行第 10 节全部检查和实际使用的 workflow。
 
 不要把 updater 产生的 package resolver 结果直接视为有效 XPU 环境。
@@ -547,7 +540,8 @@ $env:SOL_ATTN_XPU_EXPERIMENTAL = "1"
 - Windows CUTE/Sol-Attn 当前只验收 BMG；PTL-H 需要独立 port 和验收。
 - CUTE 只覆盖已验证 tensor contracts；其他 dtype、layout、mask、head
   dimension 和 GQA 输入回退到 dense attention。
-- Sol-Attn 不会全局自动启用，workflow 必须使用 **Patch Sol-Attn**。
+- 原生 sparse attention 为按模型启用；迁移步骤见第 7.2 节，历史 Windows
+  结果不覆盖新原生 SOL/SLA/VSA 工作流。
 - AIMDO provider 依赖 DynamicVRAM；关闭 DynamicVRAM 时
   `OMNIXPU_PROVIDER_BOOTSTRAP=required` 会拒绝启动。
 - Kitchen Triton backend 不属于当前 Windows 必需路径。

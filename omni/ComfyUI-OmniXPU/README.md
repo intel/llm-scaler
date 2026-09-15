@@ -165,13 +165,18 @@ disabled by default on other configurations.
 
 ## Model Sparse Attention
 
-With a matching native Sol sidecar, the upstream **Model Sparse Attention**
-node can select XPU tensors. Its generic Sol/SLA path and MiniMax-H3 chunked
-producer call Kitchen's public APIs. The upstream node owns block selection,
+Use the upstream **Model Sparse Attention** node (`BlockSparseAttention`)
+with a matching complete native sparse API for SOL, SLA and VSA on XPU. Its
+generic Sol/SLA path and MiniMax-H3 chunked producer call Kitchen's public APIs. The upstream node owns block selection,
 4096-token projection chunks, previous-step statistics, VSA tiling and cleanup.
 The adapter only extends its device eligibility checks. An unavailable native
 API or an unsupported upstream eligibility contract leaves the original node
 behavior in place.
+
+See [native sparse attention usage](../docs/SPARSE_ATTENTION.md) for model
+connections, trained SLA/VSA recipes, fallback diagnostics and migration from
+the deprecated **Patch Sol-Attn** custom node. The old experimental environment
+gate is not needed; `OMNIXPU_SPARSE_ATTENTION` controls this adapter.
 
 ## Native compiled inference
 

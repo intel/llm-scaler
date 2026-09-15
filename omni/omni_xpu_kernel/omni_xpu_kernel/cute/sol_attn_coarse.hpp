@@ -5,6 +5,7 @@
 // Included inside sol_attn_prepare.cpp's implementation namespace.
 
 struct SolCoarseScoreKernel;
+struct SolCoarseScoreTiledScalarKernel;
 struct SolCoarsePVKernel;
 
 auto coarse_output(const at::Tensor& qm,const at::Tensor& km,const at::Tensor& vsum,
@@ -29,22 +30,66 @@ auto coarse_output(const at::Tensor& qm,const at::Tensor& km,const at::Tensor& v
   auto& queue=c10::xpu::getCurrentXPUStream(qm.device().index()).queue();
   TORCH_CHECK(N*int64_t(sizeof(float))<=int64_t(queue.get_device().get_info<sycl::info::device::local_mem_size>()),
       "coarse block count exceeds XPU local-memory capacity");
-  constexpr int SG=32,WG=128,ScoresPerWG=WG/SG;
-  const int64_t pairs=rows*N,groups=(pairs+ScoresPerWG-1)/ScoresPerWG;
-  queue.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for<SolCoarseScoreKernel>(sycl::nd_range<1>(sycl::range<1>(groups*WG),sycl::range<1>(WG)),
-        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
-      const auto sg=item.get_sub_group();const int lane=sg.get_local_linear_id();
-      const int64_t pair=item.get_group_linear_id()*ScoresPerWG+sg.get_group_linear_id();
-      if(pair>=pairs)return;
-      const int64_t row=pair/N,key=pair%N,bh=row/N;
-      float sum=0;
-#pragma unroll
-      for(int i=0;i<4;++i) {const int d=lane+i*SG;sum+=qp[row*128+d]*kp[(bh*N+key)*128+d];}
-      sum=sycl::reduce_over_group(sg,sum,sycl::plus<float>());
-      if(lane==0)sp[pair]=sum*factor;
+  constexpr int WG=128;
+  const auto selection=omni_xpu::device::get_bmg_selection_unwarned(queue);
+  // The measured route is B70-local. Other SKUs and debug overrides retain
+  // the original kernel; sequence length remains a runtime launch input.
+  if(selection.physical_sku==omni_xpu::device::BmgSku::b70&&!selection.forced) {
+    constexpr int SG=32,WG=128,TileQ=4,TileK=4,SubgroupsPerWG=WG/SG;
+    const int64_t query_tiles=(N+TileQ-1)/TileQ,key_tiles=(N+TileK-1)/TileK;
+    const int64_t tiles=B*H*query_tiles*key_tiles,groups=(tiles+SubgroupsPerWG-1)/SubgroupsPerWG;
+    queue.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for<SolCoarseScoreTiledScalarKernel>(sycl::nd_range<1>(sycl::range<1>(groups*WG),sycl::range<1>(WG)),
+          [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
+        const auto sg=item.get_sub_group();const int lane=sg.get_local_linear_id();
+        const int64_t tile=item.get_group_linear_id()*SubgroupsPerWG+sg.get_group_linear_id();
+        if(tile>=tiles)return;
+        const int64_t bh=tile/(query_tiles*key_tiles);
+        const int64_t q0=((tile/key_tiles)%query_tiles)*TileQ,k0=(tile%key_tiles)*TileK;
+        float qvalues[TileQ][4],kvalues[TileK][4];
+  #pragma unroll
+        for(int q=0;q<TileQ;++q) {
+  #pragma unroll
+          for(int i=0;i<4;++i)qvalues[q][i]=q0+q<N?qp[((bh*N+q0+q)*128)+lane+i*SG]:0.0f;
+        }
+  #pragma unroll
+        for(int k=0;k<TileK;++k) {
+  #pragma unroll
+          for(int i=0;i<4;++i)kvalues[k][i]=k0+k<N?kp[((bh*N+k0+k)*128)+lane+i*SG]:0.0f;
+        }
+        // Each dot retains the legacy scalar expression and reduction order.
+        // Operand values remain shared across the subgroup's score tile.
+  #pragma unroll
+        for(int q=0;q<TileQ;++q) {
+  #pragma unroll
+          for(int k=0;k<TileK;++k) {
+            float sum=0;
+  #pragma unroll
+            for(int i=0;i<4;++i)sum+=qvalues[q][i]*kvalues[k][i];
+            sum=sycl::reduce_over_group(sg,sum,sycl::plus<float>());
+            if(lane==0&&q0+q<N&&k0+k<N)sp[(bh*N+q0+q)*N+k0+k]=sum*factor;
+          }
+        }
+      });
     });
-  });
+  } else {
+    constexpr int SG=32,WG=128,ScoresPerWG=WG/SG;
+    const int64_t pairs=rows*N,groups=(pairs+ScoresPerWG-1)/ScoresPerWG;
+    queue.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for<SolCoarseScoreKernel>(sycl::nd_range<1>(sycl::range<1>(groups*WG),sycl::range<1>(WG)),
+          [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
+        const auto sg=item.get_sub_group();const int lane=sg.get_local_linear_id();
+        const int64_t pair=item.get_group_linear_id()*ScoresPerWG+sg.get_group_linear_id();
+        if(pair>=pairs)return;
+        const int64_t row=pair/N,key=pair%N,bh=row/N;
+        float sum=0;
+  #pragma unroll
+        for(int i=0;i<4;++i) {const int d=lane+i*SG;sum+=qp[row*128+d]*kp[(bh*N+key)*128+d];}
+        sum=sycl::reduce_over_group(sg,sum,sycl::plus<float>());
+        if(lane==0)sp[pair]=sum*factor;
+      });
+    });
+  }
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float,1> weights(sycl::range<1>(N),cgh);
     cgh.parallel_for<SolCoarsePVKernel>(sycl::nd_range<1>(sycl::range<1>(rows*WG),sycl::range<1>(WG)),

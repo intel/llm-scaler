@@ -51,17 +51,15 @@ The supported environment overrides are:
 | `COMFY_NUNCHAKU_REPOSITORY` | Combined Nunchaku custom-node/runtime repository | pinned in `build.sh` |
 | `COMFY_NUNCHAKU_COMMIT` | Combined Nunchaku source revision | pinned in `build.sh` |
 | `COMFY_NUNCHAKU_VERSION` | Expected combined distribution version | pinned in `build.sh` |
-| `COMFY_SOL_ATTN_REPOSITORY` | Sol-Attn custom-node repository | pinned in `build.sh` |
-| `COMFY_SOL_ATTN_COMMIT` | Sol-Attn custom-node source revision | pinned in `build.sh` |
 
 ComfyUI repository, commit, and version must be updated together. Kitchen and
 AIMDO official distribution versions and matching XPU provider source pins are
 independently checked against their package and provider manifests. GGUF
 repository and commit must be updated together.
 The same rule applies to the combined Nunchaku repository, commit, and
-distribution version. The Sol-Attn custom node is pinned independently from
-the kernel package and contains no image-local XPU build path. The kernel source is copied from
-`omni/omni_xpu_kernel` in the current llm-scaler checkout.
+distribution version. Sparse attention uses ComfyUI's built-in node and the
+Kitchen XPU provider; it has no separate custom-node source pin. The kernel
+source is copied from `omni/omni_xpu_kernel` in the current llm-scaler checkout.
 
 Each provider revision must be reachable from its pinned remote. The build
 fetches and checks out those exact full commits before constructing the private
@@ -171,7 +169,6 @@ whether `omni/` had uncommitted changes. The final image also records:
 - retained XPU provider wheel SHA256 values;
 - GGUF custom-node commit;
 - combined Nunchaku custom-node/runtime version and commit;
-- Sol-Attn custom-node repository and commit;
 - SYCL-TLA commit.
 
 Build from a clean commit before release acceptance. A device-less Docker
@@ -203,9 +200,14 @@ GGUF/SentencePiece/Protobuf imports; the bundled `nunchaku_torch` runtime; and
 the managed Kitchen GGUF/W4A16 capabilities. It additionally fails closed if
 the oneDNN manifest, checked-in patch, installed runtime DSO, or
 `libdnnl.so.3` symlink does not match the identities recorded by the image.
-It also requires the exact Sol-Attn custom-node checkout, its explicit XPU
-gate, and a loadable packaged `omni-cute` Sol-Attn DSO; the image does not
-install Triton or build a custom-node-local XPU sidecar.
+On XPU it also requires the native `BlockSparseAttention` source/schema,
+compatible OmniXPU eligibility adapter, Kitchen's registered `sol_attn`
+capability, callable `sol_attn_chunked` entry points in Kitchen and its XPU
+backend, and the complete packaged quantized
+SOL/SLA/VSA API. It records the installed CUTE DSO hash and rejects an external
+library override. Actual node registration and generated media remain workflow
+lifecycle checks. The legacy Sol custom node, its source pins and experimental
+gate are retired; see [migration and usage](SPARSE_ATTENTION.md).
 
 This source-built image supports BMG.
 

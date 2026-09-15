@@ -82,7 +82,11 @@ class SolCuteKernelTag {};
 template <typename Kernel, int GrfSize>
 class SolParentKernelTag {};
 
-template <typename Kernel, int GrfSize = 256, bool ParentTag = false>
+template <typename Kernel, int GrfSize>
+class SolPreparedHalfVKernelTag {};
+
+template <typename Kernel, int GrfSize = 256, bool ParentTag = false,
+          bool HalfVTag = false>
 void launch_on_torch_queue(typename Kernel::Params params, int device_index) {
   static_assert(GrfSize == 128 || GrfSize == 256);
   compat::dim3 const block = Kernel::get_block_shape();
@@ -108,7 +112,10 @@ void launch_on_torch_queue(typename Kernel::Params params, int device_index) {
     syclex::detail::LaunchConfigAccess<
         sycl::nd_range<3>, decltype(policy.get_launch_properties())>
         config_access(config);
-    if constexpr (ParentTag) {
+    if constexpr (HalfVTag) {
+      cgh.parallel_for<SolPreparedHalfVKernelTag<Kernel, GrfSize>>(
+          config_access.getRange(), config_access.getProperties(), functor);
+    } else if constexpr (ParentTag) {
       cgh.parallel_for<SolParentKernelTag<Kernel, GrfSize>>(
           config_access.getRange(), config_access.getProperties(), functor);
     } else {
@@ -229,7 +236,8 @@ template <
     bool PreparedState = false,
     bool TokenAugmented = false,
     bool SelectedOnly = false,
-    bool RowTail = false>
+    bool RowTail = false,
+    typename StorageVElement = StorageElement>
 struct SolKernel {
   static constexpr int QTile = TilePolicy::QTile;
   static constexpr int KvTile = 64;
@@ -281,7 +289,7 @@ struct SolKernel {
       make_gmem_ptr((StorageElement*)nullptr),
       make_layout(repeat<rank_v<StrideK>>(1), StrideK{})));
   using TensorV = decltype(make_tensor(
-      make_gmem_ptr((StorageElement*)nullptr),
+      make_gmem_ptr((StorageVElement*)nullptr),
       make_layout(repeat<rank_v<StrideV>>(1), StrideV{})));
   using TensorO = decltype(make_tensor(
       make_gmem_ptr((Element*)nullptr),
@@ -376,72 +384,91 @@ at::Tensor forward_cute_prepared_impl(
   using PreparedPolicy = std::conditional_t<SelectedOnly,
       SolTilePolicy<128, 16, 256>, std::conditional_t<TokenAugmented,
       SolTilePolicy<128, 32, 256>, SolConfiguredTilePolicy>>;
-  using KT = SolKernel<OutputElement, PreparedPolicy,
-      true, true, false, false, int8_t, true, TokenAugmented, SelectedOnly, RowTail>;
-  using K = typename KT::Kernel;
-  constexpr auto output_dtype = std::is_same_v<OutputElement,cutlass::half_t> ? at::kHalf : at::kBFloat16;
-  at::Tensor selected_state;
-  at::Tensor output;
-  if constexpr (SelectedOnly) {
-    static_assert(std::is_same_v<OutputElement,float>);
-    // The output view starts at a 64-byte aligned offset and has a 64-byte
-    // aligned pitch. Columns 0 and 1 store max/sum; 2 through 15 are alignment padding.
-    selected_state = at::empty({B,H,T,144}, q.options().dtype(at::kFloat));
-    output = selected_state.slice(3,16,144).permute({0,2,1,3});
-  } else output = at::empty(q.sizes(), q.options().dtype(output_dtype));
-  typename K::Arguments args{};
-  auto& shape = args.kernel.shape;
-  shape.batch = B;
-  shape.num_heads_q = shape.num_heads_kv = H;
-  shape.seq_len_qo = shape.seq_len_kv = T;
-  shape.seq_len_kv_cache = 0;
-  shape.head_size_qk = shape.head_size_vo = 128;
-  auto row_stride = [&](const at::Tensor& tensor) {
-    return cute::make_stride(checked_int(tensor.stride(1), "sequence stride"), _1{},
-        checked_int(tensor.stride(2), "head stride"),
-        checked_int(tensor.stride(0), "batch stride"));
+  auto launch_prepared = [&](auto storage_value) -> at::Tensor {
+    using StorageV = decltype(storage_value);
+    at::Tensor kernel_v = v;
+    if constexpr (std::is_same_v<StorageV, cutlass::half_t>) {
+      // Every signed-byte value is exactly representable in FP16. Materialize
+      // once per API call, using its resulting strides instead of converting V again
+      // for every routed query subgroup. Include this allocation/copy in timing.
+      kernel_v = v.to(at::kHalf);
+    }
+    using KT = SolKernel<OutputElement, PreparedPolicy,
+        true, true, false, false, int8_t, true, TokenAugmented, SelectedOnly, RowTail, StorageV>;
+    using K = typename KT::Kernel;
+    constexpr auto output_dtype = std::is_same_v<OutputElement,cutlass::half_t> ? at::kHalf : at::kBFloat16;
+    at::Tensor selected_state;
+    at::Tensor output;
+    if constexpr (SelectedOnly) {
+      static_assert(std::is_same_v<OutputElement,float>);
+      // The output view starts at a 64-byte aligned offset and has a 64-byte
+      // aligned pitch. Columns 0 and 1 store max/sum; 2 through 15 are alignment padding.
+      selected_state = at::empty({B,H,T,144}, q.options().dtype(at::kFloat));
+      output = selected_state.slice(3,16,144).permute({0,2,1,3});
+    } else output = at::empty(q.sizes(), q.options().dtype(output_dtype));
+    typename K::Arguments args{};
+    auto& shape = args.kernel.shape;
+    shape.batch = B;
+    shape.num_heads_q = shape.num_heads_kv = H;
+    shape.seq_len_qo = shape.seq_len_kv = T;
+    shape.seq_len_kv_cache = 0;
+    shape.head_size_qk = shape.head_size_vo = 128;
+    auto row_stride = [&](const at::Tensor& tensor) {
+      return cute::make_stride(checked_int(tensor.stride(1), "sequence stride"), _1{},
+          checked_int(tensor.stride(2), "head stride"),
+          checked_int(tensor.stride(0), "batch stride"));
+    };
+    args.kernel.Q = q.data_ptr<int8_t>();
+    args.kernel.K = k.data_ptr<int8_t>();
+    args.kernel.V = reinterpret_cast<StorageV*>(kernel_v.data_ptr());
+    args.kernel.O = reinterpret_cast<OutputElement*>(output.data_ptr());
+    args.kernel.dQ = row_stride(q);
+    args.kernel.dK = row_stride(k);
+    args.kernel.dV = cute::make_stride(_1{}, checked_int(kernel_v.stride(1), "V sequence stride"),
+        checked_int(kernel_v.stride(2), "V head stride"), checked_int(kernel_v.stride(0), "V batch stride"));
+    args.kernel.dO = row_stride(output);
+    args.kernel.dK_cache = args.kernel.dK;
+    args.kernel.dV_cache = args.kernel.dV;
+    auto& mainloop = args.mainloop;
+    mainloop.scale = static_cast<float>(scale);
+    // These old-summary views are not consumed by the prepared specialization.
+    mainloop.k_centroids = mainloop.k_base = k.data_ptr<int8_t>();
+    mainloop.v_means = reinterpret_cast<StorageV*>(kernel_v.data_ptr());
+    mainloop.tokens = T;
+    mainloop.heads = H;
+    mainloop.blocks = N;
+    mainloop.k_stride_batch = k.stride(0);
+    mainloop.k_stride_head = k.stride(2);
+    mainloop.prepared = {routes.data_ptr<uint8_t>(), q_scale.data_ptr<float>(),
+        k_scale.data_ptr<float>(), v_scale.data_ptr<float>(), tail_state.data_ptr<float>()};
+    mainloop.prepared.key_bias = key_bias.defined() ? key_bias.data_ptr<float>() : nullptr;
+    if constexpr (SelectedOnly) mainloop.prepared.selected_state = selected_state.data_ptr<float>();
+    if constexpr (RowTail) mainloop.prepared.row_state = row_state.data_ptr<float>();
+    if constexpr (TokenAugmented) {
+      mainloop.prepared.extra_indices = extra_indices.data_ptr<int32_t>();
+      mainloop.prepared.extra_counts = extra_counts.data_ptr<int32_t>();
+      mainloop.prepared.extra_budget = budget;
+    }
+    args.hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
+        args.hw_info.device_id);
+    TORCH_CHECK(K::can_implement(args), "prepared Sol CUTE cannot implement this contract");
+    auto workspace = at::empty({static_cast<int64_t>(K::get_workspace_size(args))},
+        q.options().dtype(at::kByte));
+    K::initialize_workspace(args, workspace.data_ptr());
+    auto params = K::to_underlying_arguments(args, workspace.data_ptr());
+    launch_on_torch_queue<K, KT::GrfSize, false,
+        std::is_same_v<StorageV, cutlass::half_t>>(params, q.device().index());
+    if constexpr (SelectedOnly) return selected_state;
+    else return output;
   };
-  args.kernel.Q = q.data_ptr<int8_t>();
-  args.kernel.K = k.data_ptr<int8_t>();
-  args.kernel.V = v.data_ptr<int8_t>();
-  args.kernel.O = reinterpret_cast<OutputElement*>(output.data_ptr());
-  args.kernel.dQ = row_stride(q);
-  args.kernel.dK = row_stride(k);
-  args.kernel.dV = cute::make_stride(_1{}, checked_int(v.stride(1), "V sequence stride"),
-      checked_int(v.stride(2), "V head stride"), checked_int(v.stride(0), "V batch stride"));
-  args.kernel.dO = row_stride(output);
-  args.kernel.dK_cache = args.kernel.dK;
-  args.kernel.dV_cache = args.kernel.dV;
-  auto& mainloop = args.mainloop;
-  mainloop.scale = static_cast<float>(scale);
-  // These old-summary views are not consumed by the prepared specialization.
-  mainloop.k_centroids = mainloop.k_base = k.data_ptr<int8_t>();
-  mainloop.v_means = v.data_ptr<int8_t>();
-  mainloop.tokens = T;
-  mainloop.heads = H;
-  mainloop.blocks = N;
-  mainloop.k_stride_batch = k.stride(0);
-  mainloop.k_stride_head = k.stride(2);
-  mainloop.prepared = {routes.data_ptr<uint8_t>(), q_scale.data_ptr<float>(),
-      k_scale.data_ptr<float>(), v_scale.data_ptr<float>(), tail_state.data_ptr<float>()};
-  mainloop.prepared.key_bias = key_bias.defined() ? key_bias.data_ptr<float>() : nullptr;
-  if constexpr (SelectedOnly) mainloop.prepared.selected_state = selected_state.data_ptr<float>();
-  if constexpr (RowTail) mainloop.prepared.row_state = row_state.data_ptr<float>();
-  if constexpr (TokenAugmented) {
-    mainloop.prepared.extra_indices = extra_indices.data_ptr<int32_t>();
-    mainloop.prepared.extra_counts = extra_counts.data_ptr<int32_t>();
-    mainloop.prepared.extra_budget = budget;
+  if constexpr (!SelectedOnly && !TokenAugmented) {
+    const auto& queue = c10::xpu::getCurrentXPUStream(q.device().index()).queue();
+    const auto selection = omni_xpu::device::get_bmg_selection_unwarned(queue);
+    if (selection.physical_sku == omni_xpu::device::BmgSku::b70 && !selection.forced) {
+      return launch_prepared(cutlass::half_t{});
+    }
   }
-  args.hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
-      args.hw_info.device_id);
-  TORCH_CHECK(K::can_implement(args), "prepared Sol CUTE cannot implement this contract");
-  auto workspace = at::empty({static_cast<int64_t>(K::get_workspace_size(args))},
-      q.options().dtype(at::kByte));
-  K::initialize_workspace(args, workspace.data_ptr());
-  auto params = K::to_underlying_arguments(args, workspace.data_ptr());
-  launch_on_torch_queue<K, KT::GrfSize>(params, q.device().index());
-  if constexpr (SelectedOnly) return selected_state;
-  else return output;
+  return launch_prepared(int8_t{});
 }
 
 at::Tensor forward_cute_prepared(
