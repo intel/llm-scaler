@@ -1,13 +1,12 @@
 # Native sparse attention in ComfyUI
 
-Use ComfyUI's built-in **Model Sparse Attention** node for sparse attention
-with LLM Scaler Omni. Search for that name under **model/patch**; its workflow
-and API class ID is `BlockSparseAttention`.
+With ComfyUI 0.35.0 or later and a matching Omni XPU stack, use the built-in
+**Model Sparse Attention** node for sparse attention. Search for that name
+under **model/patch**; its workflow and API class ID is `BlockSparseAttention`.
 
 The legacy `ComfyUI-SolAttn_xpu` custom node and **Patch Sol-Attn** workflow
-entry point are deprecated for this Omni integration as of 2026-09-15. The
-focused Dockerfile no longer installs that custom node. Existing images and
-saved workflows retain their original contents until migrated.
+entry point are deprecated for this Omni integration. The focused Dockerfile
+no longer installs the legacy custom node.
 
 ## Requirements
 

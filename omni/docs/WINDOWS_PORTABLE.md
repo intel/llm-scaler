@@ -2,8 +2,8 @@
 
 本文保留 ComfyUI Intel Portable 0.34.0 的安装、运行时策略和历史验收记录。
 
-> **稀疏节点迁移 — 2026-09-15。** 新 Omni 集成使用 ComfyUI 原生
-> **Model Sparse Attention**，见 [使用及迁移指南](SPARSE_ATTENTION.md)。
+> **稀疏节点迁移。** ComfyUI 0.35.0 或更高版本搭配匹配的 Omni XPU 栈，
+> 使用原生 **Model Sparse Attention**，见 [使用及迁移指南](SPARSE_ATTENTION.md)。
 > 本页固定的 0.34.0 / Kitchen 0.2.31 / 历史 wheel 不能作为新原生
 > SOL/SLA/VSA 路径的 Windows 验收依据。旧 custom-node 安装和 gate 步骤
 > 已退出当前使用指导；原版本、revision、wheel hash 和测试结果仍保留。
