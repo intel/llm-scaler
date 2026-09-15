@@ -50,8 +50,9 @@ branch.
 ## Choose a method and matching weights
 
 These are starting configurations exercised with MiniMax-H3 at 864×480 and
-1344×768, with a 5s duration input. They are complete model recipes, not
-interchangeable kernel switches.
+1344×768, with a 5s duration input. The table combines model-author settings,
+ComfyUI defaults and explicit integration choices; their sources are explained
+below. These are complete model recipes, not interchangeable kernel switches.
 
 | Setting | SOL | SLA | VSA |
 | --- | --- | --- | --- |
@@ -59,7 +60,7 @@ interchangeable kernel switches.
 | Model | Base MiniMax-H3 | Base + matching Turbo-SLA LoRA, strength 1.0 | Matching FastH3 VSA checkpoint with learned coarse gates |
 | Steps | 20 | 4 | 4 |
 | Sampler / scheduler | `res_multistep` / `simple` | `euler` / `simple` | `euler` / `simple` |
-| Guidance | Template base guidance | `BasicGuider` (single conditioning) | `BasicGuider` (single conditioning) |
+| Guidance | `BasicGuider` (single conditioning) | `BasicGuider` (single conditioning) | `BasicGuider` (single conditioning) |
 | Video / audio shift | 12 / 3 | 6 / 3 | 12 / 3 |
 | Selection parameter | `tau=1.3` | `keep_percent=15.0` | `keep_percent=10.0` |
 | `start_percent` / `end_percent` | 0.2 / 1.0 | 0.0 / 1.0 | 0.0 / 1.0 |
@@ -67,6 +68,51 @@ interchangeable kernel switches.
 | `sink_conditioning` | `exact_kv_and_rows` | `exact_kv_and_rows` | Native VSA prefix handling |
 | `min_tokens` | 12288 | 12288 | 12288 |
 | `dense_blocks` | Empty | Empty | Empty |
+
+### Parameter sources
+
+- **SOL base recipe:** the official
+  [MiniMax-H3 template in workflow-templates 0.11.57](https://github.com/Comfy-Org/workflow_templates/blob/v0.11.57/templates/video_minimax_h3_t2v.json)
+  uses 20 steps with Turbo disabled, `res_multistep`, `simple` and
+  `BasicGuider`. Its steps input is connected to a switch, so the scheduler's
+  stored widget value alone is not the effective step count. The
+  [ComfyUI MiniMaxH3 model definition](https://github.com/Comfy-Org/ComfyUI/blob/40c4fcdf513a4523e39d54a9d391908af8df8171/comfy/supported_models.py)
+  sets the base video/audio shifts to 12/3. SOL retains this base recipe.
+- **SLA model settings:** the
+  [Turbo-SLA model card](https://huggingface.co/lightx2v/Minimax-h3-Turbo-SLA/blob/10ade67cd15ff7a135fa35c2a0673ea96c839247/README.md)
+  specifies four-step distillation and 85% sparsity, mapped here to
+  `keep_percent=15.0`. Its
+  [LightX2V configuration](https://github.com/ModelTC/LightX2V/blob/ca181cab7f454f804ab9c23f8811316a242b1e6c/configs/minimax_h3/dmd/minimax_h3_fp8_4step_5090_with_fp8_vae_sla.json)
+  supplies LoRA strength 1.0, video/audio shifts 6/3 and disabled CFG.
+- **VSA model settings:** the matching step-1300
+  [FastH3 inference configuration](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree/blob/5ea076f35b84da4c3c82217112fa733d8eea2ae1/fastvideo_inference.json)
+  specifies four transformer forwards, guidance 1.0, tile size 64 and
+  90% sparsity, mapped here to `keep_percent=10.0`. The same checkpoint's
+  [video scheduler](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree/blob/5ea076f35b84da4c3c82217112fa733d8eea2ae1/scheduler/scheduler_config.json)
+  and [audio scheduler](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree/blob/5ea076f35b84da4c3c82217112fa733d8eea2ae1/audio_scheduler/scheduler_config.json)
+  set shifts 12/3.
+- **Native node defaults and behavior:** the
+  [ComfyUI sparse node](https://github.com/Comfy-Org/ComfyUI/blob/40c4fcdf513a4523e39d54a9d391908af8df8171/comfy_extras/nodes_sparse_attention.py)
+  defines the method names, SOL `tau=1.3`, the default 0.2–1.0 window,
+  `min_tokens=12288`, empty `dense_blocks`, `extra_tokens=256` and
+  `sink_conditioning=exact_kv_and_rows`. It forces VSA augmentation to zero
+  and implements its prefix handling. These are node defaults or semantics,
+  not model-author tuning recommendations. SLA's table value of 15% overrides
+  the node's default 10% to follow the selected model.
+- **ComfyUI integration choices:** SLA/VSA use `start_percent=0.0` here to
+  enable sparse attention throughout their four-step recipes. `BasicGuider`
+  expresses sampling without CFG. `euler`/`simple` is the ComfyUI sampler
+  combination used for these recipes; the
+  [community VSA port](https://github.com/barelymining/ComfyUI-MiniMax-H3-FastVideo/blob/d610a06f7dab47f7d6329a772990bbf175b0da3c/README.md#workflow)
+  also recommends that combination. The SLA configuration names
+  `training_euler` and sets `infer_steps=5`; FastH3 records both
+  `num_inference_steps=5` and `transformer_forwards=4`. These framework fields
+  are not copied literally into ComfyUI's four sampler steps, and scheduler
+  numerical equivalence is not established. The full sparse window and this
+  sampler mapping are integration choices, not a shared official SOL/SLA/VSA
+  preset.
+
+### Weight selection and parameter meaning
 
 SOL uses an adaptive threshold without sparse-specific training. Higher `tau`
 requests more sparsity; it is not an exact keep percentage. SLA needs weights
