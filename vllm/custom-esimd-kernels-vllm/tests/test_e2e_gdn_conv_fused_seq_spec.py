@@ -97,8 +97,56 @@ def test_spec_gdn_does_not_mutate_the_null_rollback_slot():
     torch.testing.assert_close(ssm_state[0], null_ssm_before, rtol=0, atol=0)
 
 
-def test_spec_gdn_matches_native_qwen35_tp2():
-    """Exercise the actual TP2/MTP3 geometry against the native XPU kernel."""
+def test_spec_gdn_nonpacked_conv_does_not_mutate_null_rollback_slot():
+    """The legacy three-row conv cache must also treat state ID zero as null."""
+
+    tokens, k_heads, v_heads, head_dim = 4, 8, 24, 128
+    conv_dim = 2 * k_heads * head_dim + v_heads * head_dim
+    slots, conv_state_len = 5, 3
+    device = "xpu"
+
+    qkvz = torch.zeros(
+        tokens, conv_dim + v_heads * head_dim, dtype=torch.float16, device=device
+    )
+    conv_state = torch.zeros(
+        slots, conv_state_len, conv_dim, dtype=torch.float16, device=device
+    )
+    ssm_state = torch.zeros(
+        slots, v_heads, head_dim, head_dim, dtype=torch.float16, device=device
+    )
+    conv_state[0].fill_(7)
+    null_conv_before = conv_state[0].clone()
+
+    esimd.esimd_gdn_conv_fused_seq_spec(
+        qkvz,
+        conv_state,
+        torch.zeros(conv_dim, 4, dtype=torch.float16, device=device),
+        torch.zeros(conv_dim, dtype=torch.float16, device=device),
+        torch.tensor([[1, 0, 3, 4]], dtype=torch.int32, device=device),
+        torch.zeros(v_heads, dtype=torch.float16, device=device),
+        torch.zeros(v_heads, dtype=torch.float16, device=device),
+        torch.zeros(tokens, 2 * v_heads, dtype=torch.float16, device=device),
+        ssm_state,
+        torch.empty(tokens, v_heads, head_dim, dtype=torch.float16, device=device),
+        torch.empty(tokens, v_heads, head_dim, dtype=torch.float16, device=device),
+        torch.arange(tokens, dtype=torch.int32, device=device),
+        torch.tensor([1], dtype=torch.int32, device=device),
+        1,
+        tokens,
+        k_heads,
+        v_heads,
+        head_dim,
+        head_dim,
+        head_dim**-0.5,
+    )
+    torch.xpu.synchronize()
+
+    torch.testing.assert_close(conv_state[0], null_conv_before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_accepted", [1, 2, 3])
+def test_spec_gdn_matches_native_qwen35_tp2(num_accepted):
+    """Exercise TP2/MTP3 rollback offsets against the native XPU kernel."""
 
     torch.manual_seed(709)
     tokens, k_heads, v_heads, head_dim = 4, 8, 24, 128
@@ -116,7 +164,7 @@ def test_spec_gdn_matches_native_qwen35_tp2():
     dt_bias = torch.randn(v_heads, dtype=torch.float16, device=device) * 0.1
     state_indices = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32, device=device)
     token_indices = torch.arange(tokens, dtype=torch.int32, device=device)
-    accepted = torch.tensor([1], dtype=torch.int32, device=device)
+    accepted = torch.tensor([num_accepted], dtype=torch.int32, device=device)
 
     initial_conv = torch.randn(
         slots, conv_state_len, conv_dim, dtype=torch.float16, device=device
@@ -191,8 +239,13 @@ def test_spec_gdn_matches_native_qwen35_tp2():
     torch.testing.assert_close(out_esimd, out_ref, rtol=2e-2, atol=2e-3)
     torch.testing.assert_close(z_esimd, z_ref, rtol=0, atol=0)
     # v0.26 stores speculative convolution rollback checkpoints packed in the
-    # initial request block: the carried history followed by all draft inputs.
-    torch.testing.assert_close(conv_esimd[1, :2], initial_conv[1, 1:3], rtol=0, atol=0)
+    # initial request block: the carried history at init_col followed by all
+    # draft inputs. init_col is the same accepted-token rollback selection
+    # used by the native SSM recurrence.
+    init_col = num_accepted - 1
+    torch.testing.assert_close(
+        conv_esimd[1, :2], initial_conv[1, init_col + 1:init_col + 3], rtol=0, atol=0
+    )
     torch.testing.assert_close(conv_esimd[1, 2:], qkvz[:, :conv_dim], rtol=0, atol=0)
     # The reference and ESIMD implementations use different vector math
     # intrinsics, while both checkpoint the recurrence in FP16.
