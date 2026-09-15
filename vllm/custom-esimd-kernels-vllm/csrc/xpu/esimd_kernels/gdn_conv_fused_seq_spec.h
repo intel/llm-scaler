@@ -28,9 +28,12 @@ ESIMD_INLINE simd<float, 2> gdn_spec_update_seq(
     const fp16* dt_bias_ptr,
     const fp16* ba_ptr,
     int64_t ba_offset,
+    simd<float, 64>& h0_lo,
+    simd<float, 64>& h0_hi,
+    simd<float, 64>& h1_lo,
+    simd<float, 64>& h1_hi,
     fp16* ssm_state_ptr,
     int64_t ssm_stride0,
-    int prev_state_idx,
     int save_state_idx,
     int tid,
     int hv,
@@ -63,28 +66,11 @@ ESIMD_INLINE simd<float, 2> gdn_spec_update_seq(
     const float beta = 1.0f / (1.0f + esimd_expf_seq(-b_val));
 
     const int vi0 = tid * 2;
-    fp16* state_base = nullptr;
-    if (prev_state_idx >= 0) {
-        state_base = ssm_state_ptr +
-            (int64_t)prev_state_idx * ssm_stride0 +
-            (int64_t)hv * gdn_V * gdn_K;
-    }
     fp16* save_base = nullptr;
-    if (save_state_idx >= 0) {
+    if (save_state_idx > 0) {
         save_base = ssm_state_ptr +
             (int64_t)save_state_idx * ssm_stride0 +
             (int64_t)hv * gdn_V * gdn_K;
-    }
-
-    simd<float, 64> h0_lo(0.0f), h0_hi(0.0f);
-    simd<float, 64> h1_lo(0.0f), h1_hi(0.0f);
-    if (state_base != nullptr) {
-        fp16* sr0 = state_base + (int64_t)(vi0 + 0) * gdn_K;
-        fp16* sr1 = state_base + (int64_t)(vi0 + 1) * gdn_K;
-        h0_lo = lsc_load_state_64_seq(sr0);
-        h0_hi = lsc_load_state_64_seq(sr0 + 64);
-        h1_lo = lsc_load_state_64_seq(sr1);
-        h1_hi = lsc_load_state_64_seq(sr1 + 64);
     }
 
     h0_lo *= exp_g;
@@ -204,12 +190,19 @@ ESIMD_INLINE void gdn_conv_fused_seq_spec_kernel(
         conv_state_len >= num_spec_tokens + 2;
     const int accepted_prev = num_accepted_tokens_ptr[seq_idx] - 1;
     const int init_col = accepted_prev > 0 ? accepted_prev : 0;
-    const int init_state_idx = spec_state_indices_ptr[
+    // State index zero is vLLM's shared null block. The native recurrent
+    // kernel skips such a sequence without touching either cache.
+    const int init_ssm_state_idx =
+        spec_state_indices_ptr[state_row + init_col];
+    if (init_ssm_state_idx <= 0) {
+        return;
+    }
+    const int init_conv_state_idx = spec_state_indices_ptr[
         state_row + (packed_conv_state ? 0 : init_col)];
     fp16* init_conv_state = nullptr;
-    if (init_state_idx >= 0) {
+    if (init_conv_state_idx > 0) {
         init_conv_state =
-            conv_state_ptr + (int64_t)init_state_idx * conv_stride0 +
+            conv_state_ptr + (int64_t)init_conv_state_idx * conv_stride0 +
             (packed_conv_state ? (int64_t)init_col * dim : 0);
     }
     simd<float, 64> s0(0.0f), s1(0.0f), s2(0.0f);
@@ -229,13 +222,23 @@ ESIMD_INLINE void gdn_conv_fused_seq_spec_kernel(
             init_conv_state + 2 * dim + chunk_start_hi);
     }
 
+    // The native FLA kernel keeps the state in FP32 registers for the entire
+    // speculative sequence and writes FP16 only as rollback checkpoints.
+    // Reloading a just-written checkpoint here adds a quantization round-trip
+    // on every draft token and incorrectly makes the null slot observable.
+    const int vi0 = tid * 2;
+    fp16* initial_ssm_base = ssm_state_ptr +
+        (int64_t)init_ssm_state_idx * ssm_stride0 +
+        (int64_t)hv * gdn_V * gdn_K;
+    fp16* initial_sr0 = initial_ssm_base + (int64_t)(vi0 + 0) * gdn_K;
+    fp16* initial_sr1 = initial_ssm_base + (int64_t)(vi0 + 1) * gdn_K;
+    simd<float, 64> h0_lo = lsc_load_state_64_seq(initial_sr0);
+    simd<float, 64> h0_hi = lsc_load_state_64_seq(initial_sr0 + 64);
+    simd<float, 64> h1_lo = lsc_load_state_64_seq(initial_sr1);
+    simd<float, 64> h1_hi = lsc_load_state_64_seq(initial_sr1 + 64);
+
     for (int t = 0; t < num_spec_tokens; ++t) {
         const int global_t = token_indx_ptr[state_row + t];
-        const int prev_col = t == 0
-            ? init_col
-            : t - 1;
-        const int prev_state_idx =
-            spec_state_indices_ptr[state_row + prev_col];
         const int save_state_idx = spec_state_indices_ptr[state_row + t];
 
         const fp16* qkvz_row =
@@ -276,7 +279,7 @@ ESIMD_INLINE void gdn_conv_fused_seq_spec_kernel(
         const int conv_save_state_idx = packed_conv_state
             ? spec_state_indices_ptr[state_row]
             : save_state_idx;
-        if (conv_save_state_idx >= 0) {
+        if (conv_save_state_idx > 0) {
             fp16* save_state =
                 conv_state_ptr +
                 (int64_t)conv_save_state_idx * conv_stride0;
@@ -373,7 +376,6 @@ ESIMD_INLINE void gdn_conv_fused_seq_spec_kernel(
 
         barrier();
 
-        const int vi0 = tid * 2;
         simd<float, 64> q_lo = slm_block_load<float, 64>(SLM_Q_LO_SEQ);
         simd<float, 64> q_hi = slm_block_load<float, 64>(SLM_Q_HI_SEQ);
         simd<float, 64> k_lo = slm_block_load<float, 64>(SLM_K_LO_SEQ);
@@ -384,8 +386,8 @@ ESIMD_INLINE void gdn_conv_fused_seq_spec_kernel(
         const int64_t ba_offset = (int64_t)global_t * ba_stride0;
         simd<float, 2> o_acc = gdn_spec_update_seq<WG_SIZE>(
             q_lo, q_hi, k_lo, k_hi, v_f32, A_log_ptr, dt_bias_ptr,
-            ba_ptr, ba_offset, ssm_state_ptr, ssm_stride0,
-            prev_state_idx, save_state_idx, tid, hv, HV, gdn_K, gdn_V,
+            ba_ptr, ba_offset, h0_lo, h0_hi, h1_lo, h1_hi, ssm_state_ptr,
+            ssm_stride0, save_state_idx, tid, hv, HV, gdn_K, gdn_V,
             attn_scale);
 
         fp16* out = output_ptr + (int64_t)global_t * HV * gdn_V +
