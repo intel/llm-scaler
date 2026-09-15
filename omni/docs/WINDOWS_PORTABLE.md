@@ -2,6 +2,13 @@
 
 本文保留 ComfyUI Intel Portable 0.34.0 的安装、运行时策略和历史验收记录。
 
+升级到 ComfyUI 0.35.0 或更高版本时，可以参考本文的 Windows 安装与运行时
+配置，并结合 Ubuntu 侧的 [ComfyUI 更新说明](COMFYUI.md#omni-xpu-switches)、
+[组件构建配置](IMAGE_BUILD.md#build-inputs) 和
+[原生稀疏节点指南](SPARSE_ATTENTION.md) 尝试迁移。根据目标版本选择配套的
+Kitchen/AIMDO providers、Omni native wheel 和 ComfyUI-OmniXPU，使用对应的
+Windows 构建，并按本文第 10、11 节完成安装态检查和工作流验证。
+
 > **稀疏节点迁移。** ComfyUI 0.35.0 或更高版本搭配匹配的 Omni XPU 栈，
 > 使用原生 **Model Sparse Attention**，见 [使用及迁移指南](SPARSE_ATTENTION.md)。
 > 本页固定的 0.34.0 / Kitchen 0.2.31 / 历史 wheel 不能作为新原生
