@@ -1,0 +1,315 @@
+// Qwen3.8 per-expert FP8 W8A16: native TP8/TP4 I=80/160, no padding.
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+#include <c10/xpu/XPUCachingAllocator.h>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+#include <unordered_map>
+#include <vector>
+#include <cstdlib>
+#include <cstring>
+
+using fp16 = sycl::half;
+using namespace sycl::ext::intel::esimd;
+using namespace sycl::ext::intel::esimd::xmx;
+namespace xe = sycl::ext::intel::experimental::esimd;
+
+namespace {
+constexpr int H = 2560, E = 512, K = 10, R = K + 1;
+template<int I> class Q38Fp8Up;
+template<int I> class Q38Fp8Down;
+
+template<int N>
+SYCL_ESIMD_FUNCTION simd<fp16, N> decode(simd<uint8_t, N> raw) {
+    simd<uint16_t, N> u = convert<uint16_t>(raw);
+    simd<uint16_t, N> sign = (u & 128) << 8;
+    simd<uint16_t, N> bits = sign | (((u & 127) << 7) + 0x2000);
+    simd<fp16, N> normal = bits.template bit_cast_view<fp16>().read();
+    // E4M3 subnormals are exact multiples of 2^-9, not zero.
+    simd<float, N> sub = convert<float>(u & 7) * (1.0f / 512.0f);
+    sub.merge(-sub, (u & 128) != 0);
+    normal.merge(convert<fp16>(sub), (u & 120) == 0);
+    // Preserve the two E4M3 NaN encodings as well.
+    bits = sign | 0x7e00;
+    normal.merge(bits.template bit_cast_view<fp16>().read(), (u & 127) == 127);
+    return normal;
+}
+
+template<bool NK>
+SYCL_ESIMD_FUNCTION simd<fp16, 256> vnni(simd<uint8_t, 256> raw) {
+    auto decoded = decode(raw);
+    auto w = decoded.template bit_cast_view<uint16_t>().read();
+    simd<uint16_t, 256> packed;
+    #pragma unroll
+    for (int p = 0; p < 8; ++p) {
+        if constexpr (NK) {
+            packed.template select<16, 2>(p * 32) = w.template select<16, 16>(2*p);
+            packed.template select<16, 2>(p * 32 + 1) = w.template select<16, 16>(2*p+1);
+        } else {
+            packed.template select<16, 2>(p * 32) = w.template select<16, 1>(2*p*16);
+            packed.template select<16, 2>(p * 32 + 1) = w.template select<16, 1>((2*p+1)*16);
+        }
+    }
+    return packed.template bit_cast_view<fp16>().read();
+}
+
+template<bool NK>
+SYCL_ESIMD_FUNCTION simd<fp16, 256> load_tile(
+    const uint8_t* base, int width, int height, int n, int k) {
+    xe::config_2d_mem_access<uint8_t, 16, 16, 1> payload(
+        base, width - 1, height - 1, width - 1, NK ? k : n, NK ? n : k);
+    auto raw = xe::lsc_load_2d<uint8_t, 16, 16, 1, false, false,
+        xe::cache_hint::cached, xe::cache_hint::cached>(payload);
+    return vnni<NK>(raw);
+}
+
+#include "qwen38_fp8_grouped_up.h"
+
+void router(sycl::queue& q, const fp16* x, const fp16* w,
+            const fp16* sw, fp16* logits, fp16* gate, int m) {
+    q.parallel_for<class Q38Fp8Router>(sycl::range<2>(m, E+1),
+        [=](sycl::id<2> id) SYCL_ESIMD_KERNEL {
+            int t = id[0], e = id[1];
+            const fp16* row = e == E ? sw : w + e*H;
+            simd<float, 128> acc(0.0f);
+            for (int k = 0; k < H; k += 128) {
+                acc += convert<float>(block_load<fp16, 128>(x+t*H+k)) *
+                       convert<float>(block_load<fp16, 128>(row+k));
+            }
+            fp16 value = fp16(sycl::ext::intel::esimd::detail::sum<float,float,128>(acc));
+            if (e == E)
+                gate[t] = fp16(1.0f/(1.0f + exp(simd<float, 1>(-float(value)))[0]));
+            else logits[t*E+e] = value;
+        });
+}
+
+void topk(sycl::queue& q, const fp16* logits, int* indices,
+          float* probs, int m) {
+    q.parallel_for<class Q38Fp8TopK>(sycl::range<1>(m),
+        [=](sycl::id<1> id) SYCL_ESIMD_KERNEL {
+            int t = id[0];
+            simd<float, E> scores = convert<float>(block_load<fp16, E>(logits+t*E));
+            simd<int, E> ids(0, 1);
+            simd<int, E> available = ids;
+            simd<float, 16> picked(0.0f);
+            float maximum = hmax<float>(scores);
+            float sum = 0.0f;
+            for (int r = 0; r < K; ++r) {
+                float value = hmax<float>(scores);
+                simd<int, E> candidates(E);
+                candidates.merge(available, scores == value);
+                int index = hmin<int>(candidates);
+                // A NaN maximum matches no lane. Dummy runs (or invalid model
+                // activations) must not turn that into expert E and an OOB read.
+                // Keep distinct, in-range routes even for all -inf/NaN logits;
+                // probabilities still propagate the non-finite arithmetic.
+                if (index == E) index = hmin<int>(available);
+                indices[t*K+r] = index;
+                available.merge(simd<int, E>(E), ids == index);
+                float p = exp(simd<float, 1>(value-maximum))[0];
+                picked[r] = p;
+                sum += p;
+                scores.merge(simd<float, E>(-INFINITY), ids == index);
+            }
+            for (int r = 0; r < K; ++r) probs[t*K+r] = picked[r]/sum;
+        });
+}
+
+template<int I>
+void up(sycl::queue& q, const fp16* x, const uint8_t* w,
+        const float* scale, const uint8_t* shared, const float* ss,
+        const int* ids, fp16* inter, int m) {
+    constexpr int GS = 16;
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<Q38Fp8Up<I>>(
+            sycl::nd_range<2>({size_t(m*R), size_t(I/16*GS)}, {1, GS}),
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+                slm_init<GS*32*sizeof(float)>();
+                int row = item.get_global_id(0), t = row/R, r = row%R;
+                int n = item.get_group(1)*16, tid = item.get_local_id(1);
+                bool sh = r == K;
+                int e = sh ? 0 : ids[t*K+r];
+                const uint8_t* base = sh ? shared : w + size_t(e)*H*2*I;
+                simd<float, 16> ga(0.0f), ua(0.0f);
+                for (int k = tid*16; k < H; k += GS*16) {
+                    auto a = block_load<fp16, 16>(x+t*H+k);
+                    auto g = sh ? load_tile<true>(base, H, 2*I, n, k)
+                                : load_tile<false>(base, 2*I, H, n, k);
+                    auto u = sh ? load_tile<true>(base, H, 2*I, n+I, k)
+                                : load_tile<false>(base, 2*I, H, n+I, k);
+                    ga = dpas<8, 1, float, float, fp16, fp16>(ga, g, a);
+                    ua = dpas<8, 1, float, float, fp16, fp16>(ua, u, a);
+                }
+                slm_block_store<float, 16>(tid*128, ga);
+                slm_block_store<float, 16>(tid*128+64, ua);
+                barrier();
+                if (tid == 0) {
+                    ga = 0.0f; ua = 0.0f;
+                    #pragma unroll
+                    for (int s = 0; s < GS; ++s) {
+                        ga += slm_block_load<float, 16>(s*128);
+                        ua += slm_block_load<float, 16>(s*128+64);
+                    }
+                    float sc = sh ? ss[0] : scale[e];
+                    ga = convert<float>(convert<fp16>(ga*sc));
+                    ua = convert<float>(convert<fp16>(ua*sc));
+                    block_store<fp16, 16>(inter+row*I+n,
+                        convert<fp16>((ga/(1.0f+exp(-ga)))*ua));
+                }
+            });
+    });
+}
+
+template<int I>
+void down(sycl::queue& q, const fp16* inter, const uint8_t* w,
+          const float* scale, const uint8_t* shared, const float* ss,
+          const int* ids, const float* probs, const fp16* gate,
+          fp16* partial, int m) {
+    q.parallel_for<Q38Fp8Down<I>>(sycl::range<2>(m*R, H/16),
+        [=](sycl::id<2> id) SYCL_ESIMD_KERNEL {
+            int row = id[0], t = row/R, r = row%R, n = id[1]*16;
+            bool sh = r == K;
+            int e = sh ? 0 : ids[t*K+r];
+            const uint8_t* base = sh ? shared : w + size_t(e)*I*H;
+            simd<float, 16> acc(0.0f);
+            // I is a multiple of 16, including 80: no padded activation reads.
+            for (int k = 0; k < I; k += 16) {
+                auto a = block_load<fp16, 16>(inter+row*I+k);
+                auto b = sh ? load_tile<true>(base, I, H, n, k)
+                            : load_tile<false>(base, H, I, n, k);
+                acc = dpas<8, 1, float, float, fp16, fp16>(acc, b, a);
+            }
+            if (sh) {
+                acc = convert<float>(convert<fp16>(acc*ss[0])) * float(gate[t]);
+            } else {
+                acc *= scale[e] * probs[t*K+r];
+            }
+            block_store<fp16, 16>(partial+row*H+n, convert<fp16>(acc));
+        });
+}
+
+void reduce(sycl::queue& q, const fp16* partial, fp16* out, int m) {
+    q.parallel_for<class Q38Fp8Reduce>(sycl::range<2>(m, H/128),
+        [=](sycl::id<2> id) SYCL_ESIMD_KERNEL {
+            int t = id[0], n = id[1]*128;
+            simd<float, 128> sum(0.0f);
+            for (int r = 0; r < K; ++r)
+                sum += convert<float>(block_load<fp16, 128>(partial+(t*R+r)*H+n));
+            // The routed MoE sum is rounded before adding the shared expert.
+            sum = convert<float>(convert<fp16>(sum));
+            sum += convert<float>(block_load<fp16, 128>(partial+(t*R+K)*H+n));
+            block_store<fp16, 128>(out+t*H+n, convert<fp16>(sum));
+        });
+}
+
+
+bool tensor_ok(const torch::Tensor& t, const torch::Device& dev, at::ScalarType dt) {
+    return t.defined() && t.device() == dev && t.scalar_type() == dt &&
+        t.layout() == c10::kStrided && t.is_contiguous() &&
+        !t.is_conj() && !t.is_neg();
+}
+
+bool aligned(const torch::Tensor& t, uintptr_t bytes) {
+    return reinterpret_cast<uintptr_t>(t.data_ptr()) % bytes == 0;
+}
+
+struct Scratch {
+    int m, inter;
+    torch::Tensor logits, gate, indices, probs, hidden, partial;
+};
+
+class Workspace {
+    std::unordered_map<c10::xpu::XPUStream, std::vector<Scratch>> buffers;
+    bool use_grouped_up;
+public:
+    explicit Workspace(int grouped_up_ = -1) {
+        TORCH_CHECK(grouped_up_ >= -1 && grouped_up_ <= 1,
+                    "grouped_up must be -1 (environment), 0, or 1");
+        const char* env = std::getenv("VLLM_XPU_QWEN38_FP8_MOE_GROUPED_UP");
+        TORCH_CHECK(!env || std::strcmp(env, "0") == 0 || std::strcmp(env, "1") == 0,
+                    "VLLM_XPU_QWEN38_FP8_MOE_GROUPED_UP must be 0 or 1");
+        use_grouped_up = grouped_up_ >= 0 ? grouped_up_ != 0 : env && env[0] == '1';
+    }
+    // weights: routed up/scale/down/scale, shared up/scale/down/scale, shared gate.
+    std::optional<torch::Tensor> try_run(
+        const torch::Tensor& x, const torch::Tensor& rw,
+        const std::vector<torch::Tensor>& w) {
+        if (!x.defined() || !x.is_xpu() || x.dim() != 2 ||
+            x.size(1) != H || x.size(0) < 1 || x.size(0) > 128 || w.size() != 9)
+            return std::nullopt;
+        const auto dev = x.device();
+        if (!tensor_ok(x, dev, torch::kHalf) || !tensor_ok(rw, dev, torch::kHalf) ||
+            rw.sizes() != at::IntArrayRef({E, H}) || !aligned(x, 16) || !aligned(rw, 16))
+            return std::nullopt;
+        for (int j = 0; j < 8; ++j)
+            if (!tensor_ok(w[j], dev, j%2 ? torch::kFloat : at::kFloat8_e4m3fn) ||
+                !aligned(w[j], j%2 ? 4 : 64))
+                return std::nullopt;
+        if (!tensor_ok(w[8], dev, torch::kHalf) || w[8].sizes() != at::IntArrayRef({1,H}) ||
+            !aligned(w[8], 16) || w[0].dim() != 3) return std::nullopt;
+        int i = w[0].size(2)/2;
+        if ((i != 80 && i != 160) ||
+            w[0].sizes() != at::IntArrayRef({E,H,2*i}) ||
+            w[2].sizes() != at::IntArrayRef({E,i,H}) ||
+            w[4].sizes() != at::IntArrayRef({2*i,H}) ||
+            w[6].sizes() != at::IntArrayRef({H,i}) ||
+            w[1].numel() != E || w[3].numel() != E ||
+            w[5].numel() != 1 || w[7].numel() != 1) return std::nullopt;
+        // Nothing above submits device work. Inputs are read-only and every
+        // output is newly owned, so caller aliases cannot corrupt the scratch.
+        int m = x.size(0);
+        int capacity = 1;
+        while (capacity < m) capacity *= 2;
+        auto stream = c10::xpu::getCurrentXPUStream(dev.index());
+        auto& list = buffers[stream];
+        Scratch* b = nullptr;
+        for (auto& candidate : list)
+            if (candidate.m == capacity && candidate.inter == i) { b = &candidate; break; }
+        if (!b) {
+            auto h = x.options();
+            // Power-of-two buckets bound persistent memory under mixed prefill
+            // lengths, without retiring scratch used by another stream.
+            list.push_back({capacity, i,
+                torch::empty({capacity,E}, h), torch::empty({capacity}, h),
+                torch::empty({capacity,K}, h.dtype(torch::kInt)),
+                torch::empty({capacity,K}, h.dtype(torch::kFloat)),
+                torch::empty({capacity,R,i}, h), torch::empty({capacity,R,H}, h)});
+            b = &list.back();
+        }
+        auto out = torch::empty_like(x);
+        auto& q = stream.queue();
+        // Direct pybind bypasses the dispatcher. Keep inputs alive if the
+        // caller retires a tensor allocated on a different stream.
+        c10::xpu::XPUCachingAllocator::recordStream(x.storage().data_ptr(), stream);
+        c10::xpu::XPUCachingAllocator::recordStream(rw.storage().data_ptr(), stream);
+        for (const auto& weight : w)
+            c10::xpu::XPUCachingAllocator::recordStream(weight.storage().data_ptr(), stream);
+        auto half = [](const torch::Tensor& t) { return (fp16*)t.data_ptr(); };
+        auto byte = [](const torch::Tensor& t) { return (const uint8_t*)t.data_ptr(); };
+        router(q, half(x), half(rw), half(w[8]), half(b->logits), half(b->gate), m);
+        topk(q, half(b->logits), b->indices.data_ptr<int>(), b->probs.data_ptr<float>(), m);
+        auto launch = [&]<int I>() {
+            if (use_grouped_up && m >= 2 && m <= 8)
+                grouped_up<I>(q, half(x), byte(w[0]), w[1].data_ptr<float>(), byte(w[4]),
+                      w[5].data_ptr<float>(), b->indices.data_ptr<int>(), half(b->hidden), m);
+            else
+                up<I>(q, half(x), byte(w[0]), w[1].data_ptr<float>(), byte(w[4]),
+                      w[5].data_ptr<float>(), b->indices.data_ptr<int>(), half(b->hidden), m);
+            down<I>(q, half(b->hidden), byte(w[2]), w[3].data_ptr<float>(), byte(w[6]),
+                    w[7].data_ptr<float>(), b->indices.data_ptr<int>(), b->probs.data_ptr<float>(),
+                    half(b->gate), half(b->partial), m);
+        };
+        if (i == 80) launch.template operator()<80>();
+        else launch.template operator()<160>();
+        reduce(q, half(b->partial), half(out), m);
+        return out;
+    }
+};
+} // namespace
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    pybind11::class_<Workspace>(m, "Workspace")
+        .def(pybind11::init<int>(), pybind11::arg("grouped_up") = -1)
+        .def("try_run", &Workspace::try_run);
+}

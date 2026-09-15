@@ -1,13 +1,14 @@
-import sys
 from pathlib import Path
 
+import torch
+from esimd_build_extention import BuildExtension
+from ngram_offload_build import make_ngram_offload_extension
+from qsa_build import make_qsa_extension
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import SyclExtension
-from esimd_build_extention import BuildExtension
 
 root = Path(__file__).parent.resolve()
 
-import torch
 torch_include = str(Path(torch.__file__).parent / "include")
 
 ext_modules = [
@@ -16,6 +17,8 @@ ext_modules = [
         sources=[
             "csrc/xpu/esimd_kernel.sycl",
             "csrc/xpu/torch_extension.cc",
+            "csrc/xpu/esimd_kernel_ple.sycl",
+            "csrc/xpu/torch_extension_ple.cc",
         ],
         include_dirs=[
             root / "include",
@@ -167,6 +170,26 @@ ext_modules.append(
 )
 ### MoE Batch kernels (FP8)
 
+# Qwen3.8 native-width FP8 decode. Separate modules keep the existing model
+# kernels and their ABI unchanged; each can be validated with build-only.
+for module, source in (
+    ("qwen38_fp8_moe_ops", "csrc/moe_batch/qwen38_fp8_moe.sycl"),
+    ("qwen38_fp8_linear_ops", "csrc/xpu/qwen38_fp8_linear.sycl"),
+):
+    ext_modules.append(
+        SyclExtension(
+            name=f"custom_esimd_kernels_vllm.{module}",
+            sources=[source],
+            extra_compile_args={
+                "cxx": ["-O3", "-std=c++20"],
+                "sycl": ["-std=c++20", "-fsycl-targets=spir64",
+                         "-fsycl-device-code-split=per_kernel",
+                         f"-I{torch_include}"],
+            },
+            extra_link_args=["-Wl,-rpath,$ORIGIN/../torch/lib"],
+        )
+    )
+
 ### MoE INT4 Batch kernels (Router, TopK, Up/Down, Finalize) — INT4
 ext_modules.append(
     SyclExtension(
@@ -237,6 +260,11 @@ ext_modules.append(
     )
 )
 ### Q4_0 quantize kernel
+
+### Qwen3.8 TP8-rank sparse paged attention — FP16 packed-cache ABI
+ext_modules.append(make_qsa_extension(root, torch_include))
+ext_modules.append(make_ngram_offload_extension())
+### Qwen3.8 QSA kernel
 
 setup(
     name="custom-esimd-kernels-vllm",

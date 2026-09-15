@@ -5,6 +5,8 @@
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#include "xpu/esimd_kernels/ple.h"
+
 // FP8 weight GEMV with per-N scale: output = input @ dequant(weight_fp8) * scale
 // FP32 accumulation, element-wise acc + deferred scale. Optimized for decode (M=1).
 at::Tensor esimd_gemv_fp8_pern(
@@ -35,6 +37,27 @@ at::Tensor esimd_gemv_fp8_pert(
 // FP16 weight GEMV (no scale): for fp16 GateLinear-style projections at decode.
 at::Tensor esimd_gemv_fp16(
     at::Tensor input, at::Tensor weight, at::Tensor output);
+
+// Qwen3.8 HC down GEMV.  The first 320 outputs receive SiLU(x / 4)
+// after the linear FP16 rounding boundary; an optional 16-row tail stays linear.
+void esimd_hc_up_gate_mix_m1_v1(
+    at::Tensor input, at::Tensor weight, at::Tensor normed, at::Tensor output);
+
+void esimd_hc_down_fp16_out(
+    at::Tensor input, at::Tensor weight, at::Tensor output);
+
+// 独立 M=2..8 ABI；caller-owned output，当前 in-order XPU stream。
+// down: input[M,10240], weight[N,10240], output[M,N] 均 contiguous，
+// N=320/336；前 320 列逐步 FP16 linear -> FP16 /4 -> FP32 SiLU -> FP16。
+void esimd_hc_down_fp16_multi_m_out_v1(
+    at::Tensor input, at::Tensor weight, at::Tensor output);
+
+// up: input[M,320/336] 前 320 列已 scaled-SiLU，inner stride=1，
+// row stride 为偶数且 >= 逻辑宽度；其余张量 contiguous。
+// weight[10240,320], normed[M,10240], output[M,2560]。
+// 两入口均要求 same-XPU FP16、真实指针 4-byte aligned、output 不 alias 输入。
+void esimd_hc_up_gate_mix_multi_m_v1(
+    at::Tensor input, at::Tensor weight, at::Tensor normed, at::Tensor output);
 
 // Fused FP16 gate-up GEMV plus GELU-tanh and multiply for Gemma MTP.
 // weight is [2*N, K] with gate rows followed by up rows; output is [1, N].
@@ -68,6 +91,20 @@ at::Tensor esimd_qkv_split_norm_rope(
     at::Tensor positions,
     int64_t q_heads, int64_t kv_heads, bool attn_output_gate,
     int64_t rotary_dim, at::Tensor cos_sin_cache);
+
+// Qwen3.8 exact interleaved 3-axis MRoPE variant.  The versioned ABI fixes
+// rotary_dim=64 and mrope_section=[11,11,10], matching the production QSA
+// checkpoint; positions are [3, nTokens] and may be int32 or int64.
+// positions_bounds_proven must be true only when scheduler CPU metadata proves
+// every position is non-negative and within cos_sin_cache rows.
+at::Tensor esimd_qkv_split_norm_rope_mrope_v1(
+    at::Tensor qkv_state,
+    at::Tensor q_out, at::Tensor gate_out,
+    at::Tensor k_out, at::Tensor v_out,
+    at::Tensor norm_wq, at::Tensor norm_wk,
+    at::Tensor positions,
+    int64_t q_heads, int64_t kv_heads, bool attn_output_gate,
+    bool positions_bounds_proven, at::Tensor cos_sin_cache);
 
 // Variant with V-Norm (gemma4): also RMSNorms V heads.
 at::Tensor esimd_qkv_split_norm_rope_v(
@@ -151,6 +188,20 @@ at::Tensor esimd_gdn_conv_fused_seq_spec(
     int64_t H, int64_t HV, int64_t K, int64_t V,
     double scale);
 
+// Versioned rollback-aware entry point. It retains the legacy geometry and
+// adds the Qwen3.8 TP=8 local geometry H=2, HV=6.
+at::Tensor esimd_gdn_conv_fused_seq_spec_v2(
+    at::Tensor qkvz,
+    at::Tensor conv_state, at::Tensor conv_weight, at::Tensor conv_bias,
+    at::Tensor spec_state_indices,
+    at::Tensor A_log, at::Tensor dt_bias,
+    at::Tensor ba, at::Tensor ssm_state,
+    at::Tensor output, at::Tensor z_out,
+    at::Tensor token_indx, at::Tensor num_accepted_tokens,
+    int64_t num_spec_decodes, int64_t num_spec_tokens,
+    int64_t H, int64_t HV, int64_t K, int64_t V,
+    double scale);
+
 // Fused ResidualAdd + RMSNorm + FP8 GEMV (post_attn_norm + router)
 at::Tensor esimd_resadd_norm_gemv_fp8_pert(
     at::Tensor hidden_states, at::Tensor residual, at::Tensor norm_weight,
@@ -197,6 +248,13 @@ at::Tensor esimd_norm_gemv_fp8_pert(
 // gemv_scale:   [N, K/128] fp16 — per-block INT4 scale
 // output:       [1, N] fp16
 at::Tensor esimd_norm_gemv_int4_pert(
+    at::Tensor x, at::Tensor z, at::Tensor norm_weight,
+    at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output,
+    int64_t HV, int64_t V, double eps);
+
+// Fused RMSNormGated + sigmoid gate + INT4 GEMV.  This is a separate ABI
+// because the legacy ``_pert`` entry point is defined to use SiLU gating.
+at::Tensor esimd_norm_gemv_int4_sigmoid(
     at::Tensor x, at::Tensor z, at::Tensor norm_weight,
     at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output,
     int64_t HV, int64_t V, double eps);
@@ -343,6 +401,10 @@ at::Tensor esimd_gemm_int4_pgrp(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output);
 
+at::Tensor esimd_gemm_int4_small_n_v1(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output);
+
 // MoE grouped GEMM — FP8 E5M2 with per-tensor scale (one scalar per expert)
 at::Tensor esimd_moe_gemm_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor scale,
@@ -358,6 +420,36 @@ void esimd_accum_norm_add_norm(
     at::Tensor routed_output, at::Tensor h1,
     at::Tensor w1, at::Tensor w2, at::Tensor out,
     int64_t top_k, double eps1, double eps2);
+
+// Qwen3.8 decode N-gram ID generation specialized for the checkpoint's fixed
+// 8-bigram + 8-trigram vocab sizes and offsets. The caller must guard those
+// metadata values before dispatch and use the Torch fallback on a mismatch.
+at::Tensor esimd_qwen38_ngram_ids_decode(
+    at::Tensor input_ids,
+    at::Tensor ngram_context,
+    at::Tensor layer_multipliers);
+
+at::Tensor esimd_qwen38_ngram_ids_decode_out(
+    at::Tensor input_ids,
+    at::Tensor ngram_context,
+    at::Tensor layer_multipliers,
+    at::Tensor output);
+
+// Qwen3.8 NG-2a single-rank local FP16 gather before TP all-reduce.
+// local_vocab_start/local_num_rows are runtime device scalars; the table row
+// count and row width are checked by the host wrapper.
+at::Tensor esimd_qwen38_ngram_embedding_gather(
+    at::Tensor ngram_ids,
+    at::Tensor local_weight,
+    at::Tensor local_vocab_start,
+    at::Tensor local_num_rows);
+
+at::Tensor esimd_qwen38_ngram_embedding_gather_out(
+    at::Tensor ngram_ids,
+    at::Tensor local_weight,
+    at::Tensor local_vocab_start,
+    at::Tensor local_num_rows,
+    at::Tensor local_partial);
 
 at::Tensor esimd_gemv_fp8_pert_bmg(
     at::Tensor input, at::Tensor weight,

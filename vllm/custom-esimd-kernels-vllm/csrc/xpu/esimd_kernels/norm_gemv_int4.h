@@ -2,7 +2,9 @@
  *
  * INT4 analogue of norm_gemv_fused.h (FP8 version).
  * Combines two operations into a single kernel submit:
- *   1. RMSNormGated: y = rmsnorm(x) * weight * silu(z), per-head (V dims each)
+ *   1. RMSNormGated: y = rmsnorm(x) * weight * gate(z), per-head (V dims each)
+ *      The legacy specialization uses SiLU(z); the sigmoid specialization uses
+ *      sigmoid(z) and is exposed through a separate ABI.
  *   2. GEMV: output = y_flat @ dequant(int4_weight^T) (per-block scale)
  *
  * Designed for GDN decode path where:
@@ -51,7 +53,7 @@ ESIMD_INLINE float hreduce128(simd<float, 128> v) {
  *
  * Grid: N work-groups × K_SPLIT threads per WG
  * ================================================================ */
-template<int K_SPLIT>
+template<int K_SPLIT, bool SIGMOID_GATE>
 struct NormGEMV_int4_kernel {
     const fp16*    x_ptr;        // [HV, V] core_attn_out
     const fp16*    z_ptr;        // [HV, V] z_out
@@ -116,10 +118,14 @@ struct NormGEMV_int4_kernel {
             float inv_rms = sycl::ext::intel::esimd::rsqrt(
                 simd<float, 8>(sum_sq * (1.0f / V) + eps))[0];
 
-            // ── Normalize + SiLU gate ──
+            // ── Normalize + activation-specific gate ──
             simd<float, 128> normed = x_f * inv_rms * norm_w;
             simd<float, 128> exp_neg_z = sycl::ext::intel::esimd::exp(-z_f);
-            normed *= z_f / (1.0f + exp_neg_z);
+            if constexpr (SIGMOID_GATE) {
+                normed *= 1.0f / (1.0f + exp_neg_z);
+            } else {
+                normed *= z_f / (1.0f + exp_neg_z);
+            }
 
             // ── INT4 dequant + dot product (byte-level nibble extraction) ──
             // Load 16 packed int32 = 128 INT4 values = one block
@@ -166,7 +172,8 @@ struct NormGEMV_int4_kernel {
 /* ================================================================
  * Host dispatcher — auto-selects K_SPLIT based on HV and N
  * ================================================================ */
-inline void norm_gemv_int4_host(
+template <bool SIGMOID_GATE>
+inline void norm_gemv_int4_host_impl(
     const fp16* x_ptr,
     const fp16* z_ptr,
     const fp16* norm_w_ptr,
@@ -181,9 +188,11 @@ inline void norm_gemv_int4_host(
     // Large N (>512) has enough WGs — use K_SPLIT=1 to avoid SLM overhead.
     int ks = 1;
     if (N <= 512) {
-        if      (HV >= 8) ks = 8;
-        else if (HV >= 4) ks = 4;
-        else if (HV >= 2) ks = 2;
+        // The kernel assigns exactly HV / K_SPLIT heads to each work-item,
+        // so only use splits that cover HV without a remainder.
+        if      (HV >= 8 && HV % 8 == 0) ks = 8;
+        else if (HV >= 4 && HV % 4 == 0) ks = 4;
+        else if (HV >= 2 && HV % 2 == 0) ks = 2;
     }
 
     int global = N * ks;
@@ -193,7 +202,7 @@ inline void norm_gemv_int4_host(
         q.submit([&](sycl::handler& cgh) { \
             cgh.parallel_for( \
                 sycl::nd_range<1>(global, local), \
-                NormGEMV_int4_kernel<S>{ \
+                NormGEMV_int4_kernel<S, SIGMOID_GATE>{ \
                     x_ptr, z_ptr, norm_w_ptr, \
                     gemv_weight, gemv_scale, output, \
                     N, HV, V, eps}); \
@@ -207,4 +216,36 @@ inline void norm_gemv_int4_host(
     }
 
     #undef LAUNCH_NORM_GEMV_INT4
+}
+
+inline void norm_gemv_int4_host(
+    const fp16* x_ptr,
+    const fp16* z_ptr,
+    const fp16* norm_w_ptr,
+    const int32_t* gemv_weight,
+    const fp16* gemv_scale,
+    fp16* output,
+    int N, int HV, int V,
+    float eps,
+    sycl::queue& q)
+{
+    norm_gemv_int4_host_impl<false>(
+        x_ptr, z_ptr, norm_w_ptr, gemv_weight, gemv_scale, output,
+        N, HV, V, eps, q);
+}
+
+inline void norm_gemv_int4_sigmoid_host(
+    const fp16* x_ptr,
+    const fp16* z_ptr,
+    const fp16* norm_w_ptr,
+    const int32_t* gemv_weight,
+    const fp16* gemv_scale,
+    fp16* output,
+    int N, int HV, int V,
+    float eps,
+    sycl::queue& q)
+{
+    norm_gemv_int4_host_impl<true>(
+        x_ptr, z_ptr, norm_w_ptr, gemv_weight, gemv_scale, output,
+        N, HV, V, eps, q);
 }

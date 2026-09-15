@@ -1,0 +1,622 @@
+"""Independent XPU tests for the HC M=1 host-batched chain.
+
+The test intentionally imports only the canonical ESIMD package, or loads the
+canonical main DSO named by ``HC_CHAIN_DSO``.  It does not import vLLM.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+import torch
+
+CHAIN_SCHEMA = "custom_esimd_kernels_vllm::hc_combine_mix_m1_v1"
+MULTI_GATE_SCHEMA = "custom_esimd_kernels_vllm::hc_gate_mix_multi_m_v1"
+MULTI_COMBINE_NORM_SCHEMA = (
+    "custom_esimd_kernels_vllm::hc_combine_norm_multi_m_v1"
+)
+EPS = 1.0e-6
+ROWS = 1
+HC_WIDTH = 10240
+HC_HIDDEN = 2560
+HC_COUNT = 4
+DOWN_WIDTH = 336
+HC_RANK = 320
+
+
+@pytest.fixture(scope="module")
+def device() -> torch.device:
+    if not torch.xpu.is_available():
+        pytest.skip("XPU is unavailable")
+    return torch.device("xpu:0")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _load_canonical_main(device: torch.device) -> None:
+    configured = os.environ.get("HC_CHAIN_DSO")
+    if configured:
+        dso = Path(configured)
+        if not dso.is_file():
+            pytest.fail(f"HC_CHAIN_DSO does not exist: {dso}")
+        torch.ops.load_library(str(dso))
+    else:
+        try:
+            import custom_esimd_kernels_vllm  # noqa: F401
+        except ImportError as exc:
+            pytest.skip(
+                f"canonical custom_esimd_kernels_vllm package is unavailable: {exc}"
+            )
+
+    if not torch._C._jit_get_schemas_for_operator(CHAIN_SCHEMA):
+        pytest.fail(f"canonical main DSO did not register {CHAIN_SCHEMA}")
+
+
+@pytest.fixture(scope="module")
+def multi_m_available() -> bool:
+    return bool(
+        torch._C._jit_get_schemas_for_operator(MULTI_GATE_SCHEMA)
+        and torch._C._jit_get_schemas_for_operator(MULTI_COMBINE_NORM_SCHEMA)
+    )
+
+
+def _chain_op():
+    return torch.ops.custom_esimd_kernels_vllm.hc_combine_mix_m1_v1
+
+
+@pytest.mark.parametrize("on_cpu", [False, True])
+def test_batched_alias_matches_aten_without_writes(device, on_cpu):
+    operation = getattr(
+        torch.ops.custom_esimd_kernels_vllm, "hc_outputs_alias_inputs_v1", None
+    )
+    if operation is None:
+        pytest.skip("canonical main DSO lacks optional batched alias schema")
+    target = torch.device("cpu") if on_cpu else device
+    base = torch.arange(32, device=target)
+    other = torch.zeros_like(base)
+    outputs = (base[:8], other[:8])
+    for inputs in ((base[16:],), (other[12:],), (torch.ones_like(base),), ()):
+        expected = any(
+            torch._C._is_alias_of(output, value)
+            for output in outputs for value in inputs
+        )
+        assert operation(outputs, inputs) == expected
+    assert not operation((), (base,))
+    replacement = torch.full_like(base, 7)
+    outputs[0].set_(replacement.untyped_storage(), 0, (8,))
+    assert operation(outputs, (replacement,))
+    assert torch.equal(replacement, torch.full_like(base, 7))
+
+
+def _random_fp16(
+    device: torch.device,
+    shape: tuple[int, ...],
+    generator: torch.Generator,
+    scale: float,
+) -> torch.Tensor:
+    cpu_value = torch.randn(shape, generator=generator, dtype=torch.float32)
+    return (cpu_value * scale).to(device=device, dtype=torch.float16).contiguous()
+
+
+def _make_inputs(device: torch.device, *, rows: int = ROWS, seed: int = 3801):
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    return (
+        _random_fp16(device, (rows, HC_WIDTH), generator, 0.25),
+        _random_fp16(device, (rows, HC_HIDDEN), generator, 0.25),
+        _random_fp16(device, (rows, HC_COUNT), generator, 0.5),
+        _random_fp16(device, (HC_WIDTH,), generator, 0.05),
+        _random_fp16(device, (DOWN_WIDTH, HC_WIDTH), generator, 0.01),
+        _random_fp16(device, (HC_WIDTH, HC_RANK), generator, 0.01),
+    )
+
+
+def _make_outputs(device: torch.device, *, rows: int = ROWS):
+    shapes = (
+        (rows, HC_WIDTH),
+        (rows, HC_WIDTH),
+        (rows, DOWN_WIDTH),
+        (rows, HC_WIDTH),
+        (rows, HC_HIDDEN),
+    )
+    sentinels = (0.125, -0.25, 0.375, -0.5, 0.625)
+    return tuple(
+        torch.full(shape, value, dtype=torch.float16, device=device)
+        for shape, value in zip(shapes, sentinels)
+    )
+
+
+def _chain_args(inputs, outputs, eps: float = EPS):
+    return (*inputs, *outputs, eps)
+
+
+def _run_chain(inputs, outputs, eps: float = EPS):
+    return _chain_op()(*_chain_args(inputs, outputs, eps))
+
+
+def _run_four_existing_ops(inputs, outputs, eps: float = EPS) -> None:
+    hidden, block, injection, norm_weight, down_weight, up_weight = inputs
+    combined, normed, down, gate, mixed = outputs
+    ops = torch.ops.custom_esimd_kernels_vllm
+
+    assert (
+        ops.hc_combine_norm_v1(
+            hidden,
+            block,
+            injection,
+            norm_weight,
+            combined,
+            normed,
+            eps,
+        )
+        is None
+    )
+    assert ops.esimd_hc_down_fp16_out(normed, down_weight, down) is None
+    assert (
+        ops.esimd_gemv_fp16(down[:, :HC_RANK], up_weight, gate).data_ptr()
+        == gate.data_ptr()
+    )
+    assert ops.hc_gate_mix_v1(normed, gate, mixed) is None
+
+
+def _assert_exact(actual, expected) -> None:
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        assert actual_tensor.shape == expected_tensor.shape
+        assert actual_tensor.dtype == expected_tensor.dtype
+        assert torch.equal(actual_tensor.cpu(), expected_tensor.cpu())
+
+
+def _snapshot_outputs(outputs):
+    torch.xpu.synchronize()
+    return tuple(output.cpu().clone() for output in outputs)
+
+
+def _assert_outputs_unchanged(outputs, snapshots) -> None:
+    torch.xpu.synchronize()
+    for output, snapshot in zip(outputs, snapshots):
+        assert torch.equal(output.cpu(), snapshot)
+
+
+def _assert_rejected_without_writes(inputs, outputs, eps: float = EPS) -> None:
+    snapshots = _snapshot_outputs(outputs)
+    with pytest.raises(RuntimeError):
+        _run_chain(inputs, outputs, eps)
+    _assert_outputs_unchanged(outputs, snapshots)
+
+
+def test_chain_matches_the_four_existing_ops_bitwise(device: torch.device) -> None:
+    inputs = _make_inputs(device)
+    chain_outputs = _make_outputs(device)
+    reference_outputs = _make_outputs(device)
+
+    assert _run_chain(inputs, chain_outputs) is None
+    _run_four_existing_ops(inputs, reference_outputs)
+    torch.xpu.synchronize()
+
+    _assert_exact(chain_outputs, reference_outputs)
+    assert chain_outputs[2][:, 320:324].shape == (1, 4)
+
+
+@pytest.mark.parametrize("scale", [0.01, 0.2, 1.0, 8.0])
+def test_fused_up_gate_preserves_fp16_projection_rounding(device, scale):
+    operation = getattr(
+        torch.ops.custom_esimd_kernels_vllm, "esimd_hc_up_gate_mix_m1_v1", None
+    )
+    if operation is None:
+        pytest.skip("main DSO lacks fused HC up+gate")
+    generator = torch.Generator().manual_seed(3820)
+    x = _random_fp16(device, (1, HC_RANK), generator, scale)
+    w = _random_fp16(device, (HC_WIDTH, HC_RANK), generator, scale)
+    normed = _random_fp16(device, (1, HC_WIDTH), generator, 1.0)
+    expected = torch.empty((1, HC_HIDDEN), device=device, dtype=torch.float16)
+    actual = torch.empty_like(expected)
+    gate = torch.empty_like(normed)
+    ops = torch.ops.custom_esimd_kernels_vllm
+    ops.esimd_gemv_fp16(x, w, gate)
+    ops.hc_gate_mix_v1(normed, gate, expected)
+    operation(x, w, normed, actual)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # Current and nondefault streams need no shared workspace or host wait.
+    stream = torch.xpu.Stream(device=device)
+    stream.wait_stream(torch.xpu.current_stream(device))
+    with torch.xpu.stream(stream):
+        for _ in range(32):
+            operation(x, w, normed, actual)
+    torch.xpu.current_stream(device).wait_stream(stream)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_fused_chain_keeps_outputs_and_transaction_preflight(device):
+    operation = getattr(
+        torch.ops.custom_esimd_kernels_vllm, "hc_combine_mix_m1_v2", None
+    )
+    if operation is None:
+        pytest.skip("main DSO lacks HC chain v2")
+    inputs = _make_inputs(device)
+    actual, expected = _make_outputs(device), _make_outputs(device)
+    _run_four_existing_ops(inputs, expected)
+    operation(*inputs, *actual, EPS)
+    # v2 does not materialize the obsolete gate scratch, kept for ABI stability.
+    for index in (0, 1, 2, 4):
+        torch.testing.assert_close(actual[index], expected[index], rtol=0, atol=0)
+    snapshots = _snapshot_outputs(actual)
+    with pytest.raises(RuntimeError):
+        operation(*inputs, *actual, -1.0)
+    _assert_outputs_unchanged(actual, snapshots)
+    bad_outputs = (*actual[:4], actual[0][:, :HC_HIDDEN])
+    with pytest.raises(RuntimeError):
+        operation(*inputs, *bad_outputs, EPS)
+    _assert_outputs_unchanged(actual, snapshots)
+
+
+def test_workspace_matches_v2_and_owns_scratch_per_stream(device):
+    try:
+        workspace = torch.classes.custom_esimd_kernels_vllm.HCWorkspace()
+    except RuntimeError:
+        pytest.skip("main DSO lacks optional HCWorkspace class")
+
+    inputs = _make_inputs(device, seed=3807)
+    expected = _make_outputs(device)
+    _run_four_existing_ops(inputs, expected)
+
+    actual = workspace.run(*inputs, EPS)
+    torch.xpu.synchronize()
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], expected[4], rtol=0, atol=0)
+    torch.testing.assert_close(actual[2], expected[2][:, 320:324], rtol=0, atol=0)
+
+    first_pointers = tuple(value.data_ptr() for value in actual)
+    repeated = workspace.run(*inputs, EPS)
+    assert tuple(value.data_ptr() for value in repeated) == first_pointers
+
+    # Returned tensors are live outputs.  Reusing them as the next input must
+    # force a fresh owner scratch allocation rather than overwrite in-flight
+    # data on the same stream.
+    recurrent_inputs = (
+        actual[0], inputs[1], actual[2], *inputs[3:]
+    )
+    recurrent = workspace.run(*recurrent_inputs, EPS)
+    assert recurrent[0].data_ptr() != actual[0].data_ptr()
+    assert recurrent[2].data_ptr() != actual[2].data_ptr()
+
+    other_stream = torch.xpu.Stream(device=device)
+    with torch.xpu.stream(other_stream):
+        other = workspace.run(*inputs, EPS)
+    other_stream.synchronize()
+    assert other[0].data_ptr() not in {
+        actual[0].data_ptr(), recurrent[0].data_ptr()
+    }
+
+    bad_inputs = _make_inputs(device, rows=2, seed=3808)
+    with pytest.raises(RuntimeError):
+        workspace.run(*bad_inputs, EPS)
+
+
+def test_rejects_bad_dtype_before_writing_outputs(device: torch.device) -> None:
+    inputs = list(_make_inputs(device))
+    inputs[5] = inputs[5].float()
+    _assert_rejected_without_writes(tuple(inputs), _make_outputs(device))
+
+
+def test_rejects_m_gt_1_before_writing_outputs(device: torch.device) -> None:
+    inputs = _make_inputs(device, rows=2, seed=3802)
+    outputs = _make_outputs(device, rows=2)
+    _assert_rejected_without_writes(inputs, outputs)
+
+
+def test_rejects_late_output_before_writing_outputs(device: torch.device) -> None:
+    inputs = _make_inputs(device, seed=3803)
+    outputs = list(_make_outputs(device))
+    outputs[4] = torch.full(
+        (1, HC_HIDDEN - 1),
+        0.875,
+        dtype=torch.float16,
+        device=device,
+    )
+    _assert_rejected_without_writes(inputs, tuple(outputs))
+
+
+def test_rejects_output_input_and_output_output_aliases_without_writes(
+    device: torch.device,
+) -> None:
+    inputs = _make_inputs(device, seed=3804)
+
+    output_input_alias = list(_make_outputs(device))
+    output_input_alias[0] = inputs[0]
+    _assert_rejected_without_writes(inputs, tuple(output_input_alias))
+
+    shared = torch.full(
+        (1, 2 * HC_WIDTH),
+        0.9375,
+        dtype=torch.float16,
+        device=device,
+    )
+    output_output_alias = list(_make_outputs(device))
+    output_output_alias[0] = shared[:, :HC_WIDTH]
+    output_output_alias[1] = shared[:, HC_WIDTH:]
+    _assert_rejected_without_writes(inputs, tuple(output_output_alias))
+
+
+@pytest.mark.parametrize(
+    "bad_eps",
+    (0.0, -1.0e-6, 1.0e-300, float("nan"), float("inf")),
+)
+def test_rejects_invalid_eps_before_writing_outputs(
+    device: torch.device,
+    bad_eps: float,
+) -> None:
+    inputs = _make_inputs(device, seed=3805)
+    _assert_rejected_without_writes(inputs, _make_outputs(device), bad_eps)
+
+
+def _run_repeated_on_stream(
+    inputs,
+    device: torch.device,
+    stream: torch.xpu.Stream,
+) -> None:
+    with torch.xpu.stream(stream):
+        actual = _make_outputs(device)
+        expected = _make_outputs(device)
+        for _ in range(8):
+            assert _run_chain(inputs, actual) is None
+        _run_four_existing_ops(inputs, expected)
+
+    stream.synchronize()
+    _assert_exact(actual, expected)
+
+
+def test_repeated_submissions_on_current_and_nondefault_stream(
+    device: torch.device,
+) -> None:
+    inputs = _make_inputs(device, seed=3806)
+    torch.xpu.synchronize()
+
+    current_stream = torch.xpu.current_stream(device=device)
+    nondefault_stream = torch.xpu.Stream(device=device)
+    _run_repeated_on_stream(inputs, device, current_stream)
+    _run_repeated_on_stream(inputs, device, nondefault_stream)
+
+
+def _run_multi_reference(inputs, gate, combined, normed, mixed) -> None:
+    hidden, block, injection, norm_weight, *_ = inputs
+    ops = torch.ops.custom_esimd_kernels_vllm
+    for row in range(hidden.shape[0]):
+        row_slice = slice(row, row + 1)
+        assert (
+            ops.hc_combine_norm_v1(
+                hidden[row_slice],
+                block[row_slice],
+                injection[row_slice],
+                norm_weight,
+                combined[row_slice],
+                normed[row_slice],
+                EPS,
+            )
+            is None
+        )
+        assert (
+            ops.hc_gate_mix_v1(
+                normed[row_slice], gate[row_slice], mixed[row_slice]
+            )
+            is None
+        )
+
+
+def _run_multi_native(inputs, gate, combined, normed, mixed) -> None:
+    hidden, block, injection, norm_weight, *_ = inputs
+    ops = torch.ops.custom_esimd_kernels_vllm
+    assert (
+        ops.hc_combine_norm_multi_m_v1(
+            hidden,
+            block,
+            injection,
+            norm_weight,
+            combined,
+            normed,
+            EPS,
+        )
+        is None
+    )
+    assert ops.hc_gate_mix_multi_m_v1(normed, gate, mixed) is None
+
+
+def test_legacy_m4_symbols_reject_non_m4_rows_without_writes(
+    device: torch.device,
+) -> None:
+    rows = 2
+    inputs = _make_inputs(device, rows=rows, seed=3940)
+    hidden, block, injection, norm_weight, *_ = inputs
+    gate = torch.randn_like(hidden)
+    combined = torch.full_like(hidden, 0.125)
+    normed = torch.full_like(hidden, -0.25)
+    mixed = torch.full(
+        (rows, HC_HIDDEN), 0.375, dtype=torch.float16, device=device
+    )
+    snapshots = tuple(
+        output.cpu().clone() for output in (combined, normed, mixed)
+    )
+    ops = torch.ops.custom_esimd_kernels_vllm
+
+    with pytest.raises(RuntimeError):
+        ops.hc_combine_norm_m4_v1(
+            hidden,
+            block,
+            injection,
+            norm_weight,
+            combined,
+            normed,
+            EPS,
+        )
+    with pytest.raises(RuntimeError):
+        ops.hc_gate_mix_m4_v1(normed, gate, mixed)
+    torch.xpu.synchronize()
+    for output, snapshot in zip((combined, normed, mixed), snapshots):
+        assert torch.equal(output.cpu(), snapshot)
+
+
+def test_multi_m2_to_m8_matches_m1_reference(
+    device: torch.device, multi_m_available: bool
+) -> None:
+    """The additive multi-M ABI covers every supported small M."""
+    if not multi_m_available:
+        pytest.skip("canonical DSO lacks the additive multi-M HC ABI")
+
+    for rows in range(2, 9):
+        inputs = _make_inputs(device, rows=rows, seed=3900 + rows)
+        generator = torch.Generator(device="cpu").manual_seed(4900 + rows)
+        gate = _random_fp16(
+            device, (rows, HC_WIDTH), generator, 0.25
+        )
+        native_outputs = (
+            torch.empty((rows, HC_WIDTH), dtype=torch.float16, device=device),
+            torch.empty((rows, HC_WIDTH), dtype=torch.float16, device=device),
+            torch.empty((rows, HC_HIDDEN), dtype=torch.float16, device=device),
+        )
+        reference_outputs = tuple(
+            torch.empty_like(output) for output in native_outputs
+        )
+
+        _run_multi_native(inputs, gate, *native_outputs)
+        _run_multi_reference(inputs, gate, *reference_outputs)
+        torch.xpu.synchronize()
+
+        # M1 and M4 use the same FP16 contract, while their ESIMD math has
+        # different vector grouping.  Keep the check at a few half ulps; M=4
+        # is additionally compared against the old DSO by the benchmark.
+        for actual, expected in zip(native_outputs, reference_outputs):
+            torch.testing.assert_close(
+                actual,
+                expected,
+                rtol=0.0,
+                atol=2.0e-3,
+            )
+
+
+@pytest.mark.parametrize("rows", [1, 9])
+def test_multi_rejects_rows_before_writing_outputs(
+    device: torch.device, multi_m_available: bool, rows: int
+) -> None:
+    if not multi_m_available:
+        pytest.skip("canonical DSO lacks the additive multi-M HC ABI")
+    inputs = _make_inputs(device, rows=rows, seed=3950 + rows)
+    hidden, block, injection, norm_weight, *_ = inputs
+    gate = torch.randn_like(hidden)
+    combined = torch.full_like(hidden, 0.125)
+    normed = torch.full_like(hidden, -0.25)
+    mixed = torch.full(
+        (rows, HC_HIDDEN), 0.375, dtype=torch.float16, device=device
+    )
+    snapshots = tuple(
+        output.cpu().clone() for output in (combined, normed, mixed)
+    )
+    ops = torch.ops.custom_esimd_kernels_vllm
+
+    with pytest.raises(RuntimeError):
+        ops.hc_combine_norm_multi_m_v1(
+            hidden,
+            block,
+            injection,
+            norm_weight,
+            combined,
+            normed,
+            EPS,
+        )
+    with pytest.raises(RuntimeError):
+        ops.hc_gate_mix_multi_m_v1(normed, gate, mixed)
+    torch.xpu.synchronize()
+    for output, snapshot in zip((combined, normed, mixed), snapshots):
+        assert torch.equal(output.cpu(), snapshot)
+
+
+def test_multi_rejects_alias_and_odd_storage_without_writes(
+    device: torch.device, multi_m_available: bool
+) -> None:
+    if not multi_m_available:
+        pytest.skip("canonical DSO lacks the additive multi-M HC ABI")
+    rows = 2
+    inputs = _make_inputs(device, rows=rows, seed=3960)
+    hidden, block, injection, norm_weight, *_ = inputs
+    ops = torch.ops.custom_esimd_kernels_vllm
+
+    combined = torch.full_like(hidden, 0.125)
+    normed = combined
+    combined_snapshot = combined.cpu().clone()
+    with pytest.raises(RuntimeError):
+        ops.hc_combine_norm_multi_m_v1(
+            hidden,
+            block,
+            injection,
+            norm_weight,
+            combined,
+            normed,
+            EPS,
+        )
+    torch.xpu.synchronize()
+    assert torch.equal(combined.cpu(), combined_snapshot)
+
+    odd_storage = torch.empty(
+        rows * HC_WIDTH + 1, dtype=torch.float16, device=device
+    )
+    odd_hidden = odd_storage[1:].view(rows, HC_WIDTH)
+    combined = torch.full_like(hidden, 0.25)
+    normed = torch.full_like(hidden, -0.5)
+    snapshots = (combined.cpu().clone(), normed.cpu().clone())
+    with pytest.raises(RuntimeError):
+        ops.hc_combine_norm_multi_m_v1(
+            odd_hidden,
+            block,
+            injection,
+            norm_weight,
+            combined,
+            normed,
+            EPS,
+        )
+    torch.xpu.synchronize()
+    assert torch.equal(combined.cpu(), snapshots[0])
+    assert torch.equal(normed.cpu(), snapshots[1])
+
+    odd_gate_storage = torch.empty(
+        rows * HC_WIDTH + 1, dtype=torch.float16, device=device
+    )
+    odd_gate = odd_gate_storage[1:].view(rows, HC_WIDTH)
+    odd_gate.copy_(torch.randn_like(odd_gate))
+    mixed = torch.full(
+        (rows, HC_HIDDEN), 0.75, dtype=torch.float16, device=device
+    )
+    mixed_snapshot = mixed.cpu().clone()
+    with pytest.raises(RuntimeError):
+        ops.hc_gate_mix_multi_m_v1(normed, odd_gate, mixed)
+    torch.xpu.synchronize()
+    assert torch.equal(mixed.cpu(), mixed_snapshot)
+
+
+def test_multi_repeated_submissions_on_two_streams(
+    device: torch.device, multi_m_available: bool
+) -> None:
+    if not multi_m_available:
+        pytest.skip("canonical DSO lacks the additive multi-M HC ABI")
+    rows = 8
+    inputs = _make_inputs(device, rows=rows, seed=3970)
+    generator = torch.Generator(device="cpu").manual_seed(4970)
+    gate = _random_fp16(device, (rows, HC_WIDTH), generator, 0.25)
+    current_outputs = (
+        torch.empty((rows, HC_WIDTH), dtype=torch.float16, device=device),
+        torch.empty((rows, HC_WIDTH), dtype=torch.float16, device=device),
+        torch.empty((rows, HC_HIDDEN), dtype=torch.float16, device=device),
+    )
+    other_outputs = tuple(
+        torch.empty_like(output) for output in current_outputs
+    )
+    torch.xpu.synchronize()
+    current_stream = torch.xpu.current_stream(device=device)
+    other_stream = torch.xpu.Stream(device=device)
+    _run_multi_native(inputs, gate, *current_outputs)
+    other_stream.wait_stream(current_stream)
+    with torch.xpu.stream(other_stream):
+        _run_multi_native(inputs, gate, *other_outputs)
+    current_stream.synchronize()
+    other_stream.synchronize()
+
+    for current, other in zip(current_outputs, other_outputs):
+        torch.testing.assert_close(current, other, rtol=0.0, atol=0.0)

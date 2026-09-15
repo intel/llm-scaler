@@ -8,12 +8,14 @@
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
+#include <c10/xpu/XPUFunctions.h>
 #include <torch/python.h>
 
 #include <cstdint>
 
 #include "esimd_kernels/fp8_GEMM_pert.h"
 #include "esimd_kernels/int4_GEMM.h"
+#include "esimd_kernels/int4_small_n.h"
 #include "esimd_kernels/fp8_GEMM_blockscale.h"
 #include "esimd_kernels/norm_gemv_fused.h"
 
@@ -67,6 +69,11 @@ at::Tensor esimd_gemm_int4_pgrp(
                 "esimd_gemm_int4_pgrp: weight_scale must be fp16");
     TORCH_CHECK(output.scalar_type() == at::ScalarType::Half,
                 "esimd_gemm_int4_pgrp: output must be fp16");
+    // int4_GEMM.h has eight 8-row tiles as its largest specialization.
+    // Reject direct oversized calls so callers cannot receive a partially
+    // written output; the PLE wrapper chunks larger batches before dispatch.
+    TORCH_CHECK(M >= 2 && M <= 64,
+                "esimd_gemm_int4_pgrp: M must be in [2, 64], got M=", M);
     TORCH_CHECK(N % 16 == 0,
                 "esimd_gemm_int4_pgrp: N must be a multiple of 16 (DPAS N tile), got N=", N);
     TORCH_CHECK(K % INT4_GEMM_GROUP_SIZE == 0,
@@ -91,6 +98,47 @@ at::Tensor esimd_gemm_int4_pgrp(
 }
 
 // ---- FP8 block-scaled GEMM (DeepSeek 128x128 weight block scale, w8a16) ----
+at::Tensor esimd_gemm_int4_small_n_v1(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output) {
+    TORCH_CHECK(input.dim() == 2 && weight.dim() == 2 &&
+                    weight_scale.dim() == 2 && output.dim() == 2,
+                "INT4 small-N requires two-dimensional tensors");
+    const int64_t M = input.size(0), N = weight.size(0);
+    TORCH_CHECK(M >= 2 && M <= 8 && (N == 12 || N == 24) &&
+                    input.size(1) == 2560 && weight.size(1) == 1280 &&
+                    weight_scale.size(0) == N && weight_scale.size(1) == 20 &&
+                    output.size(0) == M && output.size(1) == N,
+                "INT4 small-N requires M2..8, N12/24, K2560, group128");
+    TORCH_CHECK(input.scalar_type() == at::kHalf && weight.scalar_type() == at::kByte &&
+                    weight_scale.scalar_type() == at::kHalf && output.scalar_type() == at::kHalf,
+                "INT4 small-N requires FP16 input/scale/output and uint8 weight");
+    TORCH_CHECK(input.device().is_xpu(), "INT4 small-N requires XPU");
+    for (const auto& tensor : {input, weight, weight_scale, output}) {
+        TORCH_CHECK(tensor.device() == input.device() && tensor.is_contiguous() &&
+                        !tensor.is_neg() && !tensor.is_conj() &&
+                        reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0,
+                    "INT4 small-N requires same-device contiguous aligned non-lazy tensors");
+    }
+    const auto out_begin = reinterpret_cast<uintptr_t>(output.data_ptr());
+    const auto out_end = out_begin + output.nbytes();
+    for (const auto& tensor : {input, weight, weight_scale}) {
+        const auto begin = reinterpret_cast<uintptr_t>(tensor.data_ptr());
+        TORCH_CHECK(out_begin >= begin + tensor.nbytes() || begin >= out_end,
+                    "INT4 small-N output must not overlap input storage");
+    }
+    auto& queue = get_device_queue(input);
+    TORCH_CHECK(queue.is_in_order() &&
+                    queue.get_context() == c10::xpu::get_device_context() &&
+                    queue.get_device() == c10::xpu::get_raw_device(input.device().index()),
+                "INT4 small-N requires current in-order queue/device/context");
+    qwen38_small_n::launch(
+        reinterpret_cast<const fp16*>(input.data_ptr()), weight.data_ptr<uint8_t>(),
+        reinterpret_cast<const fp16*>(weight_scale.data_ptr()),
+        reinterpret_cast<fp16*>(output.data_ptr()), M, N, queue);
+    return output;
+}
+
 // input: [M, K] fp16, weight: [N, K] fp8_e4m3 (uint8 bits),
 // weight_scale: [ceil(N/block_n), ceil(K/block_k)] fp32 (== weight_scale_inv),
 // output: [M, N] fp16 pre-allocated. Activation stays fp16 (no act quant).
