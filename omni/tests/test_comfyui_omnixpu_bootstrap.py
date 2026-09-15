@@ -115,6 +115,7 @@ def test_disabled_components_are_reported_without_importing_modules(monkeypatch)
         int8_ffn=False,
         dynamic_vram_boundary_trim=False,
         lora_memory=False,
+        quantized_matmul=False,
         seedvr_ada_reshape=False,
         seedvr_capacity=False,
         seedvr_cat_pad=False,
