@@ -23,10 +23,6 @@ ComfyUI-OmniXPU enables eligible XPU calls, Kitchen dispatches them, and
 Triton installation or `SOL_ATTN_XPU_EXPERIMENTAL=1` switch is needed for this
 XPU route.
 
-The user-facing XPU workflow evidence covers MiniMax-H3 on Ubuntu 24.04 with
-Intel Arc Pro B70. The historical [Windows Portable setup](WINDOWS_PORTABLE.md)
-does not establish native SOL/SLA/VSA support for its older pinned stack.
-
 ## Connect the node
 
 1. Start with the model's maintained ComfyUI template and load its matching
