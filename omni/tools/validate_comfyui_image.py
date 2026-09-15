@@ -859,7 +859,9 @@ def main() -> None:
 
     require_aimdo_xpu_devices(comfy_aimdo.control)
 
-    require_kitchen_xpu_capabilities(comfy_kitchen.list_backends()["xpu"])
+    kitchen_backend = comfy_kitchen.list_backends()["xpu"]
+    capabilities = kitchen_backend["capabilities"]
+    require_kitchen_xpu_capabilities(kitchen_backend)
     sol_attn_backend = require_native_sparse_attention_backend()
 
     audio = torch.linspace(-1.0, 1.0, 1600, device="xpu").unsqueeze(0)
