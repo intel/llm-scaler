@@ -262,7 +262,8 @@ def test_m1_workspace_defers_lazy_views_to_legacy_dispatcher(workspace_case):
 def golden(x, logits, cpu, *, prefill=False, include_shared=True):
     q13, s13, q2, s2, su, sd, sg = cpu
     probability = logits.float().softmax(-1)
-    rw, ids = probability.topk(10, dim=-1)
+    ids = probability.argsort(dim=-1, descending=True, stable=True)[:, :10]
+    rw = probability.gather(1, ids)
     rw = rw / rw.sum(-1, keepdim=True)
     if not prefill:
         rw = rw.half().float()
@@ -302,9 +303,37 @@ def test_native_matches_independent_fp32_routed_golden(case, m):
     torch.testing.assert_close(actual.cpu(), expected, atol=OUTPUT_ATOL, rtol=0)
 
 
-def test_native_preserves_stream_isolation_and_output_storage(case):
+@pytest.mark.parametrize("kind", ["random", "all_tie", "partial_tie", "finite_extremes"])
+def test_compact160_m1_cached_selection_preserves_routes(case, kind):
+    from test_moe_topk_e512_k10_xpu import _edge_logits
     cpu, weights = case
-    data = [inputs(2), inputs(8)]
+    x, _ = inputs(1)
+    logits = (torch.randn(1, 512, generator=torch.Generator().manual_seed(160916)).half()
+              if kind == "random" else _edge_logits(kind, 1))
+    expected, _, _ = golden(x, logits, cpu)
+    actual = torch.ops.moe_int4_ops.moe_forward_compact160_out_v1(
+        x.to("xpu"), logits.to("xpu"), *weights,
+        torch.empty_like(x, device="xpu"), 10, 1, 512)
+    torch.testing.assert_close(actual.cpu(), expected, atol=OUTPUT_ATOL, rtol=0)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+def test_compact160_m1_cached_selection_nonfinite_and_recovery(case, bad):
+    _, weights = case
+    x, logits = inputs(1)
+    x, logits = x.to("xpu"), logits.to("xpu")
+    def run(values):
+        return torch.ops.moe_int4_ops.moe_forward_compact160_out_v1(
+            x, values, *weights, torch.empty_like(x), 10, 1, 512)
+    expected = run(logits).clone()
+    assert torch.isnan(run(torch.full_like(logits, bad))).all().item()
+    torch.testing.assert_close(run(logits), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rows", [(1, 1), (2, 8)])
+def test_native_preserves_stream_isolation_and_output_storage(case, rows):
+    cpu, weights = case
+    data = [inputs(m) for m in rows]
     expected = [golden(x, logits, cpu)[0] for x, logits in data]
     device_data = [(x.to("xpu"), logits.to("xpu")) for x, logits in data]
     streams = [torch.xpu.Stream(), torch.xpu.Stream()]

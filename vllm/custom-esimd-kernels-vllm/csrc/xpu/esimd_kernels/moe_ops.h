@@ -76,12 +76,14 @@ SYCL_ESIMD_FUNCTION inline T h_min(simd<T, N> v) {
 
 // Argmax + zero: uses h_max for value, integer bit-cast for matching.
 // The bit-cast comparison bypasses -ffast-math float comparison issues.
-template<int C>
+template<int C, bool KnownMax = false>
 SYCL_ESIMD_FUNCTION inline void chunk_argmax_and_zero(
     simd<float, C>& vals, int base_idx,
-    float& out_val, int32_t& out_idx)
+    float& out_val, int32_t& out_idx, float known_max = 0.0f)
 {
-    float mx = h_max<float, C>(vals);
+    float mx;
+    if constexpr (KnownMax) mx = known_max;
+    else mx = h_max<float, C>(vals);
 
     // Bit-cast float max to int32 for exact bit-pattern comparison
     // This is immune to -ffast-math reordering of float comparisons
@@ -105,7 +107,7 @@ SYCL_ESIMD_FUNCTION inline void chunk_argmax_and_zero(
     vals.merge(simd<float, C>(-1.0f), zero_mask);
 }
 
-template<int NUM_EXPERTS, int TOPK>
+template<int NUM_EXPERTS, int TOPK, bool CacheChunkMax = false, bool ReuseMax = false>
 struct MoE_TopK_V2_Kernel {
     const fp16* router_logits;   // [T, NUM_EXPERTS]
     fp16* top_values;            // [T, TOPK]
@@ -165,6 +167,12 @@ struct MoE_TopK_V2_Kernel {
         // ── TopK selection: TOPK rounds ──
         float   tv[16];
         int32_t ti[16];
+        float chunk_max[N_CHUNKS];
+        if constexpr (CacheChunkMax) {
+            #pragma unroll
+            for (int c = 0; c < N_CHUNKS; ++c)
+                chunk_max[c] = h_max<float, C>(probs[c]);
+        }
 
         #pragma unroll
         for (int k = 0; k < TOPK; k++) {
@@ -173,13 +181,23 @@ struct MoE_TopK_V2_Kernel {
             int   bc = 0;
             #pragma unroll
             for (int c = 0; c < N_CHUNKS; c++) {
-                float m = h_max<float, C>(probs[c]);
+                float m;
+                if constexpr (CacheChunkMax) m = chunk_max[c];
+                else m = h_max<float, C>(probs[c]);
                 if (m > bv) { bv = m; bc = c; }
             }
 
             // Argmax + zero within winning chunk
             float fv; int32_t fi;
-            chunk_argmax_and_zero<C>(probs[bc], bc * C, fv, fi);
+            if constexpr (CacheChunkMax && ReuseMax)
+                chunk_argmax_and_zero<C, true>(probs[bc], bc * C, fv, fi, chunk_max[bc]);
+            else
+                chunk_argmax_and_zero<C>(probs[bc], bc * C, fv, fi);
+            if constexpr (CacheChunkMax) {
+                // Only the winning chunk changed. Preserve the original
+                // softmax, exact tie order, and top-weight normalization.
+                if (k + 1 < TOPK) chunk_max[bc] = h_max<float, C>(probs[bc]);
+            }
 
             tv[k] = fv;
             ti[k] = fi;
@@ -250,7 +268,7 @@ struct MoE_TopK_V2_Kernel {
     }
 };
 
-template<int NUM_EXPERTS, int TOPK>
+template<int NUM_EXPERTS, int TOPK, bool CacheChunkMax = false, bool ReuseMax = false>
 inline void moe_topk_v2_host(
     const fp16* logits, fp16* values, int32_t* indices,
     int T, sycl::queue& q)
@@ -274,7 +292,7 @@ inline void moe_topk_v2_host(
     q.submit([&](sycl::handler& h) {
         h.parallel_for(
             sycl::nd_range<1>({(size_t)T}, {1}),
-            MoE_TopK_V2_Kernel<NUM_EXPERTS, TOPK>{logits, values, indices, T});
+            MoE_TopK_V2_Kernel<NUM_EXPERTS, TOPK, CacheChunkMax, ReuseMax>{logits, values, indices, T});
     });
 }
 

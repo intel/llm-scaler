@@ -362,10 +362,58 @@ struct M1StoreDescriptor {
   void* cache;
   const void* rows;
   const int64_t* slot;
-  int64_t capacity, page_size, page_stride, token_stride, column_stride;
-  int width;
+  int64_t capacity, page_size, page_mask, page_stride, token_stride,
+      column_stride;
+  int page_shift, width;
 };
+template <bool PageSizesPowerOfTwo>
 class QsaStoreM1TransactionKernel;
+
+template <bool PageSizesPowerOfTwo>
+void launch_store_m1_transaction(
+    sycl::queue& queue,
+    const std::array<M1StoreDescriptor, 3>& descriptors,
+    int count) {
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<QsaStoreM1TransactionKernel<PageSizesPowerOfTwo>>(
+        sycl::range<1>(1), [=](sycl::id<1>) SYCL_ESIMD_KERNEL {
+          // One work item preserves the original transaction order, including
+          // cross-store aliases. FP16/BF16 keys are copied as raw 16-bit bits.
+          for (int i = 0; i < count; ++i) {
+            const auto d = descriptors[i];
+            const int64_t slot = *d.slot;
+            if (slot < 0 || slot >= d.capacity) continue;
+            int64_t page;
+            int64_t token;
+            if constexpr (PageSizesPowerOfTwo) {
+              // The host proved every descriptor page size is a positive
+              // power of two. The preceding validity check keeps negative
+              // slot behavior identical to the division fallback.
+              page = slot >> d.page_shift;
+              token = slot & d.page_mask;
+            } else {
+              page = slot / d.page_size;
+              token = slot % d.page_size;
+            }
+            const int64_t dst = page * d.page_stride +
+                                token * d.token_stride;
+            if (d.width == kKeyWidth) {
+              auto* output = static_cast<uint16_t*>(d.cache);
+              const auto* input = static_cast<const uint16_t*>(d.rows);
+              const simd<uint16_t, kKeyWidth> values =
+                  block_load<uint16_t, kKeyWidth>(input);
+              block_store<uint16_t, kKeyWidth>(output + dst, values);
+            } else {
+              auto* output = static_cast<int64_t*>(d.cache);
+              const auto* input = static_cast<const int64_t*>(d.rows);
+#pragma unroll
+              for (int j = 0; j < kPositionWidth; ++j)
+                output[dst + j] = input[j * d.column_stride];
+            }
+          }
+        });
+  });
+}
 }  // namespace
 
 bool try_store_m1_transaction_v1(
@@ -422,42 +470,32 @@ bool try_store_m1_transaction_v1(
     return true;
   }
   std::array<M1StoreDescriptor, 3> descriptors{};
+  bool page_sizes_power_of_two = true;
   for (size_t i = 0; i < stores.size(); ++i) {
     const auto& [cache, slots, rows] = stores[i];
+    const int64_t page_size = cache.size(1);
+    const bool page_size_power_of_two =
+        page_size > 0 && (page_size & (page_size - 1)) == 0;
+    page_sizes_power_of_two &= page_size_power_of_two;
+    int page_shift = 0;
+    if (page_size_power_of_two) {
+      for (int64_t remaining = page_size; remaining > 1; remaining >>= 1) {
+        ++page_shift;
+      }
+    }
     descriptors[i] = {cache.data_ptr(), rows.data_ptr(), slots.data_ptr<int64_t>(),
-                     cache.size(0) * cache.size(1), cache.size(1), cache.stride(0),
-                     cache.stride(1), rows.stride(rows.dim() - 1),
+                     cache.size(0) * page_size, page_size, page_size - 1,
+                     cache.stride(0), cache.stride(1),
+                     rows.stride(rows.dim() - 1), page_shift,
                      static_cast<int>(cache.size(3))};
   }
   const int count = stores.size();
   auto& queue = c10::xpu::getCurrentXPUStream(device.index()).queue();
-  queue.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for<QsaStoreM1TransactionKernel>(
-        sycl::range<1>(1), [=](sycl::id<1>) SYCL_ESIMD_KERNEL {
-          // One work item preserves the original transaction order, including
-          // cross-store aliases. FP16/BF16 keys are copied as raw 16-bit bits.
-          for (int i = 0; i < count; ++i) {
-            const auto d = descriptors[i];
-            const int64_t slot = *d.slot;
-            if (slot < 0 || slot >= d.capacity) continue;
-            const int64_t dst = (slot / d.page_size) * d.page_stride +
-                                (slot % d.page_size) * d.token_stride;
-            if (d.width == kKeyWidth) {
-              auto* output = static_cast<uint16_t*>(d.cache);
-              const auto* input = static_cast<const uint16_t*>(d.rows);
-              const simd<uint16_t, kKeyWidth> values =
-                  block_load<uint16_t, kKeyWidth>(input);
-              block_store<uint16_t, kKeyWidth>(output + dst, values);
-            } else {
-              auto* output = static_cast<int64_t*>(d.cache);
-              const auto* input = static_cast<const int64_t*>(d.rows);
-#pragma unroll
-              for (int j = 0; j < kPositionWidth; ++j)
-                output[dst + j] = input[j * d.column_stride];
-            }
-          }
-        });
-  });
+  if (page_sizes_power_of_two) {
+    launch_store_m1_transaction<true>(queue, descriptors, count);
+  } else {
+    launch_store_m1_transaction<false>(queue, descriptors, count);
+  }
   return true;
 }
 

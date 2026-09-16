@@ -198,7 +198,7 @@ def test_topk_v2_tail_stores_declare_natural_alignment() -> None:
         Path(__file__).parents[1] / "csrc/xpu/esimd_kernels/moe_ops.h"
     ).read_text()
     start = source.index("        // block_store first 8")
-    end = source.index("template<int NUM_EXPERTS, int TOPK>\ninline void", start)
+    end = source.index("inline void moe_topk_v2_host", start)
     stores = source[start:end]
     fp16_alignment = "properties{alignment<sizeof(fp16)>}"
     int32_alignment = "properties{alignment<sizeof(int32_t)>}"

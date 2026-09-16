@@ -33,7 +33,7 @@ using namespace sycl::ext::intel::esimd;
 template <typename scalar_t>
 class QsaGroupCompressionKernel;
 
-template <typename scalar_t>
+template <typename scalar_t, bool RingPowerOfTwo>
 class QsaGroupCompressionV2Kernel;
 
 bool is_positive_non_overlapping(const at::Tensor& tensor) {
@@ -682,7 +682,7 @@ void validate_group_compression_v2_inputs(
       "QSA compressor state capacity overflows int64");
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool RingPowerOfTwo>
 void launch_group_compression_v2(
     const at::Tensor& raw_keys,
     const at::Tensor& raw_positions,
@@ -715,6 +715,7 @@ void launch_group_compression_v2(
   }
   const int64_t num_requests = query_start_loc.numel() - 1;
   const int64_t ring_size = compressor_state_cache.size(1);
+  const int64_t ring_mask = ring_size - 1;
   const int64_t pages = compressor_state_cache.size(0);
   const int64_t block_rows = compressor_state_block_table.size(0);
   const int64_t block_stride = compressor_state_block_table.stride(0);
@@ -734,7 +735,7 @@ void launch_group_compression_v2(
 
   auto& queue = c10::xpu::getCurrentXPUStream(raw_keys.device().index()).queue();
   queue.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for<QsaGroupCompressionV2Kernel<scalar_t>>(
+    cgh.parallel_for<QsaGroupCompressionV2Kernel<scalar_t, RingPowerOfTwo>>(
         sycl::range<1>(static_cast<size_t>(rows)),
         [=](sycl::id<1> work_item) SYCL_ESIMD_KERNEL {
           const int64_t row = static_cast<int64_t>(work_item[0]);
@@ -776,7 +777,14 @@ void launch_group_compression_v2(
                          ++group_offset) {
                       const int64_t position =
                           end_position - (kCompressionRatio - 1 - group_offset);
-                      const int64_t ring_slot = position % ring_size;
+                      int64_t ring_slot;
+                      if constexpr (RingPowerOfTwo) {
+                        // valid implies end_position>=3, so every historical
+                        // position is nonnegative in the ratio-4 window.
+                        ring_slot = position & ring_mask;
+                      } else {
+                        ring_slot = position % ring_size;
+                      }
                       const int64_t source = block * cache_page_stride +
                           ring_slot * cache_token_stride +
                           column * cache_column_stride;
@@ -808,7 +816,12 @@ void launch_group_compression_v2(
                       accumulator += block_load<scalar_t, kCompressionTile>(
                           raw_ptr + source);
                     } else if (ring_ok) {
-                      const int64_t ring_slot = position % ring_size;
+                      int64_t ring_slot;
+                      if constexpr (RingPowerOfTwo) {
+                        ring_slot = position & ring_mask;
+                      } else {
+                        ring_slot = position % ring_size;
+                      }
                       const int64_t source = block * cache_page_stride +
                           ring_slot * cache_token_stride +
                           column * cache_column_stride;
@@ -835,7 +848,12 @@ void launch_group_compression_v2(
                          ++group_offset) {
                       const int64_t position =
                           end_position - (kCompressionRatio - 1 - group_offset);
-                      const int64_t ring_slot = position % ring_size;
+                      int64_t ring_slot;
+                      if constexpr (RingPowerOfTwo) {
+                        ring_slot = position & ring_mask;
+                      } else {
+                        ring_slot = position % ring_size;
+                      }
                       const int64_t source = block * cache_page_stride +
                           ring_slot * cache_token_stride +
                           column * cache_column_stride;
@@ -881,7 +899,12 @@ void launch_group_compression_v2(
                       bits = block_load<uint16_t, kCompressionTile>(
                           reinterpret_cast<const uint16_t*>(raw_ptr + source));
                     } else if (ring_ok) {
-                      const int64_t ring_slot = position % ring_size;
+                      int64_t ring_slot;
+                      if constexpr (RingPowerOfTwo) {
+                        ring_slot = position & ring_mask;
+                      } else {
+                        ring_slot = position % ring_size;
+                      }
                       const int64_t source = block * cache_page_stride +
                           ring_slot * cache_token_stride +
                           column * cache_column_stride;
@@ -934,7 +957,13 @@ void launch_group_compression_v2(
                   raw_first_row * raw_position_row_stride +
                   axis * raw_position_column_stride];
             } else if (ring_first_ok) {
-              const int64_t first_slot = first_position % ring_size;
+              int64_t first_slot;
+              if constexpr (RingPowerOfTwo) {
+                // ring_first_ok includes valid, which proves first_position>=0.
+                first_slot = first_position & ring_mask;
+              } else {
+                first_slot = first_position % ring_size;
+              }
               const int64_t source = block * position_page_stride +
                   first_slot * position_token_stride +
                   axis * position_column_stride;
@@ -1003,18 +1032,39 @@ at::Tensor group_compress_v2(
       compressor_state_block_table, token_to_req, query_start_loc,
       logical_positions, compressed_slots, pooled, first_positions,
       compress_ratio, compressed_capacity, historical_ring_proven);
+  const int64_t ring_size = compressor_state_cache.size(1);
+  // Keep the address specialization decode-only: multi-row prefill/verify
+  // retains the original division path even when its ring is a power of two.
+  const bool ring_power_of_two = raw_keys.size(0) == 1 &&
+      ring_size > 0 && (ring_size & (ring_size - 1)) == 0;
   if (raw_keys.scalar_type() == at::kHalf) {
-    launch_group_compression_v2<fp16>(
-        raw_keys, raw_positions, compressor_state_cache, rope_position_cache,
-        compressor_state_block_table, token_to_req, query_start_loc,
-        logical_positions, compressed_slots, pooled, first_positions,
-        compressed_capacity);
+    if (ring_power_of_two) {
+      launch_group_compression_v2<fp16, true>(
+          raw_keys, raw_positions, compressor_state_cache, rope_position_cache,
+          compressor_state_block_table, token_to_req, query_start_loc,
+          logical_positions, compressed_slots, pooled, first_positions,
+          compressed_capacity);
+    } else {
+      launch_group_compression_v2<fp16, false>(
+          raw_keys, raw_positions, compressor_state_cache, rope_position_cache,
+          compressor_state_block_table, token_to_req, query_start_loc,
+          logical_positions, compressed_slots, pooled, first_positions,
+          compressed_capacity);
+    }
   } else {
-    launch_group_compression_v2<bf16>(
-        raw_keys, raw_positions, compressor_state_cache, rope_position_cache,
-        compressor_state_block_table, token_to_req, query_start_loc,
-        logical_positions, compressed_slots, pooled, first_positions,
-        compressed_capacity);
+    if (ring_power_of_two) {
+      launch_group_compression_v2<bf16, true>(
+          raw_keys, raw_positions, compressor_state_cache, rope_position_cache,
+          compressor_state_block_table, token_to_req, query_start_loc,
+          logical_positions, compressed_slots, pooled, first_positions,
+          compressed_capacity);
+    } else {
+      launch_group_compression_v2<bf16, false>(
+          raw_keys, raw_positions, compressor_state_cache, rope_position_cache,
+          compressor_state_block_table, token_to_req, query_start_loc,
+          logical_positions, compressed_slots, pooled, first_positions,
+          compressed_capacity);
+    }
   }
   return pooled;
 }

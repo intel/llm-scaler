@@ -2,6 +2,7 @@
 // TP4: physical I=160, original group128 scales (128+32), FP16 shared expert.
 // Included by moe_int4.sycl after the common kernels and validation helpers.
 #pragma once
+#include "moe_compact160_m1_down_routes.h"
 
 static int64_t qwen38_moe_compact160_weight_contract_v1(
     at::TensorList tensors, c10::Device device) {
@@ -110,16 +111,45 @@ static torch::Tensor compact160_submit(
             reinterpret_cast<uint8_t*>(b.logits.data_ptr()), 512, 2560, queue);
         logits = reinterpret_cast<const fp16*>(b.logits.data_ptr());
     }
-    moe_topk_v2_host<512,10>(logits, reinterpret_cast<fp16*>(b.weights.data_ptr()),
-                            b.ids.data_ptr<int32_t>(), m, queue);
+    static const bool cached_topk = [] {
+        const char* value = std::getenv("VLLM_XPU_MOE_COMPACT160_M1_CACHED_TOPK");
+        return value == nullptr || std::strcmp(value, "1") == 0;
+    }();
+    static const bool reuse_max = [] {
+        const char* value = std::getenv("VLLM_XPU_MOE_COMPACT160_M1_TOPK_REUSE_MAX");
+        return value == nullptr || std::strcmp(value, "1") == 0;
+    }();
+    if (m == 1 && cached_topk && reuse_max)
+        moe_topk_v2_host<512,10,true,true>(logits, reinterpret_cast<fp16*>(b.weights.data_ptr()),
+                                         b.ids.data_ptr<int32_t>(), m, queue);
+    else if (m == 1 && cached_topk)
+        moe_topk_v2_host<512,10,true>(logits, reinterpret_cast<fp16*>(b.weights.data_ptr()),
+                                    b.ids.data_ptr<int32_t>(), m, queue);
+    else
+        moe_topk_v2_host<512,10>(logits, reinterpret_cast<fp16*>(b.weights.data_ptr()),
+                                b.ids.data_ptr<int32_t>(), m, queue);
     if (m == 1) {
-        moe_tiny_m_up_cutlass_int4_with_shared_fp16_kernel<int32_t>(
-            reinterpret_cast<const fp16*>(x.data_ptr()), w13.data_ptr<uint8_t>(),
-            reinterpret_cast<const fp16*>(s13.data_ptr()), b.ids.data_ptr<int32_t>(),
-            reinterpret_cast<const fp16*>(shared_up.data_ptr()),
-            reinterpret_cast<const fp16*>(shared_gate.data_ptr()),
-            reinterpret_cast<fp16*>(b.routed.data_ptr()), reinterpret_cast<fp16*>(b.shared.data_ptr()),
-            b.gates.data_ptr<float>(), m, 10, 2560, 160, 160, 1, device);
+        static const bool up_esimd1 = [] {
+            const char* value = std::getenv("VLLM_XPU_MOE_COMPACT160_M1_UP_ESIMD1");
+            return value == nullptr || std::strcmp(value, "1") == 0;
+        }();
+        if (up_esimd1) {
+            moe_compact160_m1_up_esimd1_kernel(
+                reinterpret_cast<const fp16*>(x.data_ptr()), w13.data_ptr<uint8_t>(),
+                reinterpret_cast<const fp16*>(s13.data_ptr()), b.ids.data_ptr<int32_t>(),
+                reinterpret_cast<const fp16*>(shared_up.data_ptr()),
+                reinterpret_cast<const fp16*>(shared_gate.data_ptr()),
+                reinterpret_cast<fp16*>(b.routed.data_ptr()),
+                reinterpret_cast<fp16*>(b.shared.data_ptr()), b.gates.data_ptr<float>(), device);
+        } else {
+            moe_tiny_m_up_cutlass_int4_with_shared_fp16_kernel<int32_t>(
+                reinterpret_cast<const fp16*>(x.data_ptr()), w13.data_ptr<uint8_t>(),
+                reinterpret_cast<const fp16*>(s13.data_ptr()), b.ids.data_ptr<int32_t>(),
+                reinterpret_cast<const fp16*>(shared_up.data_ptr()),
+                reinterpret_cast<const fp16*>(shared_gate.data_ptr()),
+                reinterpret_cast<fp16*>(b.routed.data_ptr()), reinterpret_cast<fp16*>(b.shared.data_ptr()),
+                b.gates.data_ptr<float>(), m, 10, 2560, 160, 160, 1, device);
+        }
     } else {
         static const bool shared_ksplit = [] {
             const char* value = std::getenv("VLLM_XPU_MOE_COMPACT160_SHARED_UP_KSPLIT4");
@@ -162,6 +192,28 @@ static torch::Tensor compact160_submit(
             shared_ksplit && m <= 6);
         }
     }
+    static const bool down_routes = [] {
+        const char* value = std::getenv("VLLM_XPU_MOE_COMPACT160_M1_DOWN_ROUTES");
+        return value == nullptr || std::strcmp(value, "1") == 0;
+    }();
+    if (m == 1 && down_routes) {
+        static const bool vector_reduce = [] {
+            const char* value = std::getenv("VLLM_XPU_MOE_COMPACT160_M1_DOWN_VECTOR_REDUCE");
+            return value == nullptr || std::strcmp(value, "1") == 0;
+        }();
+        const auto launch_routes = [&](auto mode) {
+            compact160_m1_down_routes<8, decltype(mode)::value>(
+                reinterpret_cast<const fp16*>(b.routed.data_ptr()), w2.data_ptr<uint8_t>(),
+                reinterpret_cast<const fp16*>(s2.data_ptr()),
+                reinterpret_cast<const fp16*>(b.weights.data_ptr()), b.ids.data_ptr<int32_t>(),
+                reinterpret_cast<const fp16*>(b.shared.data_ptr()), b.gates.data_ptr<float>(),
+                reinterpret_cast<const fp16*>(shared_down.data_ptr()),
+                reinterpret_cast<fp16*>(output.data_ptr()), device);
+        };
+        if (vector_reduce) launch_routes(std::true_type{});
+        else launch_routes(std::false_type{});
+        return output;
+    }
     const auto launch_down = [&](auto tile) {
         moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int32_t,decltype(tile)::value,false,true>(
         reinterpret_cast<const fp16*>(b.routed.data_ptr()), w2.data_ptr<uint8_t>(),
@@ -171,11 +223,17 @@ static torch::Tensor compact160_submit(
         reinterpret_cast<const fp16*>(shared_down.data_ptr()),
         reinterpret_cast<fp16*>(output.data_ptr()), m, 10, 2560, 160, 160, 1, device);
     };
+    static const bool down_m1_ht2 = [] {
+        const char* value = std::getenv("VLLM_XPU_MOE_COMPACT160_M1_DOWN_HT2");
+        return value == nullptr || std::strcmp(value, "1") == 0;
+    }();
     static const bool down_tile8 = [] {
         const char* value = std::getenv("VLLM_XPU_MOE_COMPACT160_DOWN_H_TILE");
         return value == nullptr || std::strcmp(value, "8") == 0;
     }();
-    if (down_tile8 && m >= 4 && m <= 6) {
+    if (down_m1_ht2 && m == 1) {
+        launch_down(std::integral_constant<int,2>{});
+    } else if (down_tile8 && m >= 4 && m <= 6) {
         launch_down(std::integral_constant<int,8>{});
     } else {
         launch_down(std::integral_constant<int,4>{});

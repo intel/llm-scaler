@@ -402,3 +402,27 @@ def test_preprocessed_parallel_selection_exact_page_boundaries(
     qsa_ops.qsa_select_paged_tokens_parallel_v1(*inputs, new)
     torch.xpu.synchronize()
     assert torch.equal(new, old)
+
+
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("length", [2051, 32768, 65540, 128004])
+def test_m1_first_chunk_sort_ties_invalid_pages_and_streams(qsa_ops, page_size, length):
+    q, _, _, _, cache, table, requests, positions, lengths, _ = _make_case(
+        1, False, length, page_size)
+    cache.zero_()
+    table[:, 1:3] = -1
+    args = (q, cache, table, requests, positions, lengths, 2048, 4, page_size)
+    expected = torch.empty(1, 2051, dtype=torch.int32, device="xpu")
+    qsa_ops.qsa_select_paged_tokens_v2(*args, expected)
+    streams = [torch.xpu.Stream(), torch.xpu.Stream()]
+    parent = torch.xpu.current_stream()
+    outputs = [torch.empty_like(expected) for _ in streams]
+    for stream in streams:
+        stream.wait_stream(parent)
+    for _ in range(3):
+        for stream, output in zip(streams, outputs):
+            with torch.xpu.stream(stream):
+                qsa_ops.qsa_select_paged_tokens_parallel_v1(*args, output)
+    for stream in streams:
+        parent.wait_stream(stream)
+    assert all(torch.equal(output, expected) for output in outputs)

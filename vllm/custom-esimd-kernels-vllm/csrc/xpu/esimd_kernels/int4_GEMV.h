@@ -1,5 +1,7 @@
 #pragma once
 #include "utils.h"
+#include <cstdint>
+#include <cstdlib>
 
 // ============================================================================
 // INT4 GEMV with FP32 accumulation and per-group scale.
@@ -404,6 +406,56 @@ struct GEMV_int4_fused_kernel {
 
 
 // ============================================================================
+// TP4 M1 input projection: coalesce adjacent scale-group loads without
+// changing the two 64-lane accumulators or their group/reduction order.
+template<int GROUPS>
+struct GEMV_int4_fused_tp4_wide_kernel {
+    const fp16* input;
+    const uint8_t* weight0;
+    const uint8_t* weight1;
+    const fp16* scale0;
+    const fp16* scale1;
+    fp16* output0;
+    fp16* output1;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        constexpr int K = 2560, GROUP_COUNT = 20;
+        const int row = item.get_global_id(0);
+        const bool second = row >= 4096;
+        const int n = second ? row - 4096 : row;
+        const uint8_t* w = (second ? weight1 : weight0) + (size_t)n * (K / 2);
+        const fp16* s = (second ? scale1 : scale0) + (size_t)n * GROUP_COUNT;
+        fp16* output = second ? output1 : output0;
+        simd<fp16, GROUP_COUNT> row_scales;
+        row_scales.template select<16, 1>(0) = block_load<fp16, 16>(s);
+        row_scales.template select<4, 1>(16) = block_load<fp16, 4>(s + 16);
+        simd<float, 64> acc_even = 0.0f, acc_odd = 0.0f;
+        for (int g = 0; g < GROUP_COUNT; g += GROUPS) {
+            simd<fp16, GROUPS * 128> inputs =
+                block_load<fp16, GROUPS * 128>(input + g * 128);
+            simd<uint8_t, GROUPS * 64> packed =
+                block_load<uint8_t, GROUPS * 64>(w + g * 64);
+#pragma unroll
+            for (int j = 0; j < GROUPS; ++j) {
+                simd<fp16, 128> in = inputs.template select<128, 1>(j * 128);
+                simd<float, 64> even = in.template select<64, 2>(0).read();
+                simd<float, 64> odd = in.template select<64, 2>(1).read();
+                simd<uint8_t, 64> raw = packed.template select<64, 1>(j * 64);
+                simd<float, 64> lo, hi;
+                int4_dequant<128>(raw, lo, hi);
+                const fp16 scale_half = row_scales[g + j];
+                const float scale = (float)scale_half;
+                lo *= scale;
+                hi *= scale;
+                acc_even += even * lo;
+                acc_odd += odd * hi;
+            }
+        }
+        output[n] = fp16(reduce<float>(acc_even, std::plus<>()) +
+                         reduce<float>(acc_odd, std::plus<>()));
+    }
+};
+
 // Host dispatcher for fused INT4 GEMV.
 //
 // Launches a single kernel for GEMV_COUNT matrices sharing the same input.
@@ -422,6 +474,35 @@ inline void GEMV_int4_fused_host(
     sycl::queue& q) {
 
     auto* p_in = reinterpret_cast<const fp16*>(input_data);
+
+    if constexpr (GEMV_COUNT == 2) {
+        if (Ns[0] == 4096 && Ns[1] == 24 && K == 2560) {
+            static const int wide_groups = [] {
+                const char* value = std::getenv("VLLM_XPU_GDN_IN_WIDE_GROUPS");
+                return value == nullptr ? 4 : std::atoi(value);
+            }();
+#define LAUNCH_GDN_IN_WIDE(G) \
+            q.submit([&](sycl::handler& h) { \
+                h.parallel_for(sycl::nd_range<1>(4120, 1), \
+                    GEMV_int4_fused_tp4_wide_kernel<G>{p_in, weight_ptrs[0], \
+                        weight_ptrs[1], reinterpret_cast<const fp16*>(scale_ptrs[0]), \
+                        reinterpret_cast<const fp16*>(scale_ptrs[1]), \
+                        reinterpret_cast<fp16*>(output_ptrs[0]), \
+                        reinterpret_cast<fp16*>(output_ptrs[1])}); \
+            });
+            // FP16 scale views can be contiguous with only 2-byte alignment.
+            // The wide scale loads assume 4 bytes; their 40-byte row stride
+            // preserves that alignment. Keep scalar-scale GEMV as fallback.
+            const bool scales_aligned =
+                ((reinterpret_cast<std::uintptr_t>(scale_ptrs[0]) |
+                  reinterpret_cast<std::uintptr_t>(scale_ptrs[1])) & 3u) == 0;
+            if (wide_groups == 4 && scales_aligned) {
+                LAUNCH_GDN_IN_WIDE(4);
+                return;
+            }
+#undef LAUNCH_GDN_IN_WIDE
+        }
+    }
 
     uint32_t total_N = 0;
     for (int i = 0; i < GEMV_COUNT; i++) total_N += Ns[i];

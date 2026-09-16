@@ -6,8 +6,9 @@
 // selected-token reduction from the final partial merge.
 // This candidate carries forward node 3's prefetch-aware split.  The default
 // split uses 64 slots per partial (33 partials); M=2..6 uses the separate
-// 48-slot batch geometry below.  Both variants stay inside the single-launch
-// epoch protocol, so no host wait is required by async scheduling.
+// 48-slot batch geometry below. M1 cooperatively reduces four 16-slot chunks
+// into the same partial ABI. The normal path uses two in-order submissions;
+// the optional fused v4 epoch protocol remains independent.
 
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
@@ -17,6 +18,8 @@
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <tuple>
 
@@ -97,6 +100,7 @@ static_assert(BATCH_TOKENS_PER_PARTIAL <= SLOT_COUNT,
 static_assert(PREFETCH_DISTANCE_RUNS >= 0 && PREFETCH_DISTANCE_RUNS <= 8,
               "PREFETCH_DISTANCE must be a small non-negative run distance");
 
+#include "qsa_token_split_m1_workgroup.h"
 
 // Issue the next run's packed K/V reads before its consumer reaches them.  The
 // logical-index and page-table lookups intentionally mirror phase 0's existing
@@ -812,6 +816,19 @@ at::Tensor run_token_split_candidate(
     } else {
       TORCH_CHECK(false, "fused token-split supports only q3");
     }
+  } else if (rows == 1 && TOKENS_PER_PARTIAL_VALUE == 64 && [] {
+      static const bool enabled = [] {
+        const char* value = std::getenv("VLLM_XPU_QSA_M1_WORKGROUP");
+        return value == nullptr || std::strcmp(value, "1") == 0;
+      }();
+      return enabled;
+    }()) {
+    qsa_token_split_candidate::phase0_m1_workgroup<QueryHeads, PageSize>(
+        queue, q_ptr, packed_ptr, indices_ptr, table_ptr, request_ptr,
+        block_table_stride, block_table_rows, physical_pages,
+        partial_head_stride, partial_ptr);
+    qsa_token_split_candidate::phase1_m1_parallel<QueryHeads>(
+        queue, output_ptr, partial_ptr, partial_head_stride);
   } else if (rows >= 2 && rows <= qsa_token_split_candidate::BATCH_OPT_MAX_ROWS) {
     if constexpr (QueryHeads == qsa_token_split_candidate::HEADS &&
                   PageSize == 256) {

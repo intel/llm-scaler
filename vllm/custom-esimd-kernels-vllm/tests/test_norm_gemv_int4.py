@@ -270,9 +270,11 @@ def test_norm_gemv_zero_z(HV, V, N):
         f"Expected zero output for zero z gate, got max={output.cpu().abs().max().item()}"
 
 
-@pytest.mark.parametrize("HV,N", [(1, 16), (4, 64), (8, 256)])
+@pytest.mark.parametrize(
+    "HV,N", [(1, 16), (4, 64), (8, 256), (12, 2560), (6, 2560)]
+)
 def test_norm_gemv_sigmoid_correctness(HV, N):
-    """The sigmoid ABI matches a reference using the dequantized INT4 weight."""
+    """Cover generic, TP4 tiled and TP8 fallback against dequantized weights."""
     torch.manual_seed(123)
     V = 128
     eps = 1e-6
@@ -512,6 +514,52 @@ def test_norm_gemv_int4_vs_fp8_dequant(HV, V, N):
     assert int4_rel < 0.05, f"INT4 rel_err too large vs dequant ref: {int4_rel:.6f}"
     # FP8 has additional re-quantization loss on top
     assert fp8_rel < 0.2, f"FP8 rel_err too large vs dequant ref: {fp8_rel:.4f}"
+
+
+@pytest.mark.parametrize("case", ["random", "zero", "extreme_gate", "small_x"])
+def test_tp4_sigmoid_shared_norm_independent_streams(case):
+    """SLM norm sharing keeps signed scales and independent async outputs."""
+    generator = torch.Generator().manual_seed(3916)
+    hv, v, n = 12, 128, 2560
+    x_cpu = (torch.randn(hv, v, generator=generator) * 0.25).half()
+    z_cpu = torch.randn(hv, v, generator=generator).half()
+    if case == "zero":
+        x_cpu.zero_()
+    elif case == "extreme_gate":
+        z_cpu[:, ::2] = 80
+        z_cpu[:, 1::2] = -80
+    elif case == "small_x":
+        x_cpu *= 0.0001
+    norm_cpu = (1 + torch.randn(v, generator=generator) * 0.05).half()
+    qvalues = torch.randint(0, 16, (n, hv * v), generator=generator)
+    packed_cpu = pack_int4_reference(qvalues)
+    scales_cpu = (torch.rand(n, hv, generator=generator) * 0.04 - 0.02).half()
+    dequant = (qvalues.float() - 8) * scales_cpu.float().repeat_interleave(v, 1)
+    normalized = x_cpu.float() * torch.rsqrt(
+        x_cpu.float().square().mean(-1, keepdim=True) + 1e-6)
+    normalized = normalized * norm_cpu.float() * torch.sigmoid(z_cpu.float())
+    reference = (normalized.reshape(1, -1) @ dequant.T).half()
+    inputs = tuple(t.to(DEVICE) for t in
+                   (x_cpu, z_cpu, norm_cpu, packed_cpu, scales_cpu))
+    ready = torch.xpu.Event()
+    ready.record()
+    streams = [torch.xpu.Stream(), torch.xpu.Stream()]
+    outputs = []
+    for stream in streams:
+        stream.wait_event(ready)
+        with torch.xpu.stream(stream):
+            for _ in range(8):
+                output = torch.empty(1, n, dtype=torch.float16, device=DEVICE)
+                esimd_norm_gemv_int4_sigmoid(*inputs, output, hv, v, 1e-6)
+                outputs.append(output + 0)  # Same-stream downstream consumer.
+    for stream in streams:
+        stream.synchronize()
+    first = outputs[0].cpu()
+    for output in outputs:
+        actual = output.cpu()
+        assert torch.isfinite(actual).all()
+        assert torch.equal(actual, first)
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0.02)
 
 
 if __name__ == "__main__":

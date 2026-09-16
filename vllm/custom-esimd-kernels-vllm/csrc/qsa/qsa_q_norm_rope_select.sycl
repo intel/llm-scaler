@@ -12,6 +12,8 @@
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <type_traits>
 
@@ -226,6 +228,11 @@ void launch_fused(
 
   const int64_t cache_page_stride = compressed_key_cache.stride(0);
   const int64_t cache_token_stride = compressed_key_cache.stride(1);
+  static const bool first_chunk_sort512 = [] {
+    const char* value = std::getenv("VLLM_XPU_QSA_SELECT_FIRST_SORT512");
+    return value == nullptr || std::strcmp(value, "1") == 0;
+  }();
+  const bool short_first_sort = first_chunk_sort512 && rows == 1 && partitions > 1;
 
   auto& queue = c10::xpu::getCurrentXPUStream(projected_q.device().index())
                     .queue();
@@ -452,17 +459,24 @@ void launch_fused(
           // Ascending (score, descending-index) bitonic order.  Reversing the
           // retained high half reproduces the production tie order: descending
           // score and ascending logical index for exact ties.
-          for (int size = 2; size <= kSortSize; size <<= 1) {
+          // The first chunk has no retained candidates: sorting its 512
+          // new entries is sufficient. Later chunks still merge all 1024.
+          const bool first_chunk = short_first_sort &&
+              chunk_start == int64_t(partition) * kBlockTopk;
+          const int sort_offset = first_chunk ? kBlockTopk : 0;
+          const int sort_size = first_chunk ? kBlockTopk : kSortSize;
+          for (int size = 2; size <= sort_size; size <<= 1) {
             for (int stride = size >> 1; stride > 0; stride >>= 1) {
-              for (int left = static_cast<int>(local); left < kSortSize;
-                   left += kWorkgroup) {
-                const int right = left ^ stride;
+              for (int logical_left = static_cast<int>(local); logical_left < sort_size;
+                   logical_left += kWorkgroup) {
+                const int left = logical_left + sort_offset;
+                const int right = (logical_left ^ stride) + sort_offset;
                 if (right > left) {
                   const float left_score = scores[left];
                   const float right_score = scores[right];
                   const int32_t left_index = indices[left];
                   const int32_t right_index = indices[right];
-                  const bool ascending = (left & size) == 0;
+                  const bool ascending = (logical_left & size) == 0;
                   const bool swap = ascending
                       ? (left_score > right_score ||
                          (left_score == right_score &&

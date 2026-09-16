@@ -2285,6 +2285,156 @@ void moe_tiny_m_up_cutlass_int4_with_shared_fp16_kernel(
     submit_kernel(cgf, device, "moe tiny m up cutlass int4 with shared fp16");
 }
 
+// TP4 compact160 M1 candidate: keep routed/shared/gate in one submit, but
+// replace the 64-WI scalar work-group and SLM tree reduction with one ESIMD
+// work-item per output column.  The 64 lanes retain the existing mapping
+// from packed K bytes to FP32 partial sums, while removing seven barriers and
+// exposing 1600 routed + 160 shared independent column tiles.
+class MoeCompact160M1UpEsimd1;
+
+static void moe_compact160_m1_up_esimd1_kernel(
+    const fp16* x, const uint8_t* w13, const fp16* w13_scales,
+    const int32_t* topk_idx, const fp16* shared_gate_up_weight,
+    const fp16* shared_expert_gate_weight,
+    fp16* routed_intermediates, fp16* shared_intermediates,
+    float* shared_gate_values, const torch::Device& device) {
+
+    constexpr int H = 2560;
+    constexpr int I = 160;
+    constexpr int TOP_K = 10;
+    constexpr int N_TILE = 1;
+    constexpr int VL = 64;
+    constexpr int K_BYTES = H / 2;
+    constexpr int K_GROUPS = H / 128;
+    constexpr int COL_TILES = I / N_TILE;
+    constexpr int ROUTED_GROUPS = TOP_K * COL_TILES;
+    constexpr int SHARED_GROUPS = COL_TILES + 1;
+    constexpr int TWO_I = 2 * I;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeCompact160M1UpEsimd1>(
+            sycl::range<1>(ROUTED_GROUPS + SHARED_GROUPS),
+            [=](sycl::id<1> idx) SYCL_ESIMD_KERNEL {
+                const int work = (int)idx[0];
+                if (work < ROUTED_GROUPS) {
+                    const int route = work / COL_TILES;
+                    const int col_base = (work - route * COL_TILES) * N_TILE;
+                    const int expert = (int)topk_idx[route];
+                    simd<float, VL> gate_acc[N_TILE];
+                    simd<float, VL> up_acc[N_TILE];
+                    #pragma unroll
+                    for (int t = 0; t < N_TILE; ++t) {
+                        gate_acc[t] = 0.f;
+                        up_acc[t] = 0.f;
+                    }
+
+                    for (int kb = 0; kb < K_BYTES; kb += VL) {
+                        simd<fp16, 2 * VL> x_chunk =
+                            block_load<fp16, 2 * VL>(x + kb * 2,
+                                                     overaligned_tag<16>{});
+                        simd<float, VL> x_even = x_chunk.select<VL, 2>(0);
+                        simd<float, VL> x_odd = x_chunk.select<VL, 2>(1);
+                        const int group = kb / VL;
+                        #pragma unroll
+                        for (int t = 0; t < N_TILE; ++t) {
+                            const int col = col_base + t;
+                            const uint8_t* gate_row = w13 +
+                                ((size_t)expert * TWO_I + col) * K_BYTES;
+                            const uint8_t* up_row = w13 +
+                                ((size_t)expert * TWO_I + I + col) * K_BYTES;
+                            simd<uint16_t, VL> gate_raw = convert<uint16_t>(
+                                block_load<uint8_t, VL>(gate_row + kb,
+                                                        overaligned_tag<16>{}));
+                            simd<uint16_t, VL> up_raw = convert<uint16_t>(
+                                block_load<uint8_t, VL>(up_row + kb,
+                                                        overaligned_tag<16>{}));
+                            simd<float, VL> gate_lo = convert<float>(gate_raw & 0x0Fu);
+                            simd<float, VL> gate_hi = convert<float>((gate_raw >> 4) & 0x0Fu);
+                            simd<float, VL> up_lo = convert<float>(up_raw & 0x0Fu);
+                            simd<float, VL> up_hi = convert<float>((up_raw >> 4) & 0x0Fu);
+                            gate_lo.merge(gate_lo - 16.f, gate_lo >= 8.f);
+                            gate_hi.merge(gate_hi - 16.f, gate_hi >= 8.f);
+                            up_lo.merge(up_lo - 16.f, up_lo >= 8.f);
+                            up_hi.merge(up_hi - 16.f, up_hi >= 8.f);
+                            const float gate_scale = (float)w13_scales[
+                                ((size_t)expert * TWO_I + col) * K_GROUPS + group];
+                            const float up_scale = (float)w13_scales[
+                                ((size_t)expert * TWO_I + I + col) * K_GROUPS + group];
+                            gate_acc[t] += x_even * (gate_lo * gate_scale) +
+                                           x_odd * (gate_hi * gate_scale);
+                            up_acc[t] += x_even * (up_lo * up_scale) +
+                                         x_odd * (up_hi * up_scale);
+                        }
+                    }
+
+                    #pragma unroll
+                    for (int t = 0; t < N_TILE; ++t) {
+                        const float gate = sycl::ext::intel::esimd::detail::sum<
+                            float, float, VL>(gate_acc[t]);
+                        const float up = sycl::ext::intel::esimd::detail::sum<
+                            float, float, VL>(up_acc[t]);
+                        const float silu = gate / (1.f + sycl::exp(-gate));
+                        routed_intermediates[route * I + col_base + t] =
+                            fp16(silu * up);
+                    }
+                    return;
+                }
+
+                const int shared_work = work - ROUTED_GROUPS;
+                if (shared_work < COL_TILES) {
+                    const int row_base = shared_work * N_TILE;
+                    simd<float, VL> gate_acc[N_TILE];
+                    simd<float, VL> up_acc[N_TILE];
+                    #pragma unroll
+                    for (int t = 0; t < N_TILE; ++t) {
+                        gate_acc[t] = 0.f;
+                        up_acc[t] = 0.f;
+                    }
+                    for (int k = 0; k < H; k += VL) {
+                        simd<float, VL> xv = block_load<fp16, VL>(
+                            x + k, overaligned_tag<16>{});
+                        #pragma unroll
+                        for (int t = 0; t < N_TILE; ++t) {
+                            const int row = row_base + t;
+                            const fp16* gate_row = shared_gate_up_weight +
+                                (size_t)row * H;
+                            const fp16* up_row = shared_gate_up_weight +
+                                (size_t)(I + row) * H;
+                            gate_acc[t] += xv * simd<float, VL>(
+                                block_load<fp16, VL>(gate_row + k,
+                                                     overaligned_tag<16>{}));
+                            up_acc[t] += xv * simd<float, VL>(
+                                block_load<fp16, VL>(up_row + k,
+                                                     overaligned_tag<16>{}));
+                        }
+                    }
+                    #pragma unroll
+                    for (int t = 0; t < N_TILE; ++t) {
+                        const float gate = sycl::ext::intel::esimd::detail::sum<
+                            float, float, VL>(gate_acc[t]);
+                        const float up = sycl::ext::intel::esimd::detail::sum<
+                            float, float, VL>(up_acc[t]);
+                        const float silu = gate / (1.f + sycl::exp(-gate));
+                        shared_intermediates[row_base + t] = fp16(silu * up);
+                    }
+                } else {
+                    simd<float, VL> acc(0.f);
+                    for (int k = 0; k < H; k += VL) {
+                        acc += simd<float, VL>(block_load<fp16, VL>(
+                                   x + k, overaligned_tag<16>{})) *
+                               simd<float, VL>(block_load<fp16, VL>(
+                                   shared_expert_gate_weight + k,
+                                   overaligned_tag<16>{}));
+                    }
+                    const float gate = sycl::ext::intel::esimd::detail::sum<
+                        float, float, VL>(acc);
+                    shared_gate_values[0] = 1.f / (1.f + sycl::exp(-gate));
+                }
+            });
+    };
+    submit_kernel(cgf, device, "moe compact160 m1 up esimd1");
+}
+
 template <typename IndexT, int NT> class MoeWsUpRoutedCutlassInt4;
 
 template <typename IndexT, int N_TILE>
