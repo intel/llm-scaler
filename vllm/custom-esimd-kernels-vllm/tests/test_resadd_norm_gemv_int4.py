@@ -229,6 +229,78 @@ def test_resadd_norm_gemv_fp8_router_has_no_cross_workgroup_race(n, k):
             pytest.fail(f"router race at iteration {iteration}: {error}")
 
 
+def test_resadd_norm_gemv_fp8_async_consumer_chain_regression():
+    """Keep the decode-style producer/consumer chain asynchronous.
+
+    vLLM reuses each layer's router and normalized-hidden buffers on later
+    decode steps.  The router logits and normalized hidden state are consumed
+    immediately by downstream work; synchronizing after the fused op would
+    hide ordering bugs in that path.  This deliberately queues 1,000 such
+    chains and synchronizes only once at the end.
+    """
+    torch.manual_seed(717)
+    n, k = 128, 2048
+    iterations = 1000
+    eps = 1e-6
+
+    hidden = torch.randn(1, k, dtype=torch.float16, device=DEVICE)
+    residual = torch.randn(1, k, dtype=torch.float16, device=DEVICE)
+    norm_weight = torch.randn(k, dtype=torch.float16, device=DEVICE) * 0.1 + 1.0
+    weight = torch.randn(n, k, dtype=torch.float16, device=DEVICE)
+    scale = torch.tensor(
+        [weight.float().abs().max().item() / 448.0],
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+    weight_fp8 = (weight.float() / scale).to(torch.float8_e4m3fn)
+    router_logits = torch.empty(1, n, dtype=torch.float16, device=DEVICE)
+    normed_out = torch.empty(1, k, dtype=torch.float16, device=DEVICE)
+
+    for iteration in range(iterations):
+        if iteration == iterations - 1:
+            # These are queued before the final fused call, so after the one
+            # final synchronize they are an immutable snapshot of its inputs.
+            final_hidden = hidden.clone()
+            final_residual = residual.clone()
+
+        esimd_resadd_norm_gemv_fp8_pert(
+            hidden,
+            residual,
+            norm_weight,
+            weight_fp8,
+            scale,
+            router_logits,
+            normed_out,
+            eps,
+        )
+
+        # Model the immediate downstream consumer: it reads both products of
+        # the fused op, and its result becomes the next decode layer's input.
+        hidden = normed_out * (1.0 + 0.01 * torch.tanh(router_logits[:, :1]))
+
+    torch.xpu.synchronize()
+
+    expected_output, expected_residual, expected_normed = ref_resadd_norm_gemv_fp8(
+        final_hidden,
+        final_residual,
+        norm_weight,
+        weight_fp8,
+        scale,
+        eps,
+    )
+    for name, tensor in {
+        "hidden": hidden,
+        "residual": residual,
+        "router_logits": router_logits,
+        "normed_out": normed_out,
+    }.items():
+        assert torch.isfinite(tensor).all().item(), f"{name} became non-finite"
+
+    torch.testing.assert_close(residual.cpu(), expected_residual, atol=0.005, rtol=0.01)
+    torch.testing.assert_close(normed_out.cpu(), expected_normed, atol=0.005, rtol=0.01)
+    torch.testing.assert_close(router_logits.cpu(), expected_output, atol=0.05, rtol=0.02)
+
+
 def test_resadd_norm_gemv_fp8_requires_k_divisible_by_128():
     k = 130
     hidden = torch.zeros(1, k, dtype=torch.float16, device=DEVICE)
