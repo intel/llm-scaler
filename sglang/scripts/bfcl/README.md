@@ -102,7 +102,7 @@ ZE_AFFINITY_MASK=6,7 \
 TP_SIZE=2 \
 HOST=0.0.0.0 \
 PORT=30000 \
-bash scripts/start_qwen3_6_service.sh
+bash scripts/start_qwen3_service.sh
 ```
 
 ### Qwen3.6-35B-A3B
@@ -115,7 +115,7 @@ ZE_AFFINITY_MASK=6,7 \
 TP_SIZE=2 \
 HOST=0.0.0.0 \
 PORT=30000 \
-bash scripts/start_qwen3_6_service.sh
+bash scripts/start_qwen3_service.sh
 ```
 
 ### Gemma4-31B
@@ -127,7 +127,7 @@ MODEL_PATH=/models/gemma-4-31B-it \
 ZE_AFFINITY_MASK=6,7 \
 HOST=127.0.0.1 \
 PORT=30000 \
-bash scripts/run_gemma4_31b.sh
+bash scripts/start_gemma4_31b_service.sh
 ```
 
 ### Gemma4-26B-A4B
@@ -141,7 +141,7 @@ TP_SIZE=2 \
 SGLANG_FP8_DTYPE=e4m3 \
 HOST=127.0.0.1 \
 PORT=30000 \
-bash scripts/run_gemma4_26b_moe.sh
+bash scripts/start_gemma4_26b_service.sh
 ```
 
 Wait for the service to become ready before starting BFCL:

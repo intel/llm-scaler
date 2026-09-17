@@ -1,30 +1,38 @@
 #!/usr/bin/env bash
-# Launch Qwen3.6-27B / 35B-A3B on Intel BMG, TP=2 by default.
+# Launch Qwen3.6-27B / 35B-A3B or Qwen3.8-27B on Intel BMG, TP=2 by default.
 #
 # Run INSIDE the container with the oneAPI environment initialized:
 #   cd /llm-scaler/sglang
 #
 # FP8 (HF directory; loaded and quantized online to E5M2):
-#   MODEL_PATH=/models/Qwen3.6-27B ZE_AFFINITY_MASK=6,7 \
-#     bash scripts/start_qwen3_6_service.sh
-#   MODEL_PATH=/models/Qwen3.6-35B-A3B ZE_AFFINITY_MASK=6,7 \
-#     bash scripts/start_qwen3_6_service.sh
+#   MODEL_PATH=/models/Qwen3.6-27B ZE_AFFINITY_MASK=0,1 \
+#     bash scripts/start_qwen3_service.sh
+#   MODEL_PATH=/models/Qwen3.6-35B-A3B ZE_AFFINITY_MASK=0,1 \
+#     bash scripts/start_qwen3_service.sh
+#   MODEL_PATH=/models/Qwen3.8-27B ZE_AFFINITY_MASK=0,1 \
+#     bash scripts/start_qwen3_service.sh
 #
 # GGUF (detected automatically from the .gguf suffix):
 #   MODEL_PATH=/models/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf \
-#     GGUF_CFG_DIR=/models/Qwen3.6-27B ZE_AFFINITY_MASK=6,7 \
-#     bash scripts/start_qwen3_6_service.sh
+#     GGUF_CFG_DIR=/models/Qwen3.6-27B ZE_AFFINITY_MASK=0,1 \
+#     bash scripts/start_qwen3_service.sh
 #   MODEL_PATH=/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
-#     GGUF_CFG_DIR=/models/Qwen3.6-35B-A3B ZE_AFFINITY_MASK=6,7 \
-#     bash scripts/start_qwen3_6_service.sh
+#     GGUF_CFG_DIR=/models/Qwen3.6-35B-A3B ZE_AFFINITY_MASK=0,1 \
+#     bash scripts/start_qwen3_service.sh
+#   MODEL_PATH=/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
+#     GGUF_CFG_DIR=/models/Qwen3.8-27B ZE_AFFINITY_MASK=0,1 \
+#     bash scripts/start_qwen3_service.sh
 #
 # MTP / speculative decoding (NEXTN), opt-in for either format by pointing
 # SPEC_DRAFT_PATH at a checkpoint that carries the mtp.* tensors. For GGUF that
 # is an MTP-enabled .gguf, which is also its own draft model:
 #   MODEL_PATH=/models/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
 #     GGUF_CFG_DIR=/models/Qwen3.6-35B-A3B \
-#     SPEC_DRAFT_PATH="$MODEL_PATH" ZE_AFFINITY_MASK=6,7 \
-#     bash scripts/start_qwen3_6_service.sh
+#     SPEC_DRAFT_PATH="$MODEL_PATH" ZE_AFFINITY_MASK=0,1 \
+#     bash scripts/start_qwen3_service.sh
+#   MODEL_PATH=/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
+#     GGUF_CFG_DIR=/models/Qwen3.8-27B SPEC_DRAFT_PATH="$MODEL_PATH" \
+#     ZE_AFFINITY_MASK=0,1 bash scripts/start_qwen3_service.sh
 #
 # Run one model at a time on the same GPUs/port.
 # GGUF_CFG_DIR must contain the matching HF config, tokenizer and safetensors

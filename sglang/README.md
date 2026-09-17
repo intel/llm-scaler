@@ -1,6 +1,6 @@
 # SGLang on Intel BMG
 
-End-to-end recipes for running Qwen3.6 and Gemma4 online FP8 inference on
+End-to-end recipes for running Qwen3.6, Qwen3.8, and Gemma4 inference on
 Intel Battlemage (BMG) GPUs with optimized ESIMD kernel fast-paths.
 
 ## What's in here
@@ -13,9 +13,9 @@ sglang/
 ├── scripts/
 │   ├── build_image.sh               # wrapper around `docker buildx build`
 │   ├── run_container.sh             # starts a service-free background container
-│   ├── start_qwen3_6_service.sh     # launches 27B/35B online FP8 or GGUF
-│   ├── run_gemma4_26b_moe.sh        # Gemma4-26B-A4B TP=2, e4m3/e5m2
-│   ├── run_gemma4_31b.sh             # Gemma4-31B TP=2 online FP8
+│   ├── start_qwen3_service.sh       # launches Qwen3.6/3.8 FP8 or GGUF
+│   ├── start_gemma4_26b_service.sh # Gemma4-26B-A4B FP8 or GGUF
+│   ├── start_gemma4_31b_service.sh # Gemma4-31B FP8 or GGUF
 │   ├── run_gsm8k.py                 # standalone GSM8K accuracy harness
 │   └── bfcl/                         # BFCL setup and evaluation workflow
 ├── patches/                         # sglang / sgl-kernel-xpu source patches
@@ -82,23 +82,30 @@ use a different `CONTAINER_NAME` to create another container. The launcher
 overrides the release image's `sglang serve` entrypoint and keeps a background
 Bash shell running for both image types.
 
-### Qwen3.6-27B / 35B-A3B: FP8 or GGUF
+### Qwen3.6-27B / 35B-A3B and Qwen3.8-27B: FP8 or GGUF
 
-Inside the container, `scripts/start_qwen3_6_service.sh` selects GGUF when
+Inside the container, `scripts/start_qwen3_service.sh` selects GGUF when
 `MODEL_PATH` ends in `.gguf`; otherwise it uses the existing online FP8 path.
-The script header includes examples for both models and formats.
+The script header includes examples for all supported models and formats.
 
 ```bash
 cd /llm-scaler/sglang
 
 # Online FP8
-MODEL_PATH=/models/Qwen3.6-27B ZE_AFFINITY_MASK=6,7 \
-  bash scripts/start_qwen3_6_service.sh
+MODEL_PATH=/models/Qwen3.6-27B ZE_AFFINITY_MASK=0,1 \
+  bash scripts/start_qwen3_service.sh
+
+MODEL_PATH=/models/Qwen3.8-27B ZE_AFFINITY_MASK=0,1 \
+  bash scripts/start_qwen3_service.sh
 
 # Q4_K_M GGUF (stop the previous service first)
 MODEL_PATH=/models/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf \
-GGUF_CFG_DIR=/models/Qwen3.6-27B ZE_AFFINITY_MASK=6,7 \
-  bash scripts/start_qwen3_6_service.sh
+GGUF_CFG_DIR=/models/Qwen3.6-27B ZE_AFFINITY_MASK=0,1 \
+  bash scripts/start_qwen3_service.sh
+
+MODEL_PATH=/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
+GGUF_CFG_DIR=/models/Qwen3.8-27B ZE_AFFINITY_MASK=0,1 \
+  bash scripts/start_qwen3_service.sh
 ```
 
 GGUF requires a matching HF directory containing configuration, tokenizer
@@ -124,8 +131,8 @@ cd /llm-scaler/sglang
 
 MODEL_PATH=/models/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
 GGUF_CFG_DIR=/models/Qwen3.6-35B-A3B \
-SPEC_DRAFT_PATH=$MODEL_PATH ZE_AFFINITY_MASK=6,7 \
-  bash scripts/start_qwen3_6_service.sh
+SPEC_DRAFT_PATH=$MODEL_PATH ZE_AFFINITY_MASK=0,1 \
+  bash scripts/start_qwen3_service.sh
 ```
 
 For Qwen3.8-27B, the GGUF includes its MTP branch:
@@ -134,8 +141,8 @@ For Qwen3.8-27B, the GGUF includes its MTP branch:
 MODEL_PATH=/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
 GGUF_CFG_DIR=/models/Qwen3.8-27B \
 SPEC_DRAFT_PATH=/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
-ZE_AFFINITY_MASK=6,7 TP_SIZE=2 PORT=30001 \
-  bash scripts/start_qwen3_6_service.sh
+ZE_AFFINITY_MASK=0,1 TP_SIZE=2 PORT=30001 \
+  bash scripts/start_qwen3_service.sh
 ```
 
 Defaults are `SPEC_NUM_STEPS=3`, `SPEC_TOPK=1`, `SPEC_NUM_DRAFT_TOKENS=4`.
@@ -171,10 +178,17 @@ Long-context runs such as BFCL multi-turn additionally need
 ```bash
 cd /llm-scaler/sglang
 
+# FP8
 MODEL_PATH=/models/gemma-4-26B-A4B-it \
-ZE_AFFINITY_MASK=6,7 TP_SIZE=2 SGLANG_FP8_DTYPE=e4m3 \
+ZE_AFFINITY_MASK=0,1 TP_SIZE=2 SGLANG_FP8_DTYPE=e4m3 \
 HOST=127.0.0.1 PORT=30000 \
-  bash scripts/run_gemma4_26b_moe.sh
+  bash scripts/start_gemma4_26b_service.sh
+
+# GGUF
+MODEL_PATH=/models/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf \
+GGUF_CFG_DIR=/models/gemma-4-26B-A4B-it ZE_AFFINITY_MASK=0,1 TP_SIZE=2 \
+HOST=127.0.0.1 PORT=30000 \
+  bash scripts/start_gemma4_26b_service.sh
 ```
 
 ### Gemma4-31B
@@ -182,14 +196,21 @@ HOST=127.0.0.1 PORT=30000 \
 ```bash
 cd /llm-scaler/sglang
 
+# FP8
 MODEL_PATH=/models/gemma-4-31B-it \
-ZE_AFFINITY_MASK=6,7 HOST=127.0.0.1 PORT=30000 \
-  bash scripts/run_gemma4_31b.sh
+ZE_AFFINITY_MASK=0,1 TP_SIZE=2 HOST=127.0.0.1 PORT=30000 \
+  bash scripts/start_gemma4_31b_service.sh
+
+# GGUF
+MODEL_PATH=/models/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf \
+GGUF_CFG_DIR=/models/gemma-4-31B-it ZE_AFFINITY_MASK=0,1 TP_SIZE=2 \
+HOST=127.0.0.1 PORT=30000 \
+  bash scripts/start_gemma4_31b_service.sh
 ```
 
 ## Fast-paths enabled
 
-Each is gated by an env var (set by `start_qwen3_6_service.sh`):
+Each is gated by an env var (set by `start_qwen3_service.sh`):
 
 | Env var                            | Path                                   |
 |------------------------------------|----------------------------------------|
