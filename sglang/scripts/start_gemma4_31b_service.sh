@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
-# Launch Gemma4-31B online FP8 on Intel BMG, TP=2, in eager mode.
+# Launch Gemma4-31B FP8 or GGUF on Intel BMG, TP=2, in eager mode.
+#
+# FP8 example:
+#   MODEL_PATH=/models/gemma-4-31B-it ZE_AFFINITY_MASK=0,1 \
+#   TP_SIZE=2 HOST=0.0.0.0 PORT=30000 \
+#     bash scripts/start_gemma4_31b_service.sh
+#
+# GGUF example:
+#   MODEL_PATH=/models/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf \
+#   GGUF_CFG_DIR=/models/gemma-4-31B-it ZE_AFFINITY_MASK=0,1 TP_SIZE=2 \
+#   HOST=0.0.0.0 PORT=30000 \
+#     bash scripts/start_gemma4_31b_service.sh
 
 set -euo pipefail
 
@@ -10,6 +21,20 @@ PORT="${PORT:-30000}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
 SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.05}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-1}"
+TP_SIZE="${TP_SIZE:-2}"
+IS_GGUF=0
+
+if [[ "${MODEL_PATH}" == *.gguf ]]; then
+    IS_GGUF=1
+    if [[ ! -f "${MODEL_PATH}" ]]; then
+        echo "MODEL_PATH must point to an existing .gguf file." >&2
+        exit 2
+    fi
+    if [[ -z "${GGUF_CFG_DIR:-}" || ! -f "${GGUF_CFG_DIR}/config.json" ]]; then
+        echo "GGUF_CFG_DIR must point to the matching HF model directory containing config.json." >&2
+        exit 2
+    fi
+fi
 
 export ZE_AFFINITY_MASK="${ZE_AFFINITY_MASK:-0,1}"
 export SGLANG_USE_SGL_XPU=1
@@ -21,7 +46,21 @@ export SGLANG_SPLITK_G="${SGLANG_SPLITK_G:-64}"
 # The old SGL_XPU_FP8_W8A16_PREFILL spelling is a no-op.
 export SGLANG_XPU_FP8_W8A16_PREFILL="${SGLANG_XPU_FP8_W8A16_PREFILL:-1}"
 # Decode runs eager: XPU graph is known-broken at TP>1 on this stack.
-export SGL_XPU_ENABLE_GRAPH="${SGL_XPU_ENABLE_GRAPH:-0}"
+export SGLANG_XPU_ENABLE_GRAPH="${SGLANG_XPU_ENABLE_GRAPH:-0}"
+
+format_args=()
+if [[ ${IS_GGUF} == 1 ]]; then
+    export SGLANG_GGUF_HF_CONFIG_DIR="${GGUF_CFG_DIR}"
+    format_args=(
+        --tokenizer-path "${GGUF_CFG_DIR}"
+        --served-model-name "${SERVED_MODEL_NAME:-${GGUF_CFG_DIR}}"
+    )
+else
+    format_args=(
+        --quantization fp8
+        --load-format layered_fp8
+    )
+fi
 
 speculative_args=()
 if [[ -n "${SPECULATIVE_DRAFT_MODEL_PATH}" ]]; then
@@ -37,11 +76,10 @@ fi
 
 exec python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
+    "${format_args[@]}" \
     --device xpu \
-    --tp 2 \
-    --quantization fp8 \
+    --tp "${TP_SIZE}" \
     --dtype float16 \
-    --load-format layered_fp8 \
     --attention-backend intel_xpu \
     --page-size 64 \
     --mem-fraction-static "${MEM_FRACTION_STATIC}" \

@@ -24,7 +24,7 @@
 #
 # NOTE: this is a TP=1 single-tile config with XPU graph on and no MoE fusion —
 # it is the config this kit was validated against, NOT a performance config.
-# For throughput use ../start_qwen3_6_service.sh with a .gguf MODEL_PATH
+# For throughput use ../start_qwen3_service.sh with a .gguf MODEL_PATH
 # (TP=2, ESIMD MoE fusion) and run 04_run.sh with SKIP_START=1.
 set -e
 
