@@ -37,11 +37,11 @@
 # Run one model at a time on the same GPUs/port.
 # GGUF_CFG_DIR must contain the matching HF config, tokenizer and safetensors
 # index (or HF shards for weight-name mapping). Tested GGUF flavor: Q4_K_M.
-# Optional: TP_SIZE=2 PORT=30000 HOST=127.0.0.1 MEM_FRACTION_STATIC=0.8.
-# MEM_FRACTION_STATIC defaults lower with MTP on, because the draft model needs
-# headroom the non-speculative defaults do not leave. Raising it back for an MTP
-# run surfaces as UR_RESULT_ERROR_OUT_OF_RESOURCES in the draft extend, or as a
-# misleading oneCCL "unknown memory type" during warmup.
+# Optional: TP_SIZE=2 PORT=30000 HOST=127.0.0.1 MEM_FRACTION_STATIC=0.75.
+# FP8 defaults to 0.75 so an 8-request concurrent prefill/decode has enough
+# transient device-memory headroom. GGUF defaults to 0.8 without MTP and 0.65
+# with MTP. Raising these values can surface as UR_RESULT_ERROR_OUT_OF_RESOURCES
+# or as a misleading oneCCL "unknown memory type" during warmup.
 # HOST defaults to 0.0.0.0; use 127.0.0.1 for local-only access.
 # Optional MTP tuning: SPEC_NUM_STEPS=3 SPEC_TOPK=1 SPEC_NUM_DRAFT_TOKENS=4.
 # The XPU GDN verify kernels support linear chains only (SPEC_TOPK=1).
@@ -173,11 +173,7 @@ if [[ "$MODEL_PATH" == *.gguf ]]; then
 fi
 
 if [[ -z "${MEM_FRACTION_STATIC:-}" ]]; then
-    if [[ $SPEC_ON == 1 ]]; then
-        MEM_FRACTION_STATIC=0.75
-    else
-        MEM_FRACTION_STATIC=0.9
-    fi
+    MEM_FRACTION_STATIC=0.75
 fi
 
 # --- triton-xpu fp16 mismatch workaround ---
