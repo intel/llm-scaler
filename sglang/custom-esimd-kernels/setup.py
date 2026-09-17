@@ -156,6 +156,29 @@ ext_modules.append(
 )
 ### Eagle kernels
 
+### Speculative sampling (temperature > 0) — tree walk half of the CUDA
+### TreeSpeculativeSamplingTargetOnly. Kept as its own small extension so it
+### rebuilds in seconds instead of recompiling the 100KB eagle.sycl.
+ext_modules.append(
+    SyclExtension(
+        name="custom_esimd_kernels_sglang.spec_sampling_ops",
+        sources=[
+            "csrc/eagle/spec_sampling.sycl",
+        ],
+        include_dirs=[
+            root / "csrc" / "eagle",
+        ],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++20"],
+            "sycl": ["-fsycl-device-code-split=per_kernel",
+                     f"-I{torch_include}"],
+        },
+        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+        py_limited_api=False,
+    )
+)
+### Speculative sampling
+
 ### oneDNN W8A16 prefill GEMM
 ext_modules.append(
     SyclExtension(
