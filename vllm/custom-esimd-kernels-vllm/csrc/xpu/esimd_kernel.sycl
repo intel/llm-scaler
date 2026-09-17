@@ -416,6 +416,9 @@ at::Tensor esimd_resadd_norm_gemv_fp8_pert(
 {
     int N = (int)gemv_weight.size(0);
     int K = (int)gemv_weight.size(1);
+    TORCH_CHECK(K % 128 == 0,
+                "esimd_resadd_norm_gemv_fp8_pert requires K divisible by 128, got ",
+                K);
     int fp8_mode = get_fp8_mode(gemv_weight);
 
     auto& dpcpp_queue = get_device_queue(hidden_states);

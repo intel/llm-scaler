@@ -56,6 +56,23 @@ def ref_resadd_norm_gemv_fp16(hidden, residual, norm_weight, weight_fp16, eps):
     return result, updated_residual.half(), normed.half()
 
 
+def ref_resadd_norm_gemv_fp8(
+    hidden, residual, norm_weight, weight_fp8, weight_scale, eps
+):
+    """Reference using the kernel's FP16 residual store/reload semantics."""
+    added_fp32 = hidden.cpu().float() + residual.cpu().float()
+    updated_residual = added_fp32.half()
+    variance = added_fp32.pow(2).mean(dim=-1, keepdim=True)
+    normed = (
+        updated_residual.float()
+        * torch.rsqrt(variance + eps)
+        * norm_weight.cpu().float()
+    )
+    dequantized_weight = weight_fp8.cpu().float() * weight_scale.cpu().float()
+    result = normed @ dequantized_weight.T
+    return result.half(), updated_residual, normed.half()
+
+
 @pytest.mark.parametrize("N,K", [
     (16, 128),
     (32, 256),
@@ -158,6 +175,153 @@ def test_resadd_norm_gemv_router_uses_consistent_normalized_input():
     torch.xpu.synchronize()
 
     torch.testing.assert_close(output, expected, rtol=2e-3, atol=2e-2)
+
+
+@pytest.mark.parametrize("n,k", [(256, 2048), (128, 2048), (128, 2816)])
+def test_resadd_norm_gemv_fp8_router_has_no_cross_workgroup_race(n, k):
+    """Every router WG must consume the original residual."""
+    torch.manual_seed(713)
+    eps = 1e-6
+    iterations = 3200
+
+    hidden = torch.randn(1, k, dtype=torch.float16, device=DEVICE)
+    residual = torch.randn(1, k, dtype=torch.float16, device=DEVICE)
+    norm_weight = torch.randn(k, dtype=torch.float16, device=DEVICE) * 0.1 + 1.0
+    weight = torch.randn(n, k, dtype=torch.float16, device=DEVICE)
+    scale = torch.tensor(
+        [weight.float().abs().max().item() / 448.0],
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+    weight_fp8 = (weight.float() / scale).to(torch.float8_e4m3fn)
+    output = torch.empty(1, n, dtype=torch.float16, device=DEVICE)
+    normed_out = torch.empty(1, k, dtype=torch.float16, device=DEVICE)
+    expected_output, expected_residual, expected_normed = ref_resadd_norm_gemv_fp8(
+        hidden, residual, norm_weight, weight_fp8, scale, eps
+    )
+
+    for iteration in range(iterations):
+        residual_out = residual.clone()
+        # Keep the clone's producer separate from the custom kernel. The
+        # stress loop is specifically checking the kernel-internal WG race.
+        torch.xpu.synchronize()
+        esimd_resadd_norm_gemv_fp8_pert(
+            hidden,
+            residual_out,
+            norm_weight,
+            weight_fp8,
+            scale,
+            output,
+            normed_out,
+            eps,
+        )
+        torch.xpu.synchronize()
+
+        torch.testing.assert_close(residual_out.cpu(), expected_residual)
+        torch.testing.assert_close(
+            normed_out.cpu(), expected_normed, atol=0.005, rtol=0.01
+        )
+        try:
+            torch.testing.assert_close(
+                output.cpu(), expected_output, atol=0.05, rtol=0.02
+            )
+        except AssertionError as error:
+            pytest.fail(f"router race at iteration {iteration}: {error}")
+
+
+def test_resadd_norm_gemv_fp8_async_consumer_chain_regression():
+    """Keep the decode-style producer/consumer chain asynchronous.
+
+    vLLM reuses each layer's router and normalized-hidden buffers on later
+    decode steps.  The router logits and normalized hidden state are consumed
+    immediately by downstream work; synchronizing after the fused op would
+    hide ordering bugs in that path.  This deliberately queues 1,000 such
+    chains and synchronizes only once at the end.
+    """
+    torch.manual_seed(717)
+    n, k = 128, 2048
+    iterations = 1000
+    eps = 1e-6
+
+    hidden = torch.randn(1, k, dtype=torch.float16, device=DEVICE)
+    residual = torch.randn(1, k, dtype=torch.float16, device=DEVICE)
+    norm_weight = torch.randn(k, dtype=torch.float16, device=DEVICE) * 0.1 + 1.0
+    weight = torch.randn(n, k, dtype=torch.float16, device=DEVICE)
+    scale = torch.tensor(
+        [weight.float().abs().max().item() / 448.0],
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+    weight_fp8 = (weight.float() / scale).to(torch.float8_e4m3fn)
+    router_logits = torch.empty(1, n, dtype=torch.float16, device=DEVICE)
+    normed_out = torch.empty(1, k, dtype=torch.float16, device=DEVICE)
+
+    for iteration in range(iterations):
+        if iteration == iterations - 1:
+            # These are queued before the final fused call, so after the one
+            # final synchronize they are an immutable snapshot of its inputs.
+            final_hidden = hidden.clone()
+            final_residual = residual.clone()
+
+        esimd_resadd_norm_gemv_fp8_pert(
+            hidden,
+            residual,
+            norm_weight,
+            weight_fp8,
+            scale,
+            router_logits,
+            normed_out,
+            eps,
+        )
+
+        # Model the immediate downstream consumer: it reads both products of
+        # the fused op, and its result becomes the next decode layer's input.
+        hidden = normed_out * (1.0 + 0.01 * torch.tanh(router_logits[:, :1]))
+
+    torch.xpu.synchronize()
+
+    expected_output, expected_residual, expected_normed = ref_resadd_norm_gemv_fp8(
+        final_hidden,
+        final_residual,
+        norm_weight,
+        weight_fp8,
+        scale,
+        eps,
+    )
+    for name, tensor in {
+        "hidden": hidden,
+        "residual": residual,
+        "router_logits": router_logits,
+        "normed_out": normed_out,
+    }.items():
+        assert torch.isfinite(tensor).all().item(), f"{name} became non-finite"
+
+    torch.testing.assert_close(residual.cpu(), expected_residual, atol=0.005, rtol=0.01)
+    torch.testing.assert_close(normed_out.cpu(), expected_normed, atol=0.005, rtol=0.01)
+    torch.testing.assert_close(router_logits.cpu(), expected_output, atol=0.05, rtol=0.02)
+
+
+def test_resadd_norm_gemv_fp8_requires_k_divisible_by_128():
+    k = 130
+    hidden = torch.zeros(1, k, dtype=torch.float16, device=DEVICE)
+    residual = torch.zeros_like(hidden)
+    norm_weight = torch.ones(k, dtype=torch.float16, device=DEVICE)
+    weight = torch.zeros(1, k, dtype=torch.float8_e4m3fn, device=DEVICE)
+    scale = torch.ones(1, dtype=torch.float32, device=DEVICE)
+    output = torch.empty(1, 1, dtype=torch.float16, device=DEVICE)
+    normed_out = torch.empty(1, k, dtype=torch.float16, device=DEVICE)
+
+    with pytest.raises(RuntimeError, match="K divisible by 128"):
+        esimd_resadd_norm_gemv_fp8_pert(
+            hidden,
+            residual,
+            norm_weight,
+            weight,
+            scale,
+            output,
+            normed_out,
+            1e-6,
+        )
 
 
 @pytest.mark.parametrize("N,K", [

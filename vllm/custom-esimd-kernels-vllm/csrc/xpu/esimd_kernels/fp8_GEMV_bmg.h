@@ -245,7 +245,8 @@ inline void select_bmg(uint32_t N, uint32_t K, int& vl_big, int& vl_tail, int& k
 
 inline void GEMV_fp8_pert_bmg_host(
     const fp16* p_in, const uint8_t* p_w, const float* p_sc, fp16* p_out,
-    uint32_t N, uint32_t K, int fp8_mode, sycl::queue& q)
+    uint32_t N, uint32_t K, int fp8_mode, sycl::queue& q,
+    const sycl::event* dependency)
 {
     int vl_big, vl_tail, ks;
     select_bmg(N, K, vl_big, vl_tail, ks);
@@ -253,8 +254,22 @@ inline void GEMV_fp8_pert_bmg_host(
     uint32_t global = N * ks;
     uint32_t local  = ks;
 
-    #define LAUNCH_NOTAIL(V, KS)         q.submit([&](sycl::handler& h) {             h.parallel_for(sycl::nd_range<1>(global, local),                 GEMV_fp8_pert_bmg_kernel<V, KS>{p_in, p_w, p_sc, p_out, (int)N, (int)K, fp8_mode});         });
-    #define LAUNCH_TAIL(V, T, KS)         q.submit([&](sycl::handler& h) {             h.parallel_for(sycl::nd_range<1>(global, local),                 GEMV_fp8_pert_bmg_tail_kernel<V, T, KS>{p_in, p_w, p_sc, p_out, (int)N, (int)K, fp8_mode});         });
+    #define LAUNCH_NOTAIL(V, KS)                                              \
+        q.submit([&](sycl::handler& h) {                                     \
+            if (dependency != nullptr) h.depends_on(*dependency);            \
+            h.parallel_for(                                                   \
+                sycl::nd_range<1>(global, local),                             \
+                GEMV_fp8_pert_bmg_kernel<V, KS>{                             \
+                    p_in, p_w, p_sc, p_out, (int)N, (int)K, fp8_mode});       \
+        });
+    #define LAUNCH_TAIL(V, T, KS)                                             \
+        q.submit([&](sycl::handler& h) {                                     \
+            if (dependency != nullptr) h.depends_on(*dependency);            \
+            h.parallel_for(                                                   \
+                sycl::nd_range<1>(global, local),                             \
+                GEMV_fp8_pert_bmg_tail_kernel<V, T, KS>{                     \
+                    p_in, p_w, p_sc, p_out, (int)N, (int)K, fp8_mode});       \
+        });
 
     if (vl_tail == 0) {
         // No tail — use simple kernel.

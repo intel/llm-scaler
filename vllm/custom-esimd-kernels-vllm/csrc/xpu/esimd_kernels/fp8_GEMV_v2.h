@@ -340,7 +340,8 @@ struct GEMV_fp8_pert_kernel {
 // fp8_GEMV_bmg.h (included in esimd_kernel.sycl alongside this header).
 inline void GEMV_fp8_pert_bmg_host(
     const fp16* p_in, const uint8_t* p_w, const float* p_sc, fp16* p_out,
-    uint32_t N, uint32_t K, int fp8_mode, sycl::queue& q);
+    uint32_t N, uint32_t K, int fp8_mode, sycl::queue& q,
+    const sycl::event* dependency = nullptr);
 
 inline void GEMV_fp8_pert_host(
     uint8_t* input_data,
@@ -350,7 +351,8 @@ inline void GEMV_fp8_pert_host(
     uint32_t N,
     uint32_t K,
     int fp8_mode,
-    sycl::queue& q) {
+    sycl::queue& q,
+    const sycl::event* dependency = nullptr) {
 
     auto* p_in  = reinterpret_cast<const fp16*>(input_data);
     auto* p_w   = reinterpret_cast<const uint8_t*>(weight_data);
@@ -366,12 +368,14 @@ inline void GEMV_fp8_pert_host(
                                      std::string(std::getenv("DISABLE_BMG_GEMV")) == "1";
     if (!_disable_bmg) {
         if (K % 64 != 0 || (K < 512 && K % 256 != 0)) {
-            GEMV_fp8_pert_bmg_host(p_in, p_w, p_sc, p_out, N, K, fp8_mode, q);
+            GEMV_fp8_pert_bmg_host(
+                p_in, p_w, p_sc, p_out, N, K, fp8_mode, q, dependency);
             return;
         }
         // K in {1024, 1056, 1152, ...} — bmg is faster when vl=32 fallback
         if (K >= 1024 && K < 2048 && (K % 256 != 0)) {
-            GEMV_fp8_pert_bmg_host(p_in, p_w, p_sc, p_out, N, K, fp8_mode, q);
+            GEMV_fp8_pert_bmg_host(
+                p_in, p_w, p_sc, p_out, N, K, fp8_mode, q, dependency);
             return;
         }
     }
@@ -384,6 +388,7 @@ inline void GEMV_fp8_pert_host(
 
     #define LAUNCH_PERT(V, S) \
         q.submit([&](sycl::handler& h) { \
+            if (dependency != nullptr) h.depends_on(*dependency); \
             h.parallel_for(sycl::nd_range<1>(global, local), \
                 GEMV_fp8_pert_kernel<V, S>{p_in, p_w, p_sc, p_out, (int)N, (int)K, fp8_mode}); \
         });
