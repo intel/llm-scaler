@@ -760,21 +760,16 @@ In this case, you should adjust the launch command with:
 ```
 
 ### 2.8 Multi-Modal Webui
-The project provides two optimized interfaces for interacting with Qwen2.5-VL models:
+The project provides an optimized interface for interacting with Qwen2.5-VL models:
 
 
 #### 📌 Core Components
 - **Inference Engine**: vLLM (Intel-optimized)
-- **Interfaces**: 
-  - Gradio (for rapid prototyping)
-  - ComfyUI (for complex workflows)
+- **Interface**: ComfyUI (for complex workflows)
 
 #### 🚀 Deployment Options
 
-#### Option 1: Gradio Deployment (Recommended for Most Users)
-- check `/llm-scaler/vllm/webui/multi-modal-gradio/README.md` for implementation details
-
-#### Option 2: ComfyUI Deployment (Advanced Workflows)
+#### ComfyUI Deployment (Advanced Workflows)
 - check `/llm-scaler/vllm/webui/multi-modal-comfyui/README.md` for implementation details
 
 
