@@ -1,0 +1,221 @@
+// SPDX-License-Identifier: Apache-2.0
+// XPU counterpart of upstream PLE pinned-host/UVA row lookup (PR #54371).
+#include <ATen/ATen.h>
+#include <ATen/MemoryOverlap.h>
+#include <ATen/core/CachingHostAllocator.h>
+#include <c10/core/DeviceGuard.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/library.h>
+#include <sycl/sycl.hpp>
+
+#include <array>
+#include <cstdint>
+#include <limits>
+
+namespace {
+
+at::Tensor lookup(const at::Tensor& weight, const at::Tensor& ids,
+                  at::Tensor output, int64_t vocab_start, int64_t vocab_end) {
+  TORCH_CHECK(weight.device().is_cpu() && ids.device().is_xpu() &&
+                  output.device() == ids.device(),
+              "NGram offload requires CPU weight and same-device XPU ids/output");
+  TORCH_CHECK(weight.dim() == 2 && weight.size(1) == 160 &&
+                  ids.dim() == 2 && ids.size(1) == 16 &&
+                  output.dim() == 2 && output.size(0) == ids.size(0) &&
+                  output.size(1) == 2560,
+              "NGram offload expects weight [V,160], ids [M,16], output [M,2560]");
+  TORCH_CHECK((weight.scalar_type() == at::kHalf ||
+               weight.scalar_type() == at::kBFloat16) &&
+                  output.scalar_type() == weight.scalar_type() &&
+                  ids.scalar_type() == at::kLong,
+              "NGram offload requires FP16/BF16 weight/output and int64 ids");
+  TORCH_CHECK(weight.is_contiguous() && ids.is_contiguous() &&
+                  output.is_contiguous() && !weight.is_neg() &&
+                  !ids.is_neg() && !output.is_neg() && !weight.is_conj() &&
+                  !ids.is_conj() && !output.is_conj(),
+              "NGram offload requires contiguous physical tensors");
+  TORCH_CHECK(vocab_start >= 0 && vocab_end >= vocab_start &&
+                  vocab_end - vocab_start <= weight.size(0),
+              "NGram offload has invalid local vocabulary bounds");
+  at::assert_no_overlap(ids, output);
+  c10::DeviceGuard guard(ids.device());
+  auto stream = c10::xpu::getCurrentXPUStream(ids.get_device());
+  auto& queue = stream.queue();
+  TORCH_CHECK(queue.get_device().has(sycl::aspect::usm_host_allocations),
+              "XPU does not support host-USM lookup");
+  TORCH_CHECK(sycl::get_pointer_type(weight.data_ptr(), queue.get_context()) ==
+                  sycl::usm::alloc::host,
+              "NGram table must be XPU-accessible pinned CPU memory");
+  if (ids.numel() == 0) return output;
+
+  // Record allocator ownership even for short-lived callers: freeing a pinned
+  // tensor after dispatch must not recycle its storage before this stream ends.
+  TORCH_CHECK(at::getHostAllocator(at::kXPU)->record_event(
+                  weight.data_ptr(), weight.storage().data_ptr().get_context(),
+                  stream.unwrap()),
+              "NGram pinned table must belong to the PyTorch host allocator");
+  const auto* table = static_cast<const uint16_t*>(weight.data_ptr());
+  const auto* indices = ids.data_ptr<int64_t>();
+  auto* result = static_cast<uint16_t*>(output.data_ptr());
+  const size_t rows = ids.numel();
+  queue.parallel_for(
+      sycl::nd_range<1>(rows * 64, 64),
+      [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+        const size_t row = item.get_group_linear_id();
+        const size_t lane = item.get_local_linear_id();
+        const int64_t global = indices[row];
+        const bool owned = global >= vocab_start && global < vocab_end;
+        // No arithmetic or conversion on embedding values: preserve raw bits.
+        for (size_t col = lane; col < 160; col += 64) {
+          uint16_t value = 0;
+          if (owned) value = table[(global - vocab_start) * 160 + col];
+          result[row * 160 + col] = value;
+        }
+      });
+  return output;
+}
+
+at::Tensor reject_lazy(const at::Tensor&, const at::Tensor&, at::Tensor,
+                       int64_t, int64_t) {
+  TORCH_CHECK(false, "NGram offload requires physical tensors, not lazy views");
+}
+
+at::Tensor lookup_chunked(at::TensorList weights, const at::Tensor& ids,
+                          at::Tensor output, int64_t vocab_start,
+                          int64_t vocab_end) {
+  TORCH_CHECK(weights.size() >= 1 && weights.size() <= 8,
+              "Chunked NGram offload requires 1..8 host chunks");
+  TORCH_CHECK(ids.device().is_xpu() && output.device() == ids.device(),
+              "Chunked NGram offload requires same-device XPU ids/output");
+  TORCH_CHECK(ids.layout() == at::kStrided && output.layout() == at::kStrided &&
+                  ids.dim() == 2 && ids.size(1) == 16 &&
+                  output.dim() == 2 && output.size(0) == ids.size(0) &&
+                  output.size(1) == 2560,
+              "Chunked NGram offload expects ids [M,16], output [M,2560]");
+  TORCH_CHECK(ids.scalar_type() == at::kLong &&
+                  (output.scalar_type() == at::kHalf ||
+                   output.scalar_type() == at::kBFloat16),
+              "Chunked NGram offload requires int64 ids and FP16/BF16 output");
+  TORCH_CHECK(ids.is_contiguous() && output.is_contiguous() &&
+                  !ids.is_neg() && !output.is_neg() && !ids.is_conj() &&
+                  !output.is_conj(),
+              "Chunked NGram offload requires contiguous physical ids/output");
+  at::assert_no_overlap(ids, output);
+
+  const auto& first_weight = weights[0];
+  TORCH_CHECK(first_weight.device().is_cpu() &&
+                  first_weight.layout() == at::kStrided &&
+                  first_weight.dim() == 2 && first_weight.size(1) == 160,
+              "Chunked NGram weights must be CPU tensors shaped [N,160]");
+  std::array<const uint16_t*, 8> tables{};
+  const int64_t chunk_rows = first_weight.size(0);
+  int64_t total_rows = 0;
+  for (size_t index = 0; index < weights.size(); ++index) {
+    const auto& weight = weights[index];
+    TORCH_CHECK(weight.device().is_cpu() && weight.layout() == at::kStrided &&
+                    weight.dim() == 2 && weight.size(1) == 160,
+                "Chunked NGram weights must be CPU tensors shaped [N,160]");
+    TORCH_CHECK(weight.scalar_type() == output.scalar_type(),
+                "Chunked NGram weights/output must have the same FP16/BF16 dtype");
+    TORCH_CHECK(weight.is_contiguous() && !weight.is_neg() &&
+                    !weight.is_conj(),
+                "Chunked NGram weights must be contiguous physical tensors");
+    TORCH_CHECK(weight.size(0) > 0 &&
+                    (index + 1 == weights.size()
+                         ? weight.size(0) <= chunk_rows
+                         : weight.size(0) == chunk_rows),
+                "Chunked NGram weights require equal full chunks and a nonempty "
+                "last chunk no larger than the first");
+    TORCH_CHECK(weight.size(0) <=
+                    std::numeric_limits<int64_t>::max() - total_rows,
+                "Chunked NGram row count overflows int64");
+    total_rows += weight.size(0);
+    tables[index] = static_cast<const uint16_t*>(weight.data_ptr());
+  }
+  TORCH_CHECK(vocab_start >= 0 && vocab_end >= vocab_start &&
+                  vocab_end - vocab_start <= total_rows,
+              "Chunked NGram offload has invalid local vocabulary bounds");
+
+  c10::DeviceGuard guard(ids.device());
+  const auto stream = c10::xpu::getCurrentXPUStream(ids.get_device());
+  auto& queue = stream.queue();
+  TORCH_CHECK(queue.is_in_order() &&
+                  queue.get_context() == c10::xpu::get_device_context() &&
+                  queue.get_device() ==
+                      c10::xpu::get_raw_device(ids.get_device()),
+              "Chunked NGram offload requires the current in-order XPU stream");
+  TORCH_CHECK(queue.get_device().has(sycl::aspect::usm_host_allocations),
+              "XPU does not support host-USM lookup");
+  for (const auto& weight : weights) {
+    TORCH_CHECK(sycl::get_pointer_type(weight.data_ptr(), queue.get_context()) ==
+                    sycl::usm::alloc::host,
+                "Chunked NGram tables must be XPU-accessible pinned CPU memory");
+  }
+  if (ids.numel() == 0) return output;
+
+  for (const auto& weight : weights) {
+    TORCH_CHECK(at::getHostAllocator(at::kXPU)->record_event(
+                    weight.data_ptr(),
+                    weight.storage().data_ptr().get_context(), stream.unwrap()),
+                "Chunked NGram tables must belong to the PyTorch host allocator");
+  }
+  const auto* indices = ids.data_ptr<int64_t>();
+  auto* result = static_cast<uint16_t*>(output.data_ptr());
+  const size_t rows = ids.numel();
+  const int64_t chunk_count = weights.size();
+  queue.parallel_for(
+      sycl::nd_range<1>(rows * 64, 64),
+      [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+        const size_t row = item.get_group_linear_id();
+        const size_t lane = item.get_local_linear_id();
+        const int64_t global = indices[row];
+        const bool owned = global >= vocab_start && global < vocab_end;
+        int64_t bank = 0;
+        int64_t offset = 0;
+        if (owned) {
+          const int64_t local = global - vocab_start;
+          if (chunk_count == 1) {
+            offset = local;
+          } else if (chunk_count == 2) {
+            bank = local >= chunk_rows;
+            offset = local - bank * chunk_rows;
+          } else {
+            bank = local / chunk_rows;
+            offset = local % chunk_rows;
+          }
+        }
+        for (size_t col = lane; col < 160; col += 64) {
+          uint16_t value = 0;
+          if (owned) value = tables[bank][offset * 160 + col];
+          result[row * 160 + col] = value;
+        }
+      });
+  return output;
+}
+
+at::Tensor reject_lazy_chunked(at::TensorList, const at::Tensor&, at::Tensor,
+                               int64_t, int64_t) {
+  TORCH_CHECK(false,
+              "Chunked NGram offload requires physical tensors, not lazy views");
+}
+
+} // namespace
+
+TORCH_LIBRARY(ngram_offload_ops, m) {
+  m.def("lookup_out_v1(Tensor weight, Tensor ids, Tensor(a!) output, "
+        "int vocab_start, int vocab_end) -> Tensor(a!)");
+  m.def("lookup_chunked_out_v1(Tensor[] weights, Tensor ids, "
+        "Tensor(a!) output, int vocab_start, int vocab_end) -> Tensor(a!)");
+}
+TORCH_LIBRARY_IMPL(ngram_offload_ops, XPU, m) {
+  m.impl("lookup_out_v1", &lookup);
+  m.impl("lookup_chunked_out_v1", &lookup_chunked);
+}
+TORCH_LIBRARY_IMPL(ngram_offload_ops, Negative, m) {
+  m.impl("lookup_out_v1", &reject_lazy);
+  m.impl("lookup_chunked_out_v1", &reject_lazy_chunked);
+}
+TORCH_LIBRARY_IMPL(ngram_offload_ops, Conjugate, m) {
+  m.impl("lookup_out_v1", &reject_lazy);
+  m.impl("lookup_chunked_out_v1", &reject_lazy_chunked);
+}

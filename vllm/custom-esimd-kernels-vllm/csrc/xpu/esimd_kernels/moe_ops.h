@@ -5,8 +5,10 @@
 
 #include <vector>
 #include <algorithm>
+#include <cstdint>
 #include <numeric>
 #include <cmath>
+#include <stdexcept>
 
 using namespace sycl::ext::intel::esimd;
 using namespace sycl;
@@ -74,12 +76,14 @@ SYCL_ESIMD_FUNCTION inline T h_min(simd<T, N> v) {
 
 // Argmax + zero: uses h_max for value, integer bit-cast for matching.
 // The bit-cast comparison bypasses -ffast-math float comparison issues.
-template<int C>
+template<int C, bool KnownMax = false>
 SYCL_ESIMD_FUNCTION inline void chunk_argmax_and_zero(
     simd<float, C>& vals, int base_idx,
-    float& out_val, int32_t& out_idx)
+    float& out_val, int32_t& out_idx, float known_max = 0.0f)
 {
-    float mx = h_max<float, C>(vals);
+    float mx;
+    if constexpr (KnownMax) mx = known_max;
+    else mx = h_max<float, C>(vals);
 
     // Bit-cast float max to int32 for exact bit-pattern comparison
     // This is immune to -ffast-math reordering of float comparisons
@@ -103,7 +107,7 @@ SYCL_ESIMD_FUNCTION inline void chunk_argmax_and_zero(
     vals.merge(simd<float, C>(-1.0f), zero_mask);
 }
 
-template<int NUM_EXPERTS, int TOPK>
+template<int NUM_EXPERTS, int TOPK, bool CacheChunkMax = false, bool ReuseMax = false>
 struct MoE_TopK_V2_Kernel {
     const fp16* router_logits;   // [T, NUM_EXPERTS]
     fp16* top_values;            // [T, TOPK]
@@ -147,6 +151,14 @@ struct MoE_TopK_V2_Kernel {
             total += h_sum<float, C>(probs[c]);
         }
 
+        // Inspect exponent bits instead of using an FP isfinite comparison:
+        // this must remain effective under the extension's fast-math flags.
+        simd<float, 1> total_vec(total);
+        simd<uint32_t, 1> total_bits =
+            total_vec.template bit_cast_view<uint32_t>().read();
+        const bool total_nonfinite =
+            (total_bits[0] & 0x7f800000u) == 0x7f800000u;
+
         // ── Softmax: normalize ──
         float inv = 1.0f / total;
         #pragma unroll
@@ -155,6 +167,12 @@ struct MoE_TopK_V2_Kernel {
         // ── TopK selection: TOPK rounds ──
         float   tv[16];
         int32_t ti[16];
+        float chunk_max[N_CHUNKS];
+        if constexpr (CacheChunkMax) {
+            #pragma unroll
+            for (int c = 0; c < N_CHUNKS; ++c)
+                chunk_max[c] = h_max<float, C>(probs[c]);
+        }
 
         #pragma unroll
         for (int k = 0; k < TOPK; k++) {
@@ -163,13 +181,23 @@ struct MoE_TopK_V2_Kernel {
             int   bc = 0;
             #pragma unroll
             for (int c = 0; c < N_CHUNKS; c++) {
-                float m = h_max<float, C>(probs[c]);
+                float m;
+                if constexpr (CacheChunkMax) m = chunk_max[c];
+                else m = h_max<float, C>(probs[c]);
                 if (m > bv) { bv = m; bc = c; }
             }
 
             // Argmax + zero within winning chunk
             float fv; int32_t fi;
-            chunk_argmax_and_zero<C>(probs[bc], bc * C, fv, fi);
+            if constexpr (CacheChunkMax && ReuseMax)
+                chunk_argmax_and_zero<C, true>(probs[bc], bc * C, fv, fi, chunk_max[bc]);
+            else
+                chunk_argmax_and_zero<C>(probs[bc], bc * C, fv, fi);
+            if constexpr (CacheChunkMax) {
+                // Only the winning chunk changed. Preserve the original
+                // softmax, exact tie order, and top-weight normalization.
+                if (k + 1 < TOPK) chunk_max[bc] = h_max<float, C>(probs[bc]);
+            }
 
             tv[k] = fv;
             ti[k] = fi;
@@ -183,6 +211,14 @@ struct MoE_TopK_V2_Kernel {
         #pragma unroll
         for (int k = 0; k < TOPK; k++) tv[k] *= inv_top;
 
+        // Non-finite softmax arithmetic deliberately remains visible in the
+        // weights. Only harden the ids so downstream MoE kernels cannot see
+        // duplicate or out-of-range routes; finite rows keep the original path.
+        if (total_nonfinite) {
+            #pragma unroll
+            for (int k = 0; k < TOPK; k++) ti[k] = k;
+        }
+
         // ── Store ──
         fp16* vp = top_values + (size_t)row * TOPK;
         int32_t* ip = top_indices + (size_t)row * TOPK;
@@ -193,8 +229,18 @@ struct MoE_TopK_V2_Kernel {
             simd<int32_t, 8> si8;
             #pragma unroll
             for (int i = 0; i < 8; i++) { sv8[i] = (fp16)tv[i]; si8[i] = ti[i]; }
-            block_store<fp16, 8>(vp, sv8);
-            block_store<int32_t, 8>(ip, si8);
+            if constexpr ((TOPK * sizeof(fp16)) % 16 == 0) {
+                block_store<fp16, 8>(vp, sv8);
+            } else {
+                block_store<fp16, 8>(
+                    vp, sv8, properties{alignment<sizeof(fp16)>});
+            }
+            if constexpr ((TOPK * sizeof(int32_t)) % 16 == 0) {
+                block_store<int32_t, 8>(ip, si8);
+            } else {
+                block_store<int32_t, 8>(
+                    ip, si8, properties{alignment<sizeof(int32_t)>});
+            }
         }
         // Store remainder individually
         if constexpr (TOPK > 8) {
@@ -202,8 +248,10 @@ struct MoE_TopK_V2_Kernel {
             for (int i = 8; i < TOPK; i++) {
                 simd<fp16, 1> sv((fp16)tv[i]);
                 simd<int32_t, 1> si(ti[i]);
-                block_store<fp16, 1>(vp + i, sv);
-                block_store<int32_t, 1>(ip + i, si);
+                block_store<fp16, 1>(
+                    vp + i, sv, properties{alignment<sizeof(fp16)>});
+                block_store<int32_t, 1>(
+                    ip + i, si, properties{alignment<sizeof(int32_t)>});
             }
         }
         if constexpr (TOPK < 8) {
@@ -211,22 +259,40 @@ struct MoE_TopK_V2_Kernel {
             for (int i = 0; i < TOPK; i++) {
                 simd<fp16, 1> sv((fp16)tv[i]);
                 simd<int32_t, 1> si(ti[i]);
-                block_store<fp16, 1>(vp + i, sv);
-                block_store<int32_t, 1>(ip + i, si);
+                block_store<fp16, 1>(
+                    vp + i, sv, properties{alignment<sizeof(fp16)>});
+                block_store<int32_t, 1>(
+                    ip + i, si, properties{alignment<sizeof(int32_t)>});
             }
         }
     }
 };
 
-template<int NUM_EXPERTS, int TOPK>
+template<int NUM_EXPERTS, int TOPK, bool CacheChunkMax = false, bool ReuseMax = false>
 inline void moe_topk_v2_host(
     const fp16* logits, fp16* values, int32_t* indices,
     int T, sycl::queue& q)
 {
+    constexpr size_t values_alignment =
+        (TOPK * sizeof(fp16)) % 16 == 0 ? 16 : alignof(fp16);
+    constexpr size_t indices_alignment =
+        (TOPK * sizeof(int32_t)) % 16 == 0 ? 16 : alignof(int32_t);
+    if (reinterpret_cast<uintptr_t>(logits) % 16 != 0) {
+        throw std::invalid_argument(
+            "moe_topk_v2_host: logits must be 16-byte aligned");
+    }
+    if (reinterpret_cast<uintptr_t>(values) % values_alignment != 0) {
+        throw std::invalid_argument(
+            "moe_topk_v2_host: values pointer has insufficient alignment");
+    }
+    if (reinterpret_cast<uintptr_t>(indices) % indices_alignment != 0) {
+        throw std::invalid_argument(
+            "moe_topk_v2_host: indices pointer has insufficient alignment");
+    }
     q.submit([&](sycl::handler& h) {
         h.parallel_for(
             sycl::nd_range<1>({(size_t)T}, {1}),
-            MoE_TopK_V2_Kernel<NUM_EXPERTS, TOPK>{logits, values, indices, T});
+            MoE_TopK_V2_Kernel<NUM_EXPERTS, TOPK, CacheChunkMax, ReuseMax>{logits, values, indices, T});
     });
 }
 

@@ -6,6 +6,7 @@
 
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
+#include <ATen/MemoryOverlap.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/python.h>
 
@@ -118,7 +119,7 @@ at::Tensor esimd_gdn_conv_fused_seq(
     return output;
 }
 
-at::Tensor esimd_gdn_conv_fused_seq_spec(
+static at::Tensor esimd_gdn_conv_fused_seq_spec_impl(
     at::Tensor qkvz,
     at::Tensor conv_state,
     at::Tensor conv_weight,
@@ -138,7 +139,8 @@ at::Tensor esimd_gdn_conv_fused_seq_spec(
     int64_t HV,
     int64_t K,
     int64_t V,
-    double scale)
+    double scale,
+    bool allow_qwen38_tp8)
 {
     auto& dpcpp_queue = get_device_queue(qkvz);
 
@@ -163,6 +165,151 @@ at::Tensor esimd_gdn_conv_fused_seq_spec(
         (int)num_spec_tokens, (int)H, (int)HV, (int)K, (int)V,
         (float)scale, (int)conv_state.size(1), conv_state.stride(0),
         ssm_state.stride(0),
-        dpcpp_queue);
+        dpcpp_queue, allow_qwen38_tp8);
+    return output;
+}
+
+at::Tensor esimd_gdn_conv_fused_seq_spec(
+    at::Tensor qkvz,
+    at::Tensor conv_state,
+    at::Tensor conv_weight,
+    at::Tensor conv_bias,
+    at::Tensor spec_state_indices,
+    at::Tensor A_log,
+    at::Tensor dt_bias,
+    at::Tensor ba,
+    at::Tensor ssm_state,
+    at::Tensor output,
+    at::Tensor z_out,
+    at::Tensor token_indx,
+    at::Tensor num_accepted_tokens,
+    int64_t num_spec_decodes,
+    int64_t num_spec_tokens,
+    int64_t H,
+    int64_t HV,
+    int64_t K,
+    int64_t V,
+    double scale)
+{
+    return esimd_gdn_conv_fused_seq_spec_impl(
+        qkvz, conv_state, conv_weight, conv_bias, spec_state_indices,
+        A_log, dt_bias, ba, ssm_state, output, z_out, token_indx,
+        num_accepted_tokens, num_spec_decodes, num_spec_tokens, H, HV, K, V,
+        scale, false);
+}
+
+at::Tensor esimd_gdn_conv_fused_seq_spec_v2(
+    at::Tensor qkvz,
+    at::Tensor conv_state,
+    at::Tensor conv_weight,
+    at::Tensor conv_bias,
+    at::Tensor spec_state_indices,
+    at::Tensor A_log,
+    at::Tensor dt_bias,
+    at::Tensor ba,
+    at::Tensor ssm_state,
+    at::Tensor output,
+    at::Tensor z_out,
+    at::Tensor token_indx,
+    at::Tensor num_accepted_tokens,
+    int64_t num_spec_decodes,
+    int64_t num_spec_tokens,
+    int64_t H,
+    int64_t HV,
+    int64_t K,
+    int64_t V,
+    double scale)
+{
+    TORCH_CHECK(
+        gdn_spec_v2_geometry_supported((int)H, (int)HV, (int)K, (int)V) &&
+        num_spec_decodes > 0 &&
+        num_spec_tokens >= 2 && num_spec_tokens <= 8 && scale > 0,
+        "GDN spec v2 requires H/HV=2/6, 4/12, or 8/16,24, "
+        "K=V=128, M=2..8");
+    const int64_t N = num_spec_decodes * num_spec_tokens;
+    const int64_t dim = (2 * H + HV) * K;
+    const auto device = qkvz.device();
+    TORCH_CHECK(qkvz.is_xpu(), "GDN spec v2 requires XPU tensors");
+    for (const auto& tensor : {qkvz, conv_state, conv_weight, conv_bias,
+                              dt_bias, ba, ssm_state, output, z_out}) {
+        TORCH_CHECK(tensor.device() == device && tensor.scalar_type() == at::kHalf,
+                    "GDN spec v2 data tensors must be FP16 on the same XPU");
+    }
+    for (const auto& tensor : {spec_state_indices, token_indx, num_accepted_tokens}) {
+        TORCH_CHECK(tensor.device() == device && tensor.scalar_type() == at::kInt &&
+                    tensor.is_contiguous(), "GDN spec v2 indices must be contiguous int32");
+    }
+    TORCH_CHECK(spec_state_indices.numel() == N && token_indx.numel() == N &&
+                num_accepted_tokens.numel() == num_spec_decodes,
+                "GDN spec v2 index dimensions do not match the sequences");
+    TORCH_CHECK(qkvz.dim() == 2 && qkvz.size(0) == N &&
+                qkvz.size(1) == dim + HV * V && qkvz.stride(1) == 1 &&
+                qkvz.stride(0) >= qkvz.size(1), "GDN spec v2 invalid qkvz layout");
+    TORCH_CHECK(ba.dim() == 2 && ba.size(0) == N && ba.size(1) == 2 * HV &&
+                ba.stride(1) == 1 && ba.stride(0) >= 2 * HV,
+                "GDN spec v2 invalid ba layout");
+    TORCH_CHECK(conv_state.dim() == 3 && conv_state.size(0) > 0 &&
+                (conv_state.size(1) == 3 || conv_state.size(1) >= num_spec_tokens + 2) &&
+                conv_state.size(2) == dim && conv_state.stride(2) == 1 &&
+                conv_state.stride(1) == dim &&
+                conv_state.stride(0) >= conv_state.size(1) * dim,
+                "GDN spec v2 invalid packed conv layout");
+    TORCH_CHECK(ssm_state.dim() == 4 && ssm_state.size(0) > 0 &&
+                ssm_state.size(1) == HV && ssm_state.size(2) == V && ssm_state.size(3) == K &&
+                ssm_state.stride(3) == 1 && ssm_state.stride(2) == K &&
+                ssm_state.stride(1) == V * K && ssm_state.stride(0) >= HV * V * K,
+                "GDN spec v2 invalid SSM layout");
+    TORCH_CHECK(conv_weight.is_contiguous() && conv_weight.numel() == dim * 4 &&
+                conv_bias.is_contiguous() && conv_bias.numel() == dim &&
+                dt_bias.is_contiguous() && dt_bias.numel() == HV,
+                "GDN spec v2 invalid convolution/gate parameter shapes");
+    TORCH_CHECK(A_log.device() == device && A_log.is_contiguous() && A_log.numel() == HV &&
+                (A_log.scalar_type() == at::kHalf || A_log.scalar_type() == at::kFloat),
+                "GDN spec v2 A_log must be FP16 or FP32");
+    for (const auto& tensor : {output, z_out}) {
+        TORCH_CHECK(tensor.is_contiguous() && tensor.dim() == 3 &&
+                    tensor.size(0) == N && tensor.size(1) == HV && tensor.size(2) == V,
+                    "GDN spec v2 invalid output shape");
+    }
+    // Reject detectable cross-tensor aliases before any submission. Intentional
+    // initial/checkpoint aliasing inside each state pool remains supported.
+    const at::Tensor writes[] = {conv_state, ssm_state, output, z_out};
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < i; ++j) at::assert_no_overlap(writes[i], writes[j]);
+        for (const auto& input : {qkvz, conv_weight, conv_bias, A_log, dt_bias, ba,
+                                  spec_state_indices, token_indx, num_accepted_tokens}) {
+            at::assert_no_overlap(writes[i], input);
+        }
+    }
+    auto& queue = get_device_queue(qkvz);
+    // Per-call temporary, allocated and consumed on the current XPU stream.
+    // Never share scratch between devices or concurrently active streams.
+    at::Tensor qkv = at::empty({N, dim}, qkvz.options());
+    auto* p_qkv = reinterpret_cast<fp16*>(qkv.data_ptr());
+    const auto ready = gdn_spec_v2_conv_host(
+        reinterpret_cast<const fp16*>(qkvz.data_ptr()), qkvz.stride(0),
+        reinterpret_cast<fp16*>(conv_state.data_ptr()),
+        reinterpret_cast<const fp16*>(conv_weight.data_ptr()),
+        reinterpret_cast<const fp16*>(conv_bias.data_ptr()),
+        spec_state_indices.data_ptr<int>(), token_indx.data_ptr<int>(),
+        num_accepted_tokens.data_ptr<int>(), p_qkv,
+        reinterpret_cast<fp16*>(z_out.data_ptr()),
+        num_spec_decodes, num_spec_tokens, H, HV, conv_state.size(1),
+        conv_state.stride(0), queue);
+    const auto recurrent = [&](auto* A) {
+        gdn_spec_v2_recurrent_host(
+            p_qkv, A, reinterpret_cast<const fp16*>(dt_bias.data_ptr()),
+            reinterpret_cast<const fp16*>(ba.data_ptr()), ba.stride(0),
+            reinterpret_cast<fp16*>(ssm_state.data_ptr()), ssm_state.stride(0),
+            reinterpret_cast<fp16*>(output.data_ptr()),
+            spec_state_indices.data_ptr<int>(), token_indx.data_ptr<int>(),
+            num_accepted_tokens.data_ptr<int>(), num_spec_decodes,
+            num_spec_tokens, H, HV, (float)scale, ready, queue);
+    };
+    if (A_log.scalar_type() == at::kFloat) {
+        recurrent(A_log.data_ptr<float>());
+    } else {
+        recurrent(reinterpret_cast<const fp16*>(A_log.data_ptr()));
+    }
     return output;
 }

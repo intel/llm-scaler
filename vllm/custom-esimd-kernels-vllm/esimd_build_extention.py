@@ -322,8 +322,11 @@ def _get_sycl_dlink_flags(compile_flags):
     dlink_flags.extend([
         '-fsycl-link',
         '--offload-compress',
-        f'-Xs "-device {_get_sycl_arch_list()}"',
     ])
+    # A JIT-only SPIR-V image must not embed the offline compiler's -device
+    # option: Level Zero rejects that option when creating the runtime program.
+    if target_flag is None or 'spir64_gen' in target_flag.split('=', 1)[1].split(','):
+        dlink_flags.append(f'-Xs "-device {_get_sycl_arch_list()}"')
     return dlink_flags
 
 # JIT_EXTENSION_VERSIONER = ExtensionVersioner()

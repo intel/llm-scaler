@@ -1,0 +1,239 @@
+// Qwen3.8 native-width FP8 W8A16 linear kernels.
+//
+// This source is intentionally a standalone pybind extension.  It does not
+// register a torch dispatcher op, so loading it cannot collide with the
+// existing custom_esimd_kernels_vllm DSOs.  The caller keeps the old ESIMD
+// kernels as the fallback for every shape outside this fixed allowlist.
+
+#include <torch/extension.h>
+
+#include <cstdint>
+
+#include <c10/xpu/XPUCachingAllocator.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+
+using fp16 = sycl::half;
+using namespace sycl::ext::intel::esimd;
+
+namespace {
+
+constexpr int kMaxM = 8;
+constexpr int kK2560 = 2560;
+constexpr int kK80 = 80;
+
+// E4M3FN finite values are representable exactly in FP16.  Building the
+// FP16 bit pattern also keeps the normal path free of device math.  The
+// exp==0 cases are subnormals: mantissa * 2^-9, not signed zero.
+template <int VL>
+SYCL_ESIMD_FUNCTION inline simd<float, VL> e4m3_to_fp32(
+    simd<uint8_t, VL> raw) {
+    simd<uint16_t, VL> u = convert<uint16_t>(raw);
+    simd<uint16_t, VL> sign = (u & 0x80) << 8;
+    simd<uint16_t, VL> bits = sign | (((u & 0x7f) << 7) + 0x2000);
+    simd<fp16, VL> value = bits.template bit_cast_view<fp16>().read();
+
+    simd<float, VL> subnormal = convert<float>(u & 0x7);
+    subnormal *= 1.0f / 512.0f;
+    subnormal.merge(-subnormal, (u & 0x80) != 0);
+    value.merge(convert<fp16>(subnormal), (u & 0x78) == 0);
+
+    // E4M3FN reserves exp=15,mant=7 as NaN.  Preserve it if a raw tensor
+    // contains the encoding instead of turning it into a finite half value.
+    bits = sign | 0x7e00;
+    value.merge(bits.template bit_cast_view<fp16>().read(), (u & 0x7f) == 0x7f);
+    return simd<float, VL>(value);
+}
+
+template <int VL, int K_SPLIT>
+struct Qwen38Fp8LinearKernel {
+    const fp16* input;
+    const uint8_t* weight;
+    const float* scale;
+    fp16* output;
+    int m;
+    int n;
+    int k;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        if constexpr (K_SPLIT > 1) {
+            // The largest supported call uses 8 rows and 8 K partitions.
+            // This is per-workgroup local memory, never a global workspace.
+            slm_init<kMaxM * K_SPLIT * sizeof(float)>();
+        }
+
+        const int local_id = static_cast<int>(item.get_local_id(0));
+        const int row = local_id / K_SPLIT;
+        const int split = local_id % K_SPLIT;
+        const int column = static_cast<int>(item.get_group(0));
+        const int k_per_split = k / K_SPLIT;
+        const int k_begin = split * k_per_split;
+
+        simd<float, VL> accumulator(0.0f);
+        for (int offset = 0; offset < k_per_split; offset += VL) {
+            const int input_offset = row * k + k_begin + offset;
+            const int weight_offset = column * k + k_begin + offset;
+            simd<fp16, VL> input_values = block_load<fp16, VL>(input + input_offset);
+            simd<uint8_t, VL> weight_bits =
+                block_load<uint8_t, VL>(weight + weight_offset);
+            accumulator += simd<float, VL>(input_values) *
+                           e4m3_to_fp32<VL>(weight_bits);
+        }
+
+        const float partial =
+            sycl::ext::intel::esimd::detail::sum<float, float, VL>(accumulator);
+
+        if constexpr (K_SPLIT == 1) {
+            // The complete dot product is already FP32 here.  Scale before
+            // the one and only conversion to the requested FP16 output.
+            output[row * n + column] = fp16(partial * scale[0]);
+        } else {
+            const uint32_t slm_offset = static_cast<uint32_t>(
+                (row * K_SPLIT + split) * sizeof(float));
+            slm_block_store<float, 1>(slm_offset, simd<float, 1>(partial));
+            barrier();
+
+            if (split == 0) {
+                const uint32_t row_offset = static_cast<uint32_t>(
+                    row * K_SPLIT * sizeof(float));
+                simd<float, K_SPLIT> partials =
+                    slm_block_load<float, K_SPLIT>(row_offset);
+                const float total =
+                    sycl::ext::intel::esimd::detail::sum<float, float, K_SPLIT>(
+                        partials);
+                output[row * n + column] = fp16(total * scale[0]);
+            }
+        }
+    }
+};
+
+template <int VL, int K_SPLIT>
+void launch_qwen38_fp8_linear(
+    sycl::queue& queue, const fp16* input, const uint8_t* weight,
+    const float* scale, fp16* output, int m, int n, int k) {
+    const size_t workgroup_size = static_cast<size_t>(m * K_SPLIT);
+    const size_t workgroups = static_cast<size_t>(n);
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<Qwen38Fp8LinearKernel<VL, K_SPLIT>>(
+            sycl::nd_range<1>(
+                sycl::range<1>(workgroups * workgroup_size),
+                sycl::range<1>(workgroup_size)),
+            Qwen38Fp8LinearKernel<VL, K_SPLIT>{
+                input, weight, scale, output, m, n, k});
+    });
+}
+
+bool tensor_is_valid(
+    const torch::Tensor& tensor, const c10::Device& device,
+    at::ScalarType dtype, size_t alignment) {
+    return tensor.defined() && tensor.device() == device &&
+           tensor.scalar_type() == dtype && tensor.layout() == c10::kStrided &&
+           tensor.is_contiguous() && !tensor.is_conj() && !tensor.is_neg() &&
+           reinterpret_cast<uintptr_t>(tensor.const_data_ptr()) % alignment == 0;
+}
+
+torch::Tensor qwen38_fp8_linear(
+    const torch::Tensor& input, const torch::Tensor& weight,
+    const torch::Tensor& scale) {
+    TORCH_CHECK(input.defined() && weight.defined() && scale.defined(),
+                "qwen38_fp8_linear: all tensors must be defined");
+    TORCH_CHECK(input.is_xpu(), "qwen38_fp8_linear: input must be on XPU");
+    const c10::Device device = input.device();
+
+    TORCH_CHECK(input.dim() == 2 && weight.dim() == 2,
+                "qwen38_fp8_linear: input and weight must be 2D");
+    const int64_t m = input.size(0);
+    const int64_t k = input.size(1);
+    const int64_t n = weight.size(0);
+    TORCH_CHECK(m >= 1 && m <= kMaxM,
+                "qwen38_fp8_linear: M must be in [1, 8], got M=", m);
+    TORCH_CHECK(weight.size(1) == k,
+                "qwen38_fp8_linear: input/weight K mismatch");
+    TORCH_CHECK(
+        (n == 12 && k == kK2560) || (n == 24 && k == kK2560) ||
+            (n == 160 && k == kK2560) || (n == 2560 && k == kK80),
+        "qwen38_fp8_linear: unsupported shape [N, K]=[", n, ", ", k,
+        "]; supported shapes are [12,2560], [24,2560], [160,2560], "
+        "[2560,80]");
+    TORCH_CHECK(scale.numel() == 1,
+                "qwen38_fp8_linear: scale must contain one FP32 value");
+
+    TORCH_CHECK(tensor_is_valid(input, device, at::kHalf, 16),
+                "qwen38_fp8_linear: input must be contiguous, aligned FP16 "
+                "on the input device");
+    TORCH_CHECK(tensor_is_valid(weight, device, at::kFloat8_e4m3fn, 64),
+                "qwen38_fp8_linear: weight must be contiguous, aligned "
+                "FP8 E4M3 on the input device");
+    TORCH_CHECK(tensor_is_valid(scale, device, at::kFloat, 4),
+                "qwen38_fp8_linear: scale must be contiguous, aligned FP32 "
+                "on the input device");
+
+    // Every check above is complete before obtaining pointers or submitting
+    // device work.  Record every borrowed input storage on the current stream:
+    // a temporary tensor can otherwise be returned to the caching allocator
+    // by its producer stream while this asynchronous kernel still reads it.
+    auto current_stream = c10::xpu::getCurrentXPUStream(device.index());
+    c10::xpu::XPUCachingAllocator::recordStream(
+        input.storage().data_ptr(), current_stream);
+    c10::xpu::XPUCachingAllocator::recordStream(
+        weight.storage().data_ptr(), current_stream);
+    c10::xpu::XPUCachingAllocator::recordStream(
+        scale.storage().data_ptr(), current_stream);
+
+    // The output owns its storage; no caller-visible scratch or cross-request
+    // state is used.
+    auto output = torch::empty(
+        {m, n}, input.options().dtype(torch::kFloat16));
+    auto& queue = current_stream.queue();
+
+    if (k == kK2560) {
+        launch_qwen38_fp8_linear<64, 8>(
+            queue, reinterpret_cast<const fp16*>(input.const_data_ptr()),
+            reinterpret_cast<const uint8_t*>(weight.const_data_ptr()),
+            scale.const_data_ptr<float>(),
+            reinterpret_cast<fp16*>(output.data_ptr()), static_cast<int>(m),
+            static_cast<int>(n), static_cast<int>(k));
+    } else {
+        // K=80 is an exact five-vector tail with VL=16.  K_SPLIT=1 avoids
+        // padded reads and lets each work-item produce one M row directly.
+        launch_qwen38_fp8_linear<16, 1>(
+            queue, reinterpret_cast<const fp16*>(input.const_data_ptr()),
+            reinterpret_cast<const uint8_t*>(weight.const_data_ptr()),
+            scale.const_data_ptr<float>(),
+            reinterpret_cast<fp16*>(output.data_ptr()), static_cast<int>(m),
+            static_cast<int>(n), static_cast<int>(k));
+    }
+    return output;
+}
+
+std::optional<torch::Tensor> try_qwen38_fp8_linear(
+    const torch::Tensor& input, const torch::Tensor& weight,
+    const torch::Tensor& scale) {
+    if (!input.defined() || !input.is_xpu() || input.dim() != 2 ||
+        !weight.defined() || weight.dim() != 2 || !scale.defined())
+        return std::nullopt;
+    const auto device = input.device();
+    const int64_t m = input.size(0), k = input.size(1), n = weight.size(0);
+    if (m < 1 || m > kMaxM || weight.size(1) != k ||
+        !((n == 12 && k == 2560) || (n == 24 && k == 2560) ||
+          (n == 160 && k == 2560) || (n == 2560 && k == 80)) ||
+        scale.numel() != 1 ||
+        !tensor_is_valid(input, device, at::kHalf, 16) ||
+        !tensor_is_valid(weight, device, at::kFloat8_e4m3fn, 64) ||
+        !tensor_is_valid(scale, device, at::kFloat, 4))
+        return std::nullopt;
+    // All misses are decided before any submission. Never catch launch or
+    // runtime failures to try a second backend on partially submitted work.
+    return qwen38_fp8_linear(input, weight, scale);
+}
+
+}  // namespace
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+    module.def("try_qwen38_fp8_linear", &try_qwen38_fp8_linear);
+    module.def(
+        "qwen38_fp8_linear", &qwen38_fp8_linear,
+        "Qwen3.8 native-width FP8 E4M3 W8A16 linear");
+}

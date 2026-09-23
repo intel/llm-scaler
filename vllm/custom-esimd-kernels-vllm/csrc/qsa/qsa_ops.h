@@ -1,0 +1,199 @@
+// Copyright 2026
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <ATen/ATen.h>
+
+#include <tuple>
+#include <vector>
+
+namespace qsa {
+
+at::Tensor select_paged_tokens(
+    const at::Tensor& q,
+    const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths,
+    int64_t token_topk,
+    int64_t compress_ratio,
+    at::Tensor out);
+
+at::Tensor select_paged_tokens_v2(
+    const at::Tensor& q,
+    const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths,
+    int64_t token_topk,
+    int64_t compress_ratio,
+    int64_t compressed_page_size,
+    at::Tensor out);
+
+at::Tensor store_cache_rows_v3(
+    at::Tensor cache,
+    const at::Tensor& slot_mapping,
+    const at::Tensor& rows);
+
+// False means no submission; all stores are validated before any mutation.
+bool try_store_m1_transaction_v1(
+    const std::vector<std::tuple<at::Tensor, at::Tensor, at::Tensor>>& stores,
+    bool fused);
+
+std::tuple<at::Tensor, at::Tensor> store_cache_rows_v4(
+    at::Tensor cache,
+    const at::Tensor& slot_mapping,
+    const at::Tensor& rows,
+    at::Tensor receipt);
+
+at::Tensor store_cache_rows_r_aware_v1(
+    at::Tensor cache,
+    const at::Tensor& slot_mapping,
+    const at::Tensor& rows,
+    bool unique_slots_proven);
+
+at::Tensor group_compress_v1(
+    const at::Tensor& raw_keys,
+    const at::Tensor& raw_positions,
+    const at::Tensor& compressor_state_cache,
+    const at::Tensor& rope_position_cache,
+    const at::Tensor& compressor_state_block_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_start_loc,
+    const at::Tensor& logical_positions,
+    const at::Tensor& compressed_slots,
+    at::Tensor pooled,
+    at::Tensor first_positions,
+    int64_t compress_ratio,
+    int64_t compressed_capacity,
+    bool historical_ring_proven);
+
+// Stream-ordered group compression for one or more query rows.  Unlike v1,
+// v2 derives each row's raw-versus-ring sources from query_start_loc and
+// accepts [M,1,128] inputs.  The caller still owns both output tensors.
+at::Tensor group_compress_v2(
+    const at::Tensor& raw_keys,
+    const at::Tensor& raw_positions,
+    const at::Tensor& compressor_state_cache,
+    const at::Tensor& rope_position_cache,
+    const at::Tensor& compressor_state_block_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_start_loc,
+    const at::Tensor& logical_positions,
+    const at::Tensor& compressed_slots,
+    at::Tensor pooled,
+    at::Tensor first_positions,
+    int64_t compress_ratio,
+    int64_t compressed_capacity,
+    bool historical_ring_proven);
+
+at::Tensor indexer_norm_rope_v1(
+    const at::Tensor& input,
+    at::Tensor output,
+    const at::Tensor& weight,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    bool mrope,
+    bool positions_bounds_proven);
+
+// 独立 v2：M2..8、NeoX、eager FP16 norm/mul/add 舍入边界。
+at::Tensor indexer_norm_rope_v2(
+    const at::Tensor& input,
+    at::Tensor output,
+    const at::Tensor& weight,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    bool mrope,
+    bool is_neox_style,
+    bool enable_fp32_compute);
+
+at::Tensor qsa_q_norm_rope_select_v1(
+    const at::Tensor& projected_q,
+    const at::Tensor& norm_weight,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths,
+    at::Tensor q_output,
+    at::Tensor out,
+    bool mrope,
+    bool positions_bounds_proven);
+
+at::Tensor qsa_q_norm_rope_select_parallel_v1(
+    const at::Tensor& projected_q,
+    const at::Tensor& norm_weight,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths,
+    at::Tensor q_output,
+    at::Tensor out,
+    bool mrope,
+    bool positions_bounds_proven);
+
+at::Tensor select_preprocessed_parallel(
+    const at::Tensor& q, const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table, const at::Tensor& token_to_req,
+    const at::Tensor& query_positions, const at::Tensor& sequence_lengths,
+    int64_t compressed_page_size, at::Tensor out, int partitions = 32);
+
+at::Tensor select_paged_tokens_local_v1(
+    const at::Tensor& q, const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table, const at::Tensor& token_to_req,
+    const at::Tensor& query_positions, const at::Tensor& sequence_lengths,
+    int64_t token_topk, int64_t compress_ratio,
+    int64_t compressed_page_size, at::Tensor out);
+
+at::Tensor select_paged_tokens_parallel_v1(
+    const at::Tensor& q,
+    const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths,
+    int64_t token_topk,
+    int64_t compress_ratio,
+    int64_t compressed_page_size,
+    at::Tensor out);
+
+}  // namespace qsa
+
+at::Tensor sparse_paged_attention_v2(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t main_page_size,
+    at::Tensor out);
+
+at::Tensor sparse_paged_attention_bounded_v2(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t max_valid_width,
+    int64_t main_page_size,
+    at::Tensor out);
+
+at::Tensor sparse_paged_attention_q6_v1(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t main_page_size,
+    at::Tensor out);
