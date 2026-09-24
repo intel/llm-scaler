@@ -151,6 +151,15 @@ struct GEMV_fp8_pert_batched_kernel {
 // Each single-thread WG handles output[m_start:m_start+TILE_M, n]
 // Weight row loaded once, reused across TILE_M input rows
 // ============================================================================
+template<typename T, int VL>
+SYCL_ESIMD_FUNCTION inline simd<T, VL> fp8_ws_block_load(
+    const T* ptr, bool unaligned) {
+    if (unaligned) {
+        return block_load<T, VL>(ptr, properties{alignment<sizeof(T)>});
+    }
+    return block_load<T, VL>(ptr);
+}
+
 template<int VL, int TILE_M>
 struct GEMM_fp8_pert_ws_kernel {
     const fp16*    input;      // [M, K]
@@ -169,18 +178,20 @@ struct GEMM_fp8_pert_ws_kernel {
         simd<float, VL> acc[TILE_M];
         #pragma unroll
         for (int i = 0; i < TILE_M; i++) acc[i] = 0.0f;
+        const bool unaligned = K % 4 != 0;
 
         // Main loop: process full VL chunks
         int k_aligned = (K / VL) * VL;
         for (int k = 0; k < k_aligned; k += VL) {
-            simd<uint8_t, VL> raw = block_load<uint8_t, VL>(weight + (size_t)n * K + k);
+            simd<uint8_t, VL> raw = fp8_ws_block_load<uint8_t, VL>(
+                weight + (size_t)n * K + k, unaligned);
             simd<float, VL> wf = fp8_dequant<VL>(raw, fp8_mode);
 
             #pragma unroll
             for (int i = 0; i < TILE_M; i++) {
                 if (m_start + i < M) {
-                    simd<fp16, VL> iv = block_load<fp16, VL>(
-                        input + (size_t)(m_start + i) * K + k);
+                    simd<fp16, VL> iv = fp8_ws_block_load<fp16, VL>(
+                        input + (size_t)(m_start + i) * K + k, unaligned);
                     acc[i] += simd<float, VL>(iv) * wf;
                 }
             }
@@ -206,7 +217,8 @@ struct GEMM_fp8_pert_ws_kernel {
                 }
             } else {
                 int k_tail = K - VL;
-                simd<uint8_t, VL> raw = block_load<uint8_t, VL>(weight + (size_t)n * K + k_tail);
+                simd<uint8_t, VL> raw = fp8_ws_block_load<uint8_t, VL>(
+                    weight + (size_t)n * K + k_tail, unaligned);
                 simd<float, VL> wf = fp8_dequant<VL>(raw, fp8_mode);
                 // Only accumulate the tail portion [k_aligned, K).
                 int overlap = k_aligned - k_tail;
@@ -215,8 +227,9 @@ struct GEMM_fp8_pert_ws_kernel {
                 #pragma unroll
                 for (int i = 0; i < TILE_M; i++) {
                     if (m_start + i < M) {
-                        simd<fp16, VL> iv = block_load<fp16, VL>(
-                            input + (size_t)(m_start + i) * K + k_tail);
+                        simd<fp16, VL> iv = fp8_ws_block_load<fp16, VL>(
+                            input + (size_t)(m_start + i) * K + k_tail,
+                            unaligned);
                         acc[i] += simd<float, VL>(iv) * wf;
                     }
                 }
