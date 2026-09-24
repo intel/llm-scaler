@@ -3,16 +3,30 @@ import pytest
 import torch
 
 
-@pytest.mark.parametrize("batch", [1, 3])
-def test_fp8_gemm_handles_gemma4_tp4_down_projection(batch):
+@pytest.mark.parametrize(
+    ("batch", "width", "output_width"),
+    [
+        (1, 16, 2816),
+        (3, 48, 2816),
+        (8, 63, 2816),
+        (1, 528, 2816),
+        (3, 528, 2816),
+        (2, 528, 8),
+        (3, 48, 8),
+        (2, 128, 8),
+    ],
+)
+def test_fp8_gemm_handles_short_and_gemma4_tp4_k_tails(
+    batch, width, output_width
+):
     torch.manual_seed(716)
     device = "xpu"
-    x = (torch.randn(batch, 528, device=device) * 0.2).half()
-    weight = (torch.randn(2816, 528, device=device) * 0.2).to(
+    x = (torch.randn(batch, width, device=device) * 0.2).half()
+    weight = (torch.randn(output_width, width, device=device) * 0.2).to(
         torch.float8_e4m3fn
     )
     scale = torch.ones(1, dtype=torch.float32, device=device)
-    actual = torch.empty(batch, 2816, dtype=torch.float16, device=device)
+    actual = torch.empty(batch, output_width, dtype=torch.float16, device=device)
 
     torch.ops.custom_esimd_kernels_vllm.esimd_gemm_fp8_pert(
         x, weight, scale, actual
