@@ -4037,7 +4037,13 @@ inline void GEMM_fp8_pert_dispatch(
     sycl::queue& q) {
 
     if (M == 1) {
-        batched_gemv_fp8_pert_host(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        // GEMV reads full VL chunks (VL >= 32). A K tail would read into
+        // the next weight row; Gemma4 TP=4 has K=528 for its down projection.
+        if (K % 32 == 0) {
+            batched_gemv_fp8_pert_host(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        } else {
+            ws_gemm_fp8_pert_host<64, 1>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        }
     } else if (N <= 16 && M >= 2) {
         // Tiny-N M-parallel: one WG per input row, K_SPLIT threads per WG.
         // Grid={M×K_SPLIT}. Weight (N*K bytes) in L3. Avoids N-parallel
@@ -4066,7 +4072,11 @@ inline void GEMM_fp8_pert_dispatch(
         // V7: K-split multi-thread WG for E5M2 or when V9 not applicable
         dpas_v7_auto_dispatch(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
     } else if (M <= 3) {
-        batched_gemv_fp8_pert_host(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        if (K % 32 == 0) {
+            batched_gemv_fp8_pert_host(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        } else {
+            ws_gemm_fp8_pert_host<64, 8>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        }
     } else if (M <= 8) {
         ws_gemm_fp8_pert_host<128, 8>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
     } else {
