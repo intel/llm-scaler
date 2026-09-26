@@ -147,6 +147,9 @@ namespace fp8 {
 }
 namespace int8_ops {
     torch::Tensor mm_int8(torch::Tensor a, torch::Tensor b);
+    std::tuple<torch::Tensor, torch::Tensor> rms_norm_convrot_quantize_int8(
+        torch::Tensor input, torch::Tensor norm_weight, double eps,
+        int64_t group_size);
     torch::Tensor int8_linear(torch::Tensor x, torch::Tensor weight, torch::Tensor weight_scale,
                               std::optional<torch::Tensor> bias, int64_t out_dtype_code,
                               bool convrot, int64_t convrot_groupsize);
@@ -955,6 +958,12 @@ PYBIND11_MODULE(_C, m) {
         "rms_norm_quantize_int8", &omni_xpu::kitchen::rms_norm_quantize_int8,
         "XPU RMSNorm and rowwise INT8 quantization in one launch",
         py::arg("input"), py::arg("weight"), py::arg("eps") = 1e-6);
+    kitchen.def(
+        "rms_norm_convrot_quantize_int8",
+        &omni_xpu::int8_ops::rms_norm_convrot_quantize_int8,
+        "XPU RMSNorm, ConvRot and rowwise INT8 quantization in one launch",
+        py::arg("input"), py::arg("weight"),
+        py::arg("eps") = 1e-6, py::arg("group_size") = 256);
     kitchen.def(
         "scaled_residual", &omni_xpu::kitchen::scaled_residual,
         "XPU residual + scale * projection epilogue",

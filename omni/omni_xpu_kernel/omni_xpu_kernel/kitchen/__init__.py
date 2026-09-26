@@ -58,6 +58,15 @@ def supports_rms_norm_quantize_int8() -> bool:
         return False
 
 
+def supports_rms_norm_convrot_quantize_int8() -> bool:
+    try:
+        return hasattr(
+            _load_extension().kitchen, "rms_norm_convrot_quantize_int8"
+        )
+    except (AttributeError, ImportError):
+        return False
+
+
 def supports_scaled_residual() -> bool:
     try:
         return hasattr(_load_extension().kitchen, "scaled_residual")
@@ -189,6 +198,23 @@ def rms_norm_quantize_int8(
     return _load_extension().kitchen.rms_norm_quantize_int8(*args)
 
 
+@compile_op(
+    "kitchen_rms_norm_convrot_quantize_int8",
+    _meta.kitchen_rms_norm_convrot_quantize,
+)
+def rms_norm_convrot_quantize_int8(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    group_size: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse Kitchen RMSNorm, ConvRot and rowwise INT8 quantization."""
+    args = (input.contiguous(), weight.contiguous(), eps, group_size)
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.kitchen_rms_norm_convrot_quantize_int8(*args)
+    return _load_extension().kitchen.rms_norm_convrot_quantize_int8(*args)
+
+
 @compile_op("kitchen_scaled_residual", _meta.unchanged)
 def scaled_residual(
     input: torch.Tensor,
@@ -211,6 +237,7 @@ __all__ = [
     "fp16_conv3d",
     "rms_norm_for_int8",
     "rms_norm_quantize_int8",
+    "rms_norm_convrot_quantize_int8",
     "scaled_residual",
     "supports_deltanet_conv_step",
     "supports_gated_delta_decode_fused",
@@ -219,5 +246,6 @@ __all__ = [
     "supports_fp16_conv3d",
     "supports_rms_norm_for_int8",
     "supports_rms_norm_quantize_int8",
+    "supports_rms_norm_convrot_quantize_int8",
     "supports_scaled_residual",
 ]

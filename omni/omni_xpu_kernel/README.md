@@ -499,6 +499,8 @@ route and preserve the established PyTorch fallback.
 `kitchen.rms_norm_quantize_int8` returns INT8 rows and FP32 row scales in one
 XPU operation. Check `kitchen.supports_rms_norm_quantize_int8()` before using
 it with `int8.int8_linear_prequantized`.
+For BF16/FP16 ConvRot inputs, `kitchen.rms_norm_convrot_quantize_int8` also
+performs the supported 64- or 256-channel rotation in that operation.
 
 ## Compiled inference
 

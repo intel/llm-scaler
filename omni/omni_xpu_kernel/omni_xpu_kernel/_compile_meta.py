@@ -32,6 +32,10 @@ def kitchen_rms_norm_quantize(input, weight, eps=1e-6):
     )
 
 
+def kitchen_rms_norm_convrot_quantize(input, weight, eps=1e-6, group_size=256):
+    return kitchen_rms_norm_quantize(input, weight, eps)
+
+
 def kitchen_group_norm_pad(input, weight=None, bias=None, groups=32,
                            eps=1e-6, pad=(0, 0, 0, 0, 0), silu=True):
     n, c, t, h, w = input.shape

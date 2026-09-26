@@ -64,6 +64,35 @@ def test_rms_norm_quantize_int8_matches_separate_cuda_contract(rows, features, d
     assert (differences != 0).float().mean().item() < 0.01
 
 
+@pytest.mark.parametrize("rows,features,group_size", [
+    (2, 256, 256), (37, 2048, 64), (37, 2048, 256),
+])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_rms_norm_convrot_quantize_matches_composed_route(
+    rows, features, group_size, dtype
+):
+    from omni_xpu_kernel import int8
+
+    torch.manual_seed(20260927)
+    x = torch.randn(rows, features, device="xpu", dtype=dtype)
+    weight = torch.randn(features, device="xpu", dtype=dtype)
+    assert kitchen.supports_rms_norm_convrot_quantize_int8()
+    actual_q, actual_scale = kitchen.rms_norm_convrot_quantize_int8(
+        x, weight, 1e-6, group_size,
+    )
+    normalized = kitchen.rms_norm_for_int8(x, weight, 1e-6)
+    rotated = int8.rotate_convrot(normalized, group_size)
+    expected_q, expected_scale = int8.quantize_int8_rowwise(rotated)
+    torch.xpu.synchronize()
+
+    assert actual_q.shape == x.shape and actual_q.dtype == torch.int8
+    assert actual_scale.shape == (rows, 1)
+    torch.testing.assert_close(actual_scale, expected_scale, rtol=2e-3, atol=1e-6)
+    differences = (actual_q.to(torch.int16) - expected_q.to(torch.int16)).abs()
+    assert differences.max().item() <= 1
+    assert (differences != 0).float().mean().item() < 0.01
+
+
 @pytest.mark.parametrize("rows,outputs", [
     (1797, 2048), (1797, 6144), (37, 256),
 ])

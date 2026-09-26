@@ -45,6 +45,7 @@ APIS = {
     "kitchen": ("deltanet_conv_step", "gated_delta_decode_fused",
                 "group_norm_silu_pad3d", "fp16_linear", "fp16_conv3d",
                 "rms_norm_for_int8", "rms_norm_quantize_int8",
+                "rms_norm_convrot_quantize_int8",
                 "scaled_residual"),
 }
 API_NAMES = tuple(f"{module}.{name}" for module, names in APIS.items() for name in names)
@@ -132,6 +133,9 @@ def case(api, *, dtype=torch.bfloat16, rows=3):
         if name == "rms_norm_quantize_int8":
             x = _rand((rows, 32), dtype)
             return function, (x, torch.ones(32, device="xpu", dtype=dtype)), {}
+        if name == "rms_norm_convrot_quantize_int8":
+            x = _rand((rows, 256), dtype)
+            return function, (x, torch.ones(256, device="xpu", dtype=dtype)), {}
         if name == "scaled_residual":
             x = _rand((rows, 32), dtype)
             return function, (x, _rand(x.shape, dtype),
@@ -294,7 +298,7 @@ def test_public_tensor_inventory_has_no_unclassified_api():
             if f.name.startswith("supports_") or f.name.endswith("_supported") or f.name == "is_available" or "_cache_" in f.name:continue
             actual.add(module + "." + f.name)
     assert actual == set(API_NAMES)
-    assert len(actual) == 83
+    assert len(actual) == 84
 
 
 @pytest.mark.parametrize("api", API_NAMES)
