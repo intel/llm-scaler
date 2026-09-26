@@ -146,7 +146,7 @@ The focused source build selects:
   pinned to `73c9bad4d21e7addbe1d13bc92eee0f1431b017d`;
 - `omni_xpu_kernel`, built for the selected Torch minor and XPU target;
 - official `comfy-kitchen==0.2.35` plus the matching co-installable XPU runtime provider
-  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/6b5d73a59de843f4529c689ab91f4060c9f4ade8),
+  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/6fd2b43658b24ff046f403efd40fee1c50363fe0),
   including the managed GGUF and Nunchaku W4A16 routes;
 - official `comfy-aimdo==0.5.5` plus the co-installable XPU runtime provider
   from [`shinosawabot/comfy-aimdo` revision](https://github.com/shinosawabot/comfy-aimdo/commit/874b805f032a213284170b6f5a2f11f6373c135d),

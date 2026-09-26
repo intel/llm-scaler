@@ -89,3 +89,33 @@ def test_group_norm_silu_pad3d_rejects_negative_padding():
     with pytest.raises(RuntimeError, match="padding must be non-negative"):
         kitchen.group_norm_silu_pad3d(x, None, None, 1, 0.0,
                                              (0, 0, 0, 0, -1), False)
+
+
+def test_group_norm_zero_pad_strided_input_and_wide_border():
+    x = torch.randn(1, 32, 2, 3, 4, device="xpu", dtype=torch.bfloat16)
+    view = x[:, :, 1:, :, ::2]
+    pad = (3, 3, 3, 3, 1)
+    actual = kitchen.group_norm_silu_pad3d(
+        view, None, None, 1, 0.0, pad, False, True,
+    )
+    expected = functional.pad(view, (3, 3, 3, 3, 1, 0))
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_group_norm_out_frame_view_preserves_other_frames():
+    x = torch.randn(1, 32, 2, 4, 5, device="xpu", dtype=torch.float16)
+    weight = torch.randn(32, device="xpu", dtype=torch.float16)
+    bias = torch.randn(32, device="xpu", dtype=torch.float16)
+    pad = (1, 1, 1, 1, 0)
+    full = torch.full(
+        (1, 32, 4, 6, 7), 7.0, device="xpu", dtype=torch.float16,
+    ).contiguous(memory_format=torch.channels_last_3d)
+    view = full[:, :, 2:]
+    expected = kitchen.group_norm_silu_pad3d(
+        x, weight, bias, 8, 1e-6, pad, True, True,
+    )
+    kitchen.group_norm_silu_pad3d_out(
+        x, weight, bias, 8, 1e-6, pad, True, True, view,
+    )
+    torch.testing.assert_close(view, expected, rtol=0, atol=0)
+    assert bool((full[:, :, :2] == 7).all())

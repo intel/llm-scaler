@@ -32,7 +32,8 @@ namespace kitchen {
     torch::Tensor group_norm_silu_pad3d(
         torch::Tensor input, std::optional<torch::Tensor> weight,
         std::optional<torch::Tensor> bias, int64_t groups, double eps,
-        std::vector<int64_t> pad, bool silu);
+        std::vector<int64_t> pad, bool silu, bool zero_pad,
+        std::optional<torch::Tensor> out);
     torch::Tensor fp16_linear(
         torch::Tensor input, torch::Tensor weight,
         std::optional<torch::Tensor> bias,
@@ -42,7 +43,8 @@ namespace kitchen {
         torch::Tensor input, torch::Tensor weight,
         std::optional<torch::Tensor> bias,
         std::optional<torch::Tensor> residual,
-        std::vector<int64_t> stride);
+        std::vector<int64_t> stride,
+        std::optional<torch::Tensor> out);
     torch::Tensor rms_norm_for_int8(
         torch::Tensor input, torch::Tensor weight, double eps);
     std::tuple<torch::Tensor, torch::Tensor> rms_norm_quantize_int8(
@@ -930,12 +932,20 @@ PYBIND11_MODULE(_C, m) {
     kitchen.def(
         "group_norm_silu_pad3d",
         &omni_xpu::kitchen::group_norm_silu_pad3d,
-        "Per-frame GroupNorm, SiLU and reflect/causal padding on XPU",
+        "Per-frame GroupNorm, SiLU and reflect/zero padding on XPU",
         py::arg("input"), py::arg("weight") = py::none(),
         py::arg("bias") = py::none(), py::arg("groups") = 32,
         py::arg("eps") = 1e-6,
         py::arg("pad") = std::vector<int64_t>{0, 0, 0, 0, 0},
-        py::arg("silu") = true);
+        py::arg("silu") = true, py::arg("zero_pad") = false,
+        py::arg("out") = py::none());
+    kitchen.def(
+        "group_norm_silu_pad3d_out",
+        &omni_xpu::kitchen::group_norm_silu_pad3d,
+        "Write per-frame GroupNorm, SiLU and padding to an XPU output view",
+        py::arg("input"), py::arg("weight"), py::arg("bias"),
+        py::arg("groups"), py::arg("eps"), py::arg("pad"),
+        py::arg("silu"), py::arg("zero_pad"), py::arg("out"));
     kitchen.def(
         "fp16_linear", &omni_xpu::kitchen::fp16_linear,
         "FP16 XPU linear with native bias and scaled-residual epilogue",
@@ -949,7 +959,13 @@ PYBIND11_MODULE(_C, m) {
         py::arg("input"), py::arg("weight"),
         py::arg("bias") = py::none(),
         py::arg("residual") = py::none(),
-        py::arg("stride") = std::vector<int64_t>{1, 1, 1});
+        py::arg("stride") = std::vector<int64_t>{1, 1, 1},
+        py::arg("out") = py::none());
+    kitchen.def(
+        "fp16_conv3d_out", &omni_xpu::kitchen::fp16_conv3d,
+        "Write native FP16 Conv3D into an XPU output view",
+        py::arg("input"), py::arg("weight"), py::arg("bias"),
+        py::arg("residual"), py::arg("stride"), py::arg("out"));
     kitchen.def(
         "rms_norm_for_int8", &omni_xpu::kitchen::rms_norm_for_int8,
         "XPU RMSNorm materialization for Kitchen INT8 projection",

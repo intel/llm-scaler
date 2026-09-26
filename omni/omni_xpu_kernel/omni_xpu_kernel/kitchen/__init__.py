@@ -30,6 +30,13 @@ def supports_group_norm_silu_pad3d() -> bool:
         return False
 
 
+def supports_group_norm_silu_pad3d_out() -> bool:
+    try:
+        return hasattr(_load_extension().kitchen, "group_norm_silu_pad3d_out")
+    except (AttributeError, ImportError):
+        return False
+
+
 def supports_fp16_linear() -> bool:
     try:
         return hasattr(_load_extension().kitchen, "fp16_linear")
@@ -40,6 +47,13 @@ def supports_fp16_linear() -> bool:
 def supports_fp16_conv3d() -> bool:
     try:
         return hasattr(_load_extension().kitchen, "fp16_conv3d")
+    except (AttributeError, ImportError):
+        return False
+
+
+def supports_fp16_conv3d_out() -> bool:
+    try:
+        return hasattr(_load_extension().kitchen, "fp16_conv3d_out")
     except (AttributeError, ImportError):
         return False
 
@@ -127,13 +141,42 @@ def group_norm_silu_pad3d(
     eps: float = 1e-6,
     pad: list[int] | None = None,
     silu: bool = True,
+    zero_pad: bool = False,
 ) -> torch.Tensor:
     """Run per-frame GroupNorm, optional SiLU, and causal 3D padding."""
     args = (input, weight, bias, groups, eps,
-            [0, 0, 0, 0, 0] if pad is None else list(pad), silu)
+            [0, 0, 0, 0, 0] if pad is None else list(pad), silu,
+            zero_pad)
+    if not supports_group_norm_silu_pad3d_out():
+        if zero_pad:
+            raise RuntimeError("Omni XPU zero_pad requires the updated native core")
+        args = args[:-1]
     if torch.compiler.is_compiling():
         return torch.ops.omni_xpu.kitchen_group_norm_silu_pad3d(*args)
     return _load_extension().kitchen.group_norm_silu_pad3d(*args)
+
+
+@compile_op(
+    "kitchen_group_norm_silu_pad3d_out", _meta.kitchen_group_norm_pad_out,
+    mutates_args=("out",),
+)
+def group_norm_silu_pad3d_out(
+    input: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    groups: int,
+    eps: float,
+    pad: list[int],
+    silu: bool,
+    zero_pad: bool,
+    out: torch.Tensor,
+) -> None:
+    """Write native per-frame GroupNorm, SiLU and padding into out."""
+    args = (input, weight, bias, groups, eps, list(pad), silu, zero_pad, out)
+    if torch.compiler.is_compiling():
+        torch.ops.omni_xpu.kitchen_group_norm_silu_pad3d_out(*args)
+    else:
+        _load_extension().kitchen.group_norm_silu_pad3d_out(*args)
 
 
 @compile_op("kitchen_fp16_linear", _meta.kitchen_linear)
@@ -163,13 +206,37 @@ def fp16_conv3d(
     stride: list[int] | None = None,
 ) -> torch.Tensor:
     """Run an XPU Conv3D with optional bias and residual."""
-    args = (input.contiguous(), weight.contiguous(),
+    native_input = input if supports_fp16_conv3d_out() else input.contiguous()
+    args = (native_input, weight.contiguous(),
             None if bias is None else bias.contiguous(),
             None if residual is None else residual.contiguous(),
             [1, 1, 1] if stride is None else list(stride))
     if torch.compiler.is_compiling():
         return torch.ops.omni_xpu.kitchen_fp16_conv3d(*args)
     return _load_extension().kitchen.fp16_conv3d(*args)
+
+
+@compile_op(
+    "kitchen_fp16_conv3d_out", _meta.kitchen_conv3d_out,
+    mutates_args=("out",),
+)
+def fp16_conv3d_out(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    residual: torch.Tensor | None,
+    stride: list[int],
+    out: torch.Tensor,
+) -> None:
+    """Write native FP16 Conv3D into out, including a strided output view."""
+    args = (input, weight.contiguous(),
+            None if bias is None else bias.contiguous(),
+            None if residual is None else residual.contiguous(),
+            list(stride), out)
+    if torch.compiler.is_compiling():
+        torch.ops.omni_xpu.kitchen_fp16_conv3d_out(*args)
+    else:
+        _load_extension().kitchen.fp16_conv3d_out(*args)
 
 
 @compile_op("kitchen_rms_norm_for_int8", _meta.unchanged)
@@ -233,8 +300,10 @@ __all__ = [
     "deltanet_conv_step",
     "gated_delta_decode_fused",
     "group_norm_silu_pad3d",
+    "group_norm_silu_pad3d_out",
     "fp16_linear",
     "fp16_conv3d",
+    "fp16_conv3d_out",
     "rms_norm_for_int8",
     "rms_norm_quantize_int8",
     "rms_norm_convrot_quantize_int8",
@@ -242,8 +311,10 @@ __all__ = [
     "supports_deltanet_conv_step",
     "supports_gated_delta_decode_fused",
     "supports_group_norm_silu_pad3d",
+    "supports_group_norm_silu_pad3d_out",
     "supports_fp16_linear",
     "supports_fp16_conv3d",
+    "supports_fp16_conv3d_out",
     "supports_rms_norm_for_int8",
     "supports_rms_norm_quantize_int8",
     "supports_rms_norm_convrot_quantize_int8",

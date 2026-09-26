@@ -43,7 +43,8 @@ APIS = {
     "linear": ("onednn_w8a16_fp8", "try_onednn_w8a16_fp8"),
     "layout": ("cat_pad_bmg",),
     "kitchen": ("deltanet_conv_step", "gated_delta_decode_fused",
-                "group_norm_silu_pad3d", "fp16_linear", "fp16_conv3d",
+                "group_norm_silu_pad3d", "group_norm_silu_pad3d_out",
+                "fp16_linear", "fp16_conv3d", "fp16_conv3d_out",
                 "rms_norm_for_int8", "rms_norm_quantize_int8",
                 "rms_norm_convrot_quantize_int8",
                 "scaled_residual"),
@@ -116,16 +117,23 @@ def case(api, *, dtype=torch.bfloat16, rows=3):
             snapshots = torch.empty((1, 1, 2, 8, 8), device="xpu", dtype=torch.float32)
             return function, (mixed, x, weight, weight, bias, decay, state,
                               8, 1, 8**-0.5, z, norm_weight, 1e-6, snapshots), {}
-        if name == "group_norm_silu_pad3d":
+        if name in ("group_norm_silu_pad3d", "group_norm_silu_pad3d_out"):
             x = _rand((1, 4, 2, 5, 6), dtype)
+            if name.endswith("_out"):
+                out = torch.empty((1, 4, 3, 7, 8), device="xpu", dtype=dtype)
+                return function, (x, None, None, 2, 1e-6,
+                                  [1, 1, 1, 1, 1], True, True, out), {}
             return function, (x, None, None, 2, 1e-6, [1, 1, 1, 1, 1], True), {}
         if name == "fp16_linear":
             x = _rand((rows, 16), torch.float16)
             weight = _rand((8, 16), torch.float16)
             return function, (x, weight), {}
-        if name == "fp16_conv3d":
+        if name in ("fp16_conv3d", "fp16_conv3d_out"):
             x = _rand((1, 4, 3, 5, 5), torch.float16)
             weight = _rand((6, 4, 2, 3, 3), torch.float16)
+            if name.endswith("_out"):
+                out = torch.empty((1, 6, 2, 3, 3), device="xpu", dtype=torch.float16)
+                return function, (x, weight, None, None, [1, 1, 1], out), {}
             return function, (x, weight), {}
         if name == "rms_norm_for_int8":
             x = _rand((rows, 32), dtype)
@@ -298,7 +306,7 @@ def test_public_tensor_inventory_has_no_unclassified_api():
             if f.name.startswith("supports_") or f.name.endswith("_supported") or f.name == "is_available" or "_cache_" in f.name:continue
             actual.add(module + "." + f.name)
     assert actual == set(API_NAMES)
-    assert len(actual) == 84
+    assert len(actual) == 86
 
 
 @pytest.mark.parametrize("api", API_NAMES)

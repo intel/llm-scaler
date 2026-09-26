@@ -502,6 +502,15 @@ it with `int8.int8_linear_prequantized`.
 For BF16/FP16 ConvRot inputs, `kitchen.rms_norm_convrot_quantize_int8` also
 performs the supported 64- or 256-channel rotation in that operation.
 
+### Comfy Kitchen 3D output views
+
+`kitchen.group_norm_silu_pad3d` accepts strided input and optional zero spatial
+padding. `kitchen.group_norm_silu_pad3d_out` writes into an existing output or
+frame-offset view. `kitchen.fp16_conv3d` accepts strided NDHWC input;
+`kitchen.fp16_conv3d_out` writes into a matching output view. Query the
+corresponding `supports_*_out()` capability when the native extension may be
+older than these interfaces.
+
 ## Compiled inference
 
 The public tensor interfaces in `norm`, `int8`, `fp8`, `gguf`, `svdq`,

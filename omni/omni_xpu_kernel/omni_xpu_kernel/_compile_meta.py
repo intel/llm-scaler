@@ -37,10 +37,16 @@ def kitchen_rms_norm_convrot_quantize(input, weight, eps=1e-6, group_size=256):
 
 
 def kitchen_group_norm_pad(input, weight=None, bias=None, groups=32,
-                           eps=1e-6, pad=(0, 0, 0, 0, 0), silu=True):
+                           eps=1e-6, pad=(0, 0, 0, 0, 0), silu=True,
+                           zero_pad=False):
     n, c, t, h, w = input.shape
     return input.new_empty((n, t + pad[4], h + pad[2] + pad[3],
                             w + pad[0] + pad[1], c)).permute(0, 4, 1, 2, 3)
+
+
+def kitchen_group_norm_pad_out(input, weight, bias, groups, eps, pad, silu,
+                               zero_pad, out):
+    return None
 
 
 def kitchen_linear(input, weight, bias=None, residual=None,
@@ -56,6 +62,10 @@ def kitchen_conv3d(input, weight, bias=None, residual=None,
     out_w = (w - weight.shape[4]) // stride[2] + 1
     return input.new_empty((n, out_t, out_h, out_w, weight.shape[0])).permute(
         0, 4, 1, 2, 3)
+
+
+def kitchen_conv3d_out(input, weight, bias, residual, stride, out):
+    return None
 
 
 def norm_projection(input, norm_weight, proj_weight, eps=1e-6):
