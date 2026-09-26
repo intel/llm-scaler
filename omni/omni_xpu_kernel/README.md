@@ -502,6 +502,14 @@ it with `int8.int8_linear_prequantized`.
 For BF16/FP16 ConvRot inputs, `kitchen.rms_norm_convrot_quantize_int8` also
 performs the supported 64- or 256-channel rotation in that operation.
 
+### Comfy Kitchen AWQ W4A16
+
+`kitchen.gemv_awq_w4a16` consumes Kitchen's row-major packed unsigned INT4
+weight and `[K/group_size, N]` scale/zero tensors. It uses a parallel XPU GEMV
+for up to eight activation rows and native dequantization plus oneDNN GEMM for
+larger batches. The output dtype follows the scale dtype. Check
+`kitchen.supports_gemv_awq_w4a16()` when using an optional companion wheel.
+
 ### Comfy Kitchen 3D output views
 
 `kitchen.group_norm_silu_pad3d` accepts strided input and optional zero spatial

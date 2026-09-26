@@ -19,6 +19,10 @@
 
 namespace omni_xpu {
 namespace kitchen {
+    torch::Tensor gemv_awq_w4a16(
+        torch::Tensor input, torch::Tensor packed, torch::Tensor scales,
+        torch::Tensor zeros, std::optional<torch::Tensor> bias,
+        int64_t group_size);
     torch::Tensor deltanet_conv_step(
         torch::Tensor proj, torch::Tensor conv_state, torch::Tensor conv_w,
         std::optional<torch::Tensor> conv_b,
@@ -929,6 +933,12 @@ PYBIND11_MODULE(_C, m) {
         py::arg("state"), py::arg("key_dim"), py::arg("key_heads"),
         py::arg("scale"), py::arg("z"), py::arg("norm_weight"),
         py::arg("eps"), py::arg("snapshots") = py::none());
+    kitchen.def(
+        "gemv_awq_w4a16", &omni_xpu::kitchen::gemv_awq_w4a16,
+        "Native XPU AWQ W4A16 GEMV and dequantized GEMM",
+        py::arg("input"), py::arg("packed"), py::arg("scales"),
+        py::arg("zeros"), py::arg("bias") = py::none(),
+        py::arg("group_size") = 64);
     kitchen.def(
         "group_norm_silu_pad3d",
         &omni_xpu::kitchen::group_norm_silu_pad3d,

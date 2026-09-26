@@ -44,6 +44,11 @@ def kitchen_group_norm_pad(input, weight=None, bias=None, groups=32,
                             w + pad[0] + pad[1], c)).permute(0, 4, 1, 2, 3)
 
 
+def kitchen_awq(input, packed, scales, zeros, bias=None, group_size=64):
+    return input.new_empty((*input.shape[:-1], packed.shape[0]),
+                           dtype=scales.dtype)
+
+
 def kitchen_group_norm_pad_out(input, weight, bias, groups, eps, pad, silu,
                                zero_pad, out):
     return None

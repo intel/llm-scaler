@@ -43,6 +43,7 @@ APIS = {
     "linear": ("onednn_w8a16_fp8", "try_onednn_w8a16_fp8"),
     "layout": ("cat_pad_bmg",),
     "kitchen": ("deltanet_conv_step", "gated_delta_decode_fused",
+                "gemv_awq_w4a16",
                 "group_norm_silu_pad3d", "group_norm_silu_pad3d_out",
                 "fp16_linear", "fp16_conv3d", "fp16_conv3d_out",
                 "rms_norm_for_int8", "rms_norm_quantize_int8",
@@ -99,6 +100,14 @@ def case(api, *, dtype=torch.bfloat16, rows=3):
         weight = _rand((1024, 2048), torch.float32).to(torch.float8_e4m3fn)
         return function, (x, weight, torch.full((1024,), 0.125, device="xpu")), {}
     if module == "kitchen":
+        if name == "gemv_awq_w4a16":
+            x = _rand((1, 128), torch.bfloat16)
+            packed = torch.randint(
+                0, 256, (32, 64), device="xpu", dtype=torch.uint8,
+            ).view(torch.int8)
+            scales = _rand((2, 32), torch.bfloat16).abs() * 0.01
+            zeros = _rand((2, 32), torch.bfloat16) * 0.01
+            return function, (x, packed, scales, zeros, None, 64), {}
         if name == "deltanet_conv_step":
             proj = _rand((1, 2, 16), dtype).contiguous()
             state = _rand((1, 16, 3), dtype).contiguous()
@@ -306,7 +315,7 @@ def test_public_tensor_inventory_has_no_unclassified_api():
             if f.name.startswith("supports_") or f.name.endswith("_supported") or f.name == "is_available" or "_cache_" in f.name:continue
             actual.add(module + "." + f.name)
     assert actual == set(API_NAMES)
-    assert len(actual) == 86
+    assert len(actual) == 87
 
 
 @pytest.mark.parametrize("api", API_NAMES)

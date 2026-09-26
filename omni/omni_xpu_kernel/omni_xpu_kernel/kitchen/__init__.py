@@ -30,6 +30,13 @@ def supports_group_norm_silu_pad3d() -> bool:
         return False
 
 
+def supports_gemv_awq_w4a16() -> bool:
+    try:
+        return hasattr(_load_extension().kitchen, "gemv_awq_w4a16")
+    except (AttributeError, ImportError):
+        return False
+
+
 def supports_group_norm_silu_pad3d_out() -> bool:
     try:
         return hasattr(_load_extension().kitchen, "group_norm_silu_pad3d_out")
@@ -130,6 +137,24 @@ def gated_delta_decode_fused(
     if torch.compiler.is_compiling():
         return torch.ops.omni_xpu.kitchen_gated_delta_decode_fused(*args)
     return _load_extension().kitchen.gated_delta_decode_fused(*args)
+
+
+@compile_op("kitchen_gemv_awq_w4a16", _meta.kitchen_awq)
+def gemv_awq_w4a16(
+    input: torch.Tensor,
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    zeros: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    group_size: int = 64,
+) -> torch.Tensor:
+    """Run native Kitchen AWQ W4A16 GEMV or dequantized GEMM on XPU."""
+    args = (input.contiguous(), packed.contiguous(),
+            scales.contiguous(), zeros.contiguous(),
+            None if bias is None else bias.contiguous(), group_size)
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.kitchen_gemv_awq_w4a16(*args)
+    return _load_extension().kitchen.gemv_awq_w4a16(*args)
 
 
 @compile_op("kitchen_group_norm_silu_pad3d", _meta.kitchen_group_norm_pad)
@@ -303,6 +328,7 @@ __all__ = [
     "group_norm_silu_pad3d_out",
     "fp16_linear",
     "fp16_conv3d",
+    "gemv_awq_w4a16",
     "fp16_conv3d_out",
     "rms_norm_for_int8",
     "rms_norm_quantize_int8",
@@ -314,6 +340,7 @@ __all__ = [
     "supports_group_norm_silu_pad3d_out",
     "supports_fp16_linear",
     "supports_fp16_conv3d",
+    "supports_gemv_awq_w4a16",
     "supports_fp16_conv3d_out",
     "supports_rms_norm_for_int8",
     "supports_rms_norm_quantize_int8",
