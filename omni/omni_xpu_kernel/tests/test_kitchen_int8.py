@@ -38,6 +38,32 @@ def test_rms_norm_for_int8_matches_cuda_ut_boundary(rows, features, dtype):
     )
 
 
+@pytest.mark.parametrize("rows,features", [(2, 128), (37, 2048), (256, 4096)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_rms_norm_quantize_int8_matches_separate_cuda_contract(rows, features, dtype):
+    from omni_xpu_kernel import int8
+
+    torch.manual_seed(20260927)
+    x = torch.randn(rows, features, device="xpu", dtype=dtype)
+    weight = torch.randn(features, device="xpu", dtype=dtype)
+    assert kitchen.supports_rms_norm_quantize_int8()
+    actual_q, actual_scale = kitchen.rms_norm_quantize_int8(x, weight, 1e-6)
+    normalized = kitchen.rms_norm_for_int8(x, weight, 1e-6)
+    expected_q, expected_scale = int8.quantize_int8_rowwise(normalized)
+    torch.xpu.synchronize()
+
+    assert actual_q.shape == x.shape and actual_q.dtype == torch.int8
+    assert actual_scale.shape == (rows, 1) and actual_scale.dtype == torch.float32
+    torch.testing.assert_close(
+        actual_scale, expected_scale,
+        rtol=1e-5 if dtype == torch.float32 else 2e-3,
+        atol=1e-6,
+    )
+    differences = (actual_q.to(torch.int16) - expected_q.to(torch.int16)).abs()
+    assert differences.max().item() <= 1
+    assert (differences != 0).float().mean().item() < 0.01
+
+
 @pytest.mark.parametrize("rows,outputs", [
     (1797, 2048), (1797, 6144), (37, 256),
 ])

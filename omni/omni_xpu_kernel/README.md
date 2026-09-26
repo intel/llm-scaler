@@ -494,6 +494,12 @@ if rotary.kitchen_rope_fast_supported(x, freqs_cis):
 Callers should use the capability query before selecting a specialized native
 route and preserve the established PyTorch fallback.
 
+### Comfy Kitchen INT8 activation
+
+`kitchen.rms_norm_quantize_int8` returns INT8 rows and FP32 row scales in one
+XPU operation. Check `kitchen.supports_rms_norm_quantize_int8()` before using
+it with `int8.int8_linear_prequantized`.
+
 ## Compiled inference
 
 The public tensor interfaces in `norm`, `int8`, `fp8`, `gguf`, `svdq`,

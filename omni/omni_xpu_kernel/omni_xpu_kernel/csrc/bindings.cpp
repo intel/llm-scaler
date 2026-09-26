@@ -45,6 +45,8 @@ namespace kitchen {
         std::vector<int64_t> stride);
     torch::Tensor rms_norm_for_int8(
         torch::Tensor input, torch::Tensor weight, double eps);
+    std::tuple<torch::Tensor, torch::Tensor> rms_norm_quantize_int8(
+        torch::Tensor input, torch::Tensor weight, double eps);
     torch::Tensor scaled_residual(
         torch::Tensor input, torch::Tensor residual,
         torch::Tensor residual_scale);
@@ -157,6 +159,11 @@ namespace int8_ops {
         torch::Tensor weight_scale, std::optional<torch::Tensor> bias,
         int64_t out_dtype_code, torch::Tensor output);
 #if defined(OMNI_XPU_ARCH_BMG)
+    torch::Tensor int8_linear_prequantized_residual(
+        torch::Tensor x_int8, torch::Tensor x_scale, torch::Tensor weight,
+        torch::Tensor weight_scale, std::optional<torch::Tensor> bias,
+        int64_t out_dtype_code, torch::Tensor residual,
+        torch::Tensor residual_scale);
     std::tuple<torch::Tensor, torch::Tensor> int8_linear_pair_prequantized(
         torch::Tensor x_int8, torch::Tensor x_scale,
         torch::Tensor weight1, torch::Tensor weight_scale1,
@@ -788,6 +795,14 @@ PYBIND11_MODULE(_C, m) {
         py::arg("out_dtype_code"), py::arg("output"));
 #if defined(OMNI_XPU_ARCH_BMG)
     int8.def(
+        "int8_linear_prequantized_residual",
+        &omni_xpu::int8_ops::int8_linear_prequantized_residual,
+        "BMG INT8 linear with scale and residual in the GEMM epilogue.",
+        py::arg("x_int8"), py::arg("x_scale"), py::arg("weight"),
+        py::arg("weight_scale"), py::arg("bias"),
+        py::arg("out_dtype_code"), py::arg("residual"),
+        py::arg("residual_scale"));
+    int8.def(
         "int8_linear_pair_prequantized",
         &omni_xpu::int8_ops::int8_linear_pair_prequantized,
         "BMG paired INT8 linears sharing one prequantized activation and "
@@ -935,6 +950,10 @@ PYBIND11_MODULE(_C, m) {
     kitchen.def(
         "rms_norm_for_int8", &omni_xpu::kitchen::rms_norm_for_int8,
         "XPU RMSNorm materialization for Kitchen INT8 projection",
+        py::arg("input"), py::arg("weight"), py::arg("eps") = 1e-6);
+    kitchen.def(
+        "rms_norm_quantize_int8", &omni_xpu::kitchen::rms_norm_quantize_int8,
+        "XPU RMSNorm and rowwise INT8 quantization in one launch",
         py::arg("input"), py::arg("weight"), py::arg("eps") = 1e-6);
     kitchen.def(
         "scaled_residual", &omni_xpu::kitchen::scaled_residual,

@@ -25,6 +25,13 @@ def kitchen_gated_delta(mixed_qkv, x, w_a, w_b, dt_bias, g_decay, state,
     return x.new_empty((x.shape[0], x.shape[1], state.shape[1], state.shape[3]))
 
 
+def kitchen_rms_norm_quantize(input, weight, eps=1e-6):
+    return (
+        input.new_empty(input.shape, dtype=torch.int8),
+        input.new_empty((*input.shape[:-1], 1), dtype=torch.float32),
+    )
+
+
 def kitchen_group_norm_pad(input, weight=None, bias=None, groups=32,
                            eps=1e-6, pad=(0, 0, 0, 0, 0), silu=True):
     n, c, t, h, w = input.shape
