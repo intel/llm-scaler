@@ -46,7 +46,7 @@ def prefix_cached_attention(prefix_k, prefix_v, transformer_options={}):
 
 
 def _copy_prefix_inputs(q, k, v, prefix_k, prefix_v, heads, options):
-    """Admit only source-bound B70 target cache hits; otherwise use original."""
+    """Admit source-bound cache hits on known BMG devices; otherwise use original."""
     if (os.environ.get(_COPY_ENV, "1") not in ("", "1") or not isinstance(options, dict)
             or os.environ.get("OMNI_ATTN_BACKEND", "auto").lower() not in ("auto", "cute")
             or options.get("optimized_attention_override")
@@ -78,7 +78,9 @@ def _copy_prefix_inputs(q, k, v, prefix_k, prefix_v, heads, options):
                 or (prefix_len + current_len) * 4096 > _MAX_ELEMENTS):
             return False
         index = q.device.index if q.device.index is not None else torch.xpu.current_device()
-        return getattr(torch.xpu.get_device_properties(index), "device_id", None) == 0xE223
+        device_id = getattr(torch.xpu.get_device_properties(index), "device_id", None)
+        return (device_id is not None and
+                omni_xpu_kernel.device.classify_bmg_device_id(int(device_id)) != "unknown")
     except (AttributeError, ImportError, TypeError, ValueError):
         return False
 

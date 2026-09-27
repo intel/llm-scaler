@@ -155,6 +155,32 @@ def test_cache_copy_default_uses_real_prefix_wrapper_and_exact_join(runtime, mon
         assert observed[0][1].stride()[1:] == joined_v.stride()[1:]
 
 
+@pytest.mark.parametrize(
+    "device_id, admitted",
+    [
+        (0xE20B, True),   # B580
+        (0xE210, True),   # B60 platform ID
+        (0xE211, True),   # B60 product ID
+        (0xE212, True),   # B50
+        (0xE223, True),   # B70
+        (0xFFFF, False),  # unknown device
+    ],
+)
+def test_cache_copy_uses_known_bmg_identity(runtime, monkeypatch, device_id, admitted):
+    monkeypatch.delenv(runtime.adapter._COPY_ENV, raising=False)
+    monkeypatch.setattr(
+        torch.xpu, "get_device_properties",
+        lambda index: types.SimpleNamespace(device_id=device_id),
+    )
+    tensors = tuple(
+        torch.empty((1, length, 32, 128), device=runtime.device,
+                    dtype=torch.bfloat16)
+        for length in (2048, 2048, 2048, 31, 31)
+    )
+    with torch.inference_mode():
+        assert runtime.adapter._copy_prefix_inputs(*tensors, 32, {}) is admitted
+
+
 def test_cache_copy_unsupported_inputs_use_exact_original_closure(runtime, monkeypatch):
     monkeypatch.setenv(runtime.adapter._COPY_ENV, "1")
     activate(runtime)
