@@ -60,10 +60,10 @@ pinned provider source wheels. The provider manifests declare which official
 versions each source wheel accepts, and image validation checks both identities.
 For the ComfyUI 0.37.0 candidate, official Kitchen 0.2.35 uses the matching
 0.2.35 provider source at `xiangyuT/comfy-kitchen-xpu`
-(`20a69c1ef0cbbb73675e3115aa78c0ea70a9a2b1`). Official AIMDO 0.5.5 still
-uses the 0.5.3 provider source at `xiangyuT/comfy-aimdo-xpu`
-(`eaaa476d9b6e1df6b23d62e2b76f3dbda8cbc80c`). The Kitchen provider manifest
-accepts official 0.2.35; AIMDO's manifest retains 0.5.3/0.5.5 compatibility.
+(`20a69c1ef0cbbb73675e3115aa78c0ea70a9a2b1`). Official AIMDO 0.5.5 uses
+the matching 0.5.5 provider source at `xiangyuT/comfy-aimdo-xpu`
+(`cc3729fc59eeab77bd4c8b28b80e49c9faa855d4`). Both provider manifests
+accept their matching official 0.2.35 and 0.5.5 versions.
 GGUF repository and commit must be updated together.
 The same rule applies to the combined Nunchaku repository, commit, and
 distribution version. Sparse attention uses ComfyUI's built-in node and the
@@ -75,6 +75,11 @@ source is copied from `omni/omni_xpu_kernel` in the current llm-scaler checkout.
 `61f388bf536942501acc163b52803d18232ccf70` are historical build inputs.
 Current builds use the merged Kitchen commit above and combined Nunchaku commit
 `9f5604445f56154dd44e8b4acfed1aef868003c5`.
+
+2026-09-27 AIMDO pin update: the former default 0.5.3 provider source pin
+`eaaa476d9b6e1df6b23d62e2b76f3dbda8cbc80c` is historical configuration,
+without a clean-image acceptance claim. Current builds use the merged 0.5.5
+provider commit above.
 
 Each provider revision must be reachable from its pinned remote. The build
 fetches and checks out those exact full commits before constructing the private

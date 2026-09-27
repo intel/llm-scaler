@@ -98,7 +98,7 @@ launchers enabling DynamicVRAM must also prepare the native preload before
 startup. Allocator modes do not change the model graph or enable XPU memory
 compilation.
 
-AIMDO 0.5.3 memory compilation (recording and replaying allocation graphs) is
+AIMDO memory compilation (recording and replaying allocation graphs) is
 not yet supported on XPU. Its basic APIs and DynamicVRAM model-weight
 offloading remain available. This limitation does not disable OmniXPU's
 `torch.compile` support.

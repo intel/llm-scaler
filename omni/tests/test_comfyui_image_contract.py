@@ -108,12 +108,12 @@ COMPONENT_PINS = {
     ),
     "COMFY_AIMDO_COMMIT": (
         "AIMDO_COMMIT",
-        "eaaa476d9b6e1df6b23d62e2b76f3dbda8cbc80c",
+        "cc3729fc59eeab77bd4c8b28b80e49c9faa855d4",
     ),
     "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.5.5"),
     "COMFY_AIMDO_PROVIDER_VERSION": (
         "AIMDO_PROVIDER_VERSION",
-        "0.5.3",
+        "0.5.5",
     ),
     "COMFY_GGUF_REPOSITORY": (
         "GGUF_REPOSITORY",
@@ -697,7 +697,7 @@ class ComfyUIImageContractTest(unittest.TestCase):
         )
         self.assertEqual(COMPONENT_PINS["COMFY_AIMDO_VERSION"][1], "0.5.5")
         self.assertEqual(
-            COMPONENT_PINS["COMFY_AIMDO_PROVIDER_VERSION"][1], "0.5.3"
+            COMPONENT_PINS["COMFY_AIMDO_PROVIDER_VERSION"][1], "0.5.5"
         )
         for label, expected in (
             (
@@ -722,8 +722,7 @@ class ComfyUIImageContractTest(unittest.TestCase):
 
         pairs = (
             ("comfy_kitchen.xpu", "0.2.35", "0.2.35", "https://github.com/xiangyuT/comfy-kitchen-xpu.git"),
-            ("comfy_aimdo.xpu", "0.5.3", "0.5.3", "https://github.com/xiangyuT/comfy-aimdo-xpu.git"),
-            ("comfy_aimdo.xpu", "0.5.3", "0.5.5", "https://github.com/xiangyuT/comfy-aimdo-xpu.git"),
+            ("comfy_aimdo.xpu", "0.5.5", "0.5.5", "https://github.com/xiangyuT/comfy-aimdo-xpu.git"),
         )
         for provider_id, source_version, official_version, source_repository in pairs:
             with self.subTest(
