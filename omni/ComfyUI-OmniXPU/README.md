@@ -138,6 +138,7 @@ OMNIXPU_NONCONTIG_RMSNORM=0
 OMNIXPU_H120_RMSNORM=0
 OMNIXPU_KREA2_RMSNORM=0
 OMNIXPU_SEEDVR_GROUPNORM=0
+OMNIXPU_EXPERIMENTAL_QWEN21_CACHE_COPY=0  # Disable only the Qwen cache-hit copy route
 ```
 
 On Windows, CUTE is never selected implicitly. A wheel built explicitly with
@@ -189,6 +190,12 @@ storage; `--async-offload 2` enables ComfyUI's existing prefetch streams.
 Select `cpu` in **Qwen Image 2.1 Cache**, or let `auto` choose host storage.
 Quantization scales keep their upstream storage behavior. A pinned allocation
 OOM falls back to pageable storage; other runtime errors remain visible.
+
+On a compatible B70 XPU cache hit, the guarded prefix K/V copy route is enabled
+by default. It falls back to ComfyUI's original concatenation path for unsupported
+shapes, layouts, patches, devices, or compilation. Set
+`OMNIXPU_EXPERIMENTAL_QWEN21_CACHE_COPY=0` before startup to disable only this
+copy route while retaining the cache compatibility and pinned-memory fixes.
 
 A ModelPatcher diffusion wrapper clears and bypasses prefix caching while
 `post_input`, `attn1_patch`, `single_block`, or block replacements are active.
