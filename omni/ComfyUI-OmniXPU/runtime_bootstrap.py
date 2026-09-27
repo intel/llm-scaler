@@ -32,10 +32,7 @@ _PROVIDER_CONTRACTS = {
         "provider_package": "comfy_kitchen_xpu_runtime",
         "canonical_distribution": "comfy-kitchen",
         "canonical_import": "comfy_kitchen",
-        "source_repositories": (
-            "https://github.com/xiangyuT/comfy-kitchen-xpu.git",
-            "https://github.com/shinosawabot/comfy-kitchen.git",
-        ),
+        "source_repository": "https://github.com/xiangyuT/comfy-kitchen-xpu.git",
         "activation_strategy": "canonical_meta_path",
         "requires_dynamic_vram": False,
     },
@@ -44,10 +41,7 @@ _PROVIDER_CONTRACTS = {
         "provider_package": "comfy_aimdo_xpu_runtime",
         "canonical_distribution": "comfy-aimdo",
         "canonical_import": "comfy_aimdo",
-        "source_repositories": (
-            "https://github.com/xiangyuT/comfy-aimdo-xpu.git",
-            "https://github.com/shinosawabot/comfy-aimdo.git",
-        ),
+        "source_repository": "https://github.com/xiangyuT/comfy-aimdo-xpu.git",
         "activation_strategy": "canonical_control_overlay",
         "requires_dynamic_vram": True,
     },
@@ -250,7 +244,7 @@ def _validate_manifest(entry_point, manifest: object) -> RuntimeProvider:
     canonical_import = str(manifest.get("canonical_import", ""))
     if canonical_import != contract["canonical_import"]:
         raise RuntimeError("canonical import is not the registered contract")
-    if source.get("repository") not in contract["source_repositories"]:
+    if source.get("repository") != contract["source_repository"]:
         raise RuntimeError("provider source repository is not the registered contract")
     if _normalize_distribution(str(source.get("distribution", ""))) != (
         _normalize_distribution(canonical_name)

@@ -61,8 +61,8 @@ versions each source wheel accepts, and image validation checks both identities.
 For the ComfyUI 0.37.0 candidate, official Kitchen 0.2.35 uses the matching
 0.2.35 provider source at `xiangyuT/comfy-kitchen-xpu`
 (`20a69c1ef0cbbb73675e3115aa78c0ea70a9a2b1`). Official AIMDO 0.5.5 still
-uses the 0.5.3 provider source at `shinosawabot/comfy-aimdo`
-(`874b805f032a213284170b6f5a2f11f6373c135d`). The Kitchen provider manifest
+uses the 0.5.3 provider source at `xiangyuT/comfy-aimdo-xpu`
+(`eaaa476d9b6e1df6b23d62e2b76f3dbda8cbc80c`). The Kitchen provider manifest
 accepts official 0.2.35; AIMDO's manifest retains 0.5.3/0.5.5 compatibility.
 GGUF repository and commit must be updated together.
 The same rule applies to the combined Nunchaku repository, commit, and

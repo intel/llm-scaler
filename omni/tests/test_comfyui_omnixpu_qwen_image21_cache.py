@@ -24,6 +24,34 @@ def load_adapter():
     return module
 
 
+def test_prefix_source_contract_accepts_formatting_but_rejects_math_change():
+    adapter = load_adapter()
+
+    def compatible_prefix(prefix_k, prefix_v, transformer_options={}):
+        # This comment intentionally differs from ComfyUI's pinned source.
+        def attn(q, k, v, heads):
+            return optimized_attention(
+                q.flatten(2),
+                torch.cat([prefix_k, k], dim=1).flatten(2),
+                torch.cat([prefix_v, v], dim=1).flatten(2),
+                heads, transformer_options=transformer_options,
+            )
+        return attn
+
+    def changed_prefix(prefix_k, prefix_v, transformer_options={}):
+        def attn(q, k, v, heads):
+            return optimized_attention(
+                q.flatten(2),
+                torch.cat([prefix_k, k], dim=2).flatten(2),
+                torch.cat([prefix_v, v], dim=1).flatten(2),
+                heads, transformer_options=transformer_options,
+            )
+        return attn
+
+    assert adapter._prefix_source_matches(compatible_prefix)
+    assert not adapter._prefix_source_matches(changed_prefix)
+
+
 @pytest.fixture(scope="module")
 def comfy_runtime():
     if not torch.xpu.is_available():

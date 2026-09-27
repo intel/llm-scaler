@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import ast
 import functools
-import hashlib
 import inspect
 import logging
 import os
@@ -20,7 +20,29 @@ _COPY_ENV = "OMNIXPU_EXPERIMENTAL_QWEN21_CACHE_COPY"
 _COPY_MARKER = "__omnixpu_qwen21_cache_copy_original__"
 _COPY_MIN_QUERY = 2048  # The existing BMG D128 prefix CUTE admission floor.
 _MAX_ELEMENTS = (1 << 31) - 1
-_PREFIX_SOURCE_SHA256 = "7e98fa30a8530e50d4030a207cdb4c5cfb3f7b98674ff2728b8b697d324234a5"
+
+
+def _prefix_source_matches(function):
+    """Accept the original attention math regardless of comments or formatting."""
+    expected = ast.parse("""\
+def prefix_cached_attention(prefix_k, prefix_v, transformer_options={}):
+    def attn(q, k, v, heads):
+        return optimized_attention(
+            q.flatten(2),
+            torch.cat([prefix_k, k], dim=1).flatten(2),
+            torch.cat([prefix_v, v], dim=1).flatten(2),
+            heads, transformer_options=transformer_options,
+        )
+    return attn
+""")
+    actual = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    if len(actual.body) != 1 or not isinstance(actual.body[0], ast.FunctionDef):
+        return False
+    # The exported binding name is checked by the caller; the local name is
+    # irrelevant to the attention math.
+    actual.body[0].name = "prefix_cached_attention"
+    return ast.dump(actual, include_attributes=False) == ast.dump(
+        expected, include_attributes=False)
 
 
 def _copy_prefix_inputs(q, k, v, prefix_k, prefix_v, heads, options):
@@ -73,10 +95,7 @@ def _copy_prefix_factory(qwen):
     if tuple(inspect.signature(original).parameters) != (
             "prefix_k", "prefix_v", "transformer_options"):
         return None, "unsupported prefix_cached_attention signature"
-    source = inspect.getsource(original)
-    if (hashlib.sha256(source.encode("utf-8")).hexdigest() != _PREFIX_SOURCE_SHA256
-            or source.count("torch.cat([prefix_k, k], dim=1).flatten(2)") != 1
-            or source.count("torch.cat([prefix_v, v], dim=1).flatten(2)") != 1):
+    if not _prefix_source_matches(original):
         return None, "unsupported prefix_cached_attention source contract"
 
     @functools.wraps(original)

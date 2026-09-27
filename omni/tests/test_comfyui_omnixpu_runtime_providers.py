@@ -539,9 +539,8 @@ def test_required_mode_refuses_disabled_dynamic_vram(runtime, monkeypatch, tmp_p
     ("source_owner", "compatible", "tampered", "expected_error"),
     (
         ("xiangyuT", True, False, None),
-        ("shinosawabot", True, False, None),
-        ("shinosawabot", True, True, "hash mismatch"),
-        ("shinosawabot", False, False, "is incompatible"),
+        ("xiangyuT", True, True, "hash mismatch"),
+        ("xiangyuT", False, False, "is incompatible"),
         ("unregistered", True, False, "source repository"),
     ),
 )

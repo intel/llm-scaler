@@ -104,11 +104,11 @@ COMPONENT_PINS = {
     ),
     "COMFY_AIMDO_REPOSITORY": (
         "AIMDO_REPOSITORY",
-        "https://github.com/shinosawabot/comfy-aimdo.git",
+        "https://github.com/xiangyuT/comfy-aimdo-xpu.git",
     ),
     "COMFY_AIMDO_COMMIT": (
         "AIMDO_COMMIT",
-        "874b805f032a213284170b6f5a2f11f6373c135d",
+        "eaaa476d9b6e1df6b23d62e2b76f3dbda8cbc80c",
     ),
     "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.5.5"),
     "COMFY_AIMDO_PROVIDER_VERSION": (
@@ -722,9 +722,8 @@ class ComfyUIImageContractTest(unittest.TestCase):
 
         pairs = (
             ("comfy_kitchen.xpu", "0.2.35", "0.2.35", "https://github.com/xiangyuT/comfy-kitchen-xpu.git"),
-            ("comfy_kitchen.xpu", "0.2.33", "0.2.35", "https://github.com/shinosawabot/comfy-kitchen.git"),
-            ("comfy_aimdo.xpu", "0.5.3", "0.5.3", "https://github.com/shinosawabot/comfy-aimdo.git"),
-            ("comfy_aimdo.xpu", "0.5.3", "0.5.5", "https://github.com/shinosawabot/comfy-aimdo.git"),
+            ("comfy_aimdo.xpu", "0.5.3", "0.5.3", "https://github.com/xiangyuT/comfy-aimdo-xpu.git"),
+            ("comfy_aimdo.xpu", "0.5.3", "0.5.5", "https://github.com/xiangyuT/comfy-aimdo-xpu.git"),
         )
         for provider_id, source_version, official_version, source_repository in pairs:
             with self.subTest(
