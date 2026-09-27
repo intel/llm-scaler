@@ -146,7 +146,7 @@ The focused source build selects:
   pinned to `73c9bad4d21e7addbe1d13bc92eee0f1431b017d`;
 - `omni_xpu_kernel`, built for the selected Torch minor and XPU target;
 - official `comfy-kitchen==0.2.35` plus the matching co-installable XPU runtime provider
-  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/27185587a93ca9591640cbd31ed4b4d5a1d56eec),
+  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/20a69c1ef0cbbb73675e3115aa78c0ea70a9a2b1),
   including the managed GGUF and Nunchaku W4A16 routes;
 - official `comfy-aimdo==0.5.5` plus the co-installable XPU runtime provider
   from [`shinosawabot/comfy-aimdo` revision](https://github.com/shinosawabot/comfy-aimdo/commit/874b805f032a213284170b6f5a2f11f6373c135d),
@@ -154,7 +154,7 @@ The focused source build selects:
 - [`ComfyUI-GGUF-XPU`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),
   with GGUF, SentencePiece, and Protobuf dependencies installed from the same
   pinned checkout's requirements;
-- [`ComfyUI-nunchaku-XPU==1.2.1+xpu.3`](https://github.com/xiangyuT/ComfyUI-nunchaku-XPU/commit/61f388bf536942501acc163b52803d18232ccf70),
+- [`ComfyUI-nunchaku-XPU==1.2.1+xpu.3`](https://github.com/xiangyuT/ComfyUI-nunchaku-XPU/commit/9f5604445f56154dd44e8b4acfed1aef868003c5),
   with its `nunchaku_torch` runtime bundled in the same pinned checkout;
 - ComfyUI native **Model Sparse Attention** (SOL, SLA and VSA), backed by
   Kitchen and the packaged `omni_xpu_kernel` XPU operators; see
