@@ -194,9 +194,9 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     int batch_offset = params.num_pages_per_seq ? params.num_pages_per_seq[l_coord] : l_coord * (seq_len_kv_cache / params.page_size);
 
     return params.ptr_page_table[
-          batch_offset +                  
-          next_page_logical_idx] * tiles_per_page +            
-          K % tiles_per_page; 
+          batch_offset +
+          next_page_logical_idx] * tiles_per_page +
+          K % tiles_per_page;
   }
 
   template <typename QVCoord>

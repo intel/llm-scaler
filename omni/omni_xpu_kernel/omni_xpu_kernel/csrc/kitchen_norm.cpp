@@ -80,7 +80,9 @@ torch::Tensor launch_group_norm_silu_pad3d(
                     const int64_t group = index % groups;
                     const int64_t frame = (index / groups) % frames;
                     const int64_t b = index / (groups * frames);
-                    float sum = 0.0f, square_sum = 0.0f;
+                    // Welford avoids cancellation for nearly constant FP32 groups.
+                    float mean = 0.0f, squared_deviations = 0.0f;
+                    int64_t samples = 0;
                     for (int64_t channel = 0; channel < channels_per_group;
                          ++channel) {
                         const int64_t c = group * channels_per_group + channel;
@@ -90,15 +92,16 @@ torch::Tensor launch_group_norm_silu_pad3d(
                             for (int64_t w = 0; w < width; ++w) {
                                 const float value = static_cast<float>(
                                     input_ptr[base + h * stride_h + w * stride_w]);
-                                sum += value;
-                                square_sum += value * value;
+                                ++samples;
+                                const float delta = value - mean;
+                                mean += delta / static_cast<float>(samples);
+                                squared_deviations += delta * (value - mean);
                             }
                         }
                     }
-                    const float mean = sum / static_cast<float>(group_elements);
                     const float variance = sycl::fmax(
-                        square_sum / static_cast<float>(group_elements) -
-                        mean * mean, 0.0f);
+                        squared_deviations / static_cast<float>(group_elements),
+                        0.0f);
                     moment_ptr[2 * index] = mean;
                     moment_ptr[2 * index + 1] =
                         1.0f / sycl::sqrt(variance + eps_f32);

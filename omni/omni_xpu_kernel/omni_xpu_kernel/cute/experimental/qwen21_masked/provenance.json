@@ -56,7 +56,7 @@
       },
       {
         "path": "flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp",
-        "sha256": "5393e4fdb96619b4faffaa1d267139049314af34ab341b070c2ed340dac3603e"
+        "sha256": "d9bced3ebace716ae588ba73258e26d8e58423f75217c517b1f39ca0a000d37e"
       }
     ]
   },

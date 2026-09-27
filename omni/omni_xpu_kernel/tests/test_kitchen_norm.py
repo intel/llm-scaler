@@ -84,6 +84,18 @@ def test_group_norm_silu_pad3d_fp32_affine_matches_cuda_ut():
     assert relative < 5e-3
 
 
+def test_group_norm_near_constant_fp32_keeps_variance():
+    x = torch.tensor([1024.0, 1024.125], device="xpu", dtype=torch.float32)
+    x = x.reshape(1, 1, 1, 1, 2)
+    weight = torch.ones(1, device="xpu", dtype=torch.float32)
+    bias = torch.zeros(1, device="xpu", dtype=torch.float32)
+    actual = kitchen.group_norm_silu_pad3d(
+        x, weight, bias, 1, 1e-6, (0, 0, 0, 0, 0), False,
+    )
+    expected = _reference(x, weight, bias, 1, 1e-6, (0, 0, 0, 0, 0), False)
+    torch.testing.assert_close(actual, expected, rtol=5e-4, atol=5e-4)
+
+
 def test_group_norm_silu_pad3d_rejects_negative_padding():
     x = torch.zeros(1, 64, 3, 8, 8, device="xpu", dtype=torch.float16)
     with pytest.raises(RuntimeError, match="padding must be non-negative"):
