@@ -11,10 +11,11 @@ Optimised SYCL/ESIMD kernels for Intel GPUs:
 * **linear** — FP8 GEMM (oneDNN W8A16, E4M3/E5M2)
 * **int8** — INT8 quantization, GEMM, and linear (oneDNN s8 matmul + ESIMD fusion)
 * **layout** — Validated layout and materialization fusions
+* **kitchen** — Native Comfy Kitchen inference operators
 
 Usage::
 
-    from omni_xpu_kernel import svdq, norm, rotary, gguf, sdp, linear, int8
+    from omni_xpu_kernel import svdq, norm, rotary, gguf, sdp, linear, int8, kitchen
 """
 
 import os
@@ -160,6 +161,7 @@ from . import int8
 from . import fp8
 from . import device
 from . import layout
+from . import kitchen
 
 # cute FMHA (CUTLASS-SYCL) is required by default on Linux and an explicit
 # build opt-in on Windows. Import remains defensive for core-only and older
@@ -180,6 +182,7 @@ __all__ = [
     "fp8",
     "device",
     "layout",
+    "kitchen",
     "cute",
     "core_aot_target",
     "is_available",
@@ -206,6 +209,7 @@ def native_capabilities() -> dict[str, tuple[str, ...]]:
         "linear",
         "int8",
         "layout",
+        "kitchen",
     )
     return {
         name: tuple(sorted(item for item in dir(getattr(native, name)) if not item.startswith("_")))

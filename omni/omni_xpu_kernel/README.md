@@ -494,6 +494,31 @@ if rotary.kitchen_rope_fast_supported(x, freqs_cis):
 Callers should use the capability query before selecting a specialized native
 route and preserve the established PyTorch fallback.
 
+### Comfy Kitchen INT8 activation
+
+`kitchen.rms_norm_quantize_int8` returns INT8 rows and FP32 row scales in one
+XPU operation. Check `kitchen.supports_rms_norm_quantize_int8()` before using
+it with `int8.int8_linear_prequantized`.
+For BF16/FP16 ConvRot inputs, `kitchen.rms_norm_convrot_quantize_int8` also
+performs the supported 64- or 256-channel rotation in that operation.
+
+### Comfy Kitchen AWQ W4A16
+
+`kitchen.gemv_awq_w4a16` consumes Kitchen's row-major packed unsigned INT4
+weight and `[K/group_size, N]` scale/zero tensors. It uses a parallel XPU GEMV
+for up to eight activation rows and native dequantization plus oneDNN GEMM for
+larger batches. The output dtype follows the scale dtype. Check
+`kitchen.supports_gemv_awq_w4a16()` when using an optional companion wheel.
+
+### Comfy Kitchen 3D output views
+
+`kitchen.group_norm_silu_pad3d` accepts strided input and optional zero spatial
+padding. `kitchen.group_norm_silu_pad3d_out` writes into an existing output or
+frame-offset view. `kitchen.fp16_conv3d` accepts strided NDHWC input;
+`kitchen.fp16_conv3d_out` writes into a matching output view. Query the
+corresponding `supports_*_out()` capability when the native extension may be
+older than these interfaces.
+
 ## Compiled inference
 
 The public tensor interfaces in `norm`, `int8`, `fp8`, `gguf`, `svdq`,

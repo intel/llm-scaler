@@ -93,6 +93,13 @@ COMPONENTS = (
         "adapters/lora_memory.py",
     ),
     Component(
+        "qwen_image21_cache_adapter",
+        "qwen_image21_cache",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/qwen_image21_cache.py",
+    ),
+    Component(
         "seedvr_ada_reshape_patch",
         "seedvr_ada_reshape",
         "compatibility_patch",

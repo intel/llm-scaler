@@ -27,6 +27,7 @@
 #include "oneapi/dnnl/dnnl_sycl.hpp"
 #include <torch/extension.h>
 #include <ATen/xpu/XPUGeneratorImpl.h>
+#include <sycl/sycl.hpp>
 
 #include "utils.h"
 
@@ -51,6 +52,94 @@ torch::Tensor fused_scaleback(torch::Tensor gemm_result, torch::Tensor x_scale,
 namespace {
 
 using DT = dnnl::memory::data_type;
+
+#if defined(OMNI_XPU_ARCH_BMG)
+template <typename OutputT>
+class KitchenInt8TwoRowKernel;
+
+template <typename OutputT>
+void launch_int8_two_row(
+    const torch::Tensor& x_int8,
+    const torch::Tensor& x_scale,
+    const torch::Tensor& weight,
+    const torch::Tensor& weight_scale,
+    const torch::Tensor& bias_f32,
+    const torch::Tensor& residual,
+    const torch::Tensor& residual_scale,
+    torch::Tensor& output) {
+    constexpr size_t subgroup = 16;
+    constexpr size_t subgroups_per_workgroup = 8;
+    constexpr size_t workgroup = subgroup * subgroups_per_workgroup;
+    const int64_t k = x_int8.size(1);
+    const int64_t n = weight.size(0);
+    const bool scalar_weight_scale = weight_scale.numel() == 1;
+    const bool has_bias = bias_f32.defined();
+    const bool has_residual = residual.defined();
+    const auto* x_ptr = x_int8.data_ptr<int8_t>();
+    const auto* x_scale_ptr = x_scale.data_ptr<float>();
+    const auto* weight_ptr = weight.data_ptr<int8_t>();
+    const auto* weight_scale_ptr = weight_scale.data_ptr<float>();
+    const auto* bias_ptr = has_bias ? bias_f32.data_ptr<float>() : nullptr;
+    const auto* residual_ptr = has_residual
+        ? static_cast<const OutputT*>(residual.data_ptr()) : nullptr;
+    const auto* residual_scale_ptr = has_residual
+        ? static_cast<const OutputT*>(residual_scale.data_ptr()) : nullptr;
+    auto* output_ptr = static_cast<OutputT*>(output.data_ptr());
+
+    auto cgf = [&](sycl::handler& handler) {
+        handler.parallel_for<KitchenInt8TwoRowKernel<OutputT>>(
+            sycl::nd_range<1>(
+                sycl::range<1>(
+                    static_cast<size_t>((n + subgroups_per_workgroup - 1) /
+                                        subgroups_per_workgroup) * workgroup),
+                sycl::range<1>(workgroup)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const int64_t column =
+                    static_cast<int64_t>(item.get_group(0)) *
+                        subgroups_per_workgroup +
+                    static_cast<int64_t>(item.get_local_id(0) / subgroup);
+                if (column >= n) return;
+                const int64_t lane = item.get_local_id(0) % subgroup;
+                const int8_t* weight_row = weight_ptr + column * k;
+                int32_t sum0 = 0;
+                int32_t sum1 = 0;
+                for (int64_t block = lane; block < k / 16; block += subgroup) {
+                    const int64_t offset = block * 16;
+#pragma unroll
+                    for (int index = 0; index < 16; ++index) {
+                        const int32_t w = weight_row[offset + index];
+                        sum0 += static_cast<int32_t>(x_ptr[offset + index]) * w;
+                        sum1 += static_cast<int32_t>(x_ptr[k + offset + index]) * w;
+                    }
+                }
+                const auto sg = item.get_sub_group();
+                sum0 = sycl::reduce_over_group(sg, sum0, sycl::plus<int32_t>());
+                sum1 = sycl::reduce_over_group(sg, sum1, sycl::plus<int32_t>());
+                if (lane == 0) {
+                    const float weight_factor = weight_scale_ptr[
+                        scalar_weight_scale ? 0 : column];
+                    const float bias = has_bias ? bias_ptr[column] : 0.0f;
+                    float value0 = static_cast<float>(sum0) *
+                        x_scale_ptr[0] * weight_factor + bias;
+                    float value1 = static_cast<float>(sum1) *
+                        x_scale_ptr[1] * weight_factor + bias;
+                    if (has_residual) {
+                        const float scale = static_cast<float>(
+                            residual_scale_ptr[column]);
+                        value0 = static_cast<float>(residual_ptr[column]) +
+                            scale * value0;
+                        value1 = static_cast<float>(residual_ptr[n + column]) +
+                            scale * value1;
+                    }
+                    output_ptr[column] = static_cast<OutputT>(value0);
+                    output_ptr[n + column] = static_cast<OutputT>(value1);
+                }
+            });
+    };
+    omni_xpu::utils::submit_kernel(
+        cgf, x_int8.device(), "kitchen_int8_two_row_gemv");
+}
+#endif
 
 // ============================================================================
 // Primitive Cache
@@ -138,8 +227,11 @@ struct Int8ScaledState {
     dnnl::memory::desc src_scale_md;
     dnnl::memory::desc wei_scale_md;
     dnnl::memory::desc bias_md;
+    dnnl::memory::desc residual_md;
+    dnnl::memory::desc residual_scale_md;
     dnnl::matmul primitive;
     bool has_bias;
+    bool has_residual;
     bool w_scale_is_scalar;
 };
 
@@ -161,6 +253,7 @@ struct Int8ScaledCacheKey {
     int64_t k;
     int64_t n;
     bool has_bias;
+    bool has_residual;
     bool w_scale_is_scalar;
 
     bool operator==(const Int8ScaledCacheKey& other) const {
@@ -168,6 +261,7 @@ struct Int8ScaledCacheKey {
             && out_dtype == other.out_dtype
             && m == other.m && k == other.k && n == other.n
             && has_bias == other.has_bias
+            && has_residual == other.has_residual
             && w_scale_is_scalar == other.w_scale_is_scalar;
     }
 };
@@ -184,6 +278,7 @@ struct Int8ScaledCacheKeyHash {
         combine(std::hash<int64_t>{}(key.k));
         combine(std::hash<int64_t>{}(key.n));
         combine(std::hash<bool>{}(key.has_bias));
+        combine(std::hash<bool>{}(key.has_residual));
         combine(std::hash<bool>{}(key.w_scale_is_scalar));
         return seed;
     }
@@ -232,11 +327,14 @@ std::shared_ptr<Int8ScaledState> get_or_create_int8_scaled_primitive(
     int64_t m, int64_t k, int64_t n,
     int out_dtype_code,  // 0=f32, 1=f16, 2=bf16
     bool has_bias,
+    bool has_residual,
     bool w_scale_is_scalar,
     const torch::Device& device,
     const sycl::queue& queue
 ) {
-    Int8ScaledCacheKey key{device.index(), out_dtype_code, m, k, n, has_bias, w_scale_is_scalar};
+    Int8ScaledCacheKey key{
+        device.index(), out_dtype_code, m, k, n,
+        has_bias, has_residual, w_scale_is_scalar};
 
     auto& cache = int8_scaled_cache();
     auto& counters = int8_cache_counters();
@@ -261,6 +359,7 @@ std::shared_ptr<Int8ScaledState> get_or_create_int8_scaled_primitive(
     auto state = std::make_shared<Int8ScaledState>();
     state->engine = engine;
     state->has_bias = has_bias;
+    state->has_residual = has_residual;
     state->w_scale_is_scalar = w_scale_is_scalar;
 
     // src: [M, K] s8 row-major
@@ -281,6 +380,12 @@ std::shared_ptr<Int8ScaledState> get_or_create_int8_scaled_primitive(
     if (has_bias) {
         state->bias_md = dnnl::memory::desc({1, n}, DT::f32, dnnl::memory::format_tag::ab);
     }
+    if (has_residual) {
+        state->residual_scale_md = dnnl::memory::desc(
+            {1, n}, dst_dt, dnnl::memory::format_tag::ab);
+        state->residual_md = dnnl::memory::desc(
+            {m, n}, dst_dt, dnnl::memory::format_tag::ab);
+    }
 
     dnnl::primitive_attr attr;
     // Per-token src scale via the grouped-scale API: mask over {M,K}, group {1,K}
@@ -293,6 +398,14 @@ std::shared_ptr<Int8ScaledState> get_or_create_int8_scaled_primitive(
         attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 1), {}, DT::f32);
     }
     attr.set_fpmath_mode(dnnl::fpmath_mode::any, true);
+    if (has_residual) {
+        dnnl::post_ops post_ops;
+        post_ops.append_binary(
+            dnnl::algorithm::binary_mul, state->residual_scale_md);
+        post_ops.append_binary(
+            dnnl::algorithm::binary_add, state->residual_md);
+        attr.set_post_ops(post_ops);
+    }
 
     dnnl::matmul::primitive_desc pd = has_bias
         ? dnnl::matmul::primitive_desc(engine, state->src_md, state->wei_md, state->bias_md, state->dst_md, attr)
@@ -516,7 +629,9 @@ torch::Tensor int8_linear_prequantized_impl(
     torch::Tensor weight_scale,
     std::optional<torch::Tensor> bias,
     int64_t out_dtype_code,
-    std::optional<torch::Tensor> output_opt
+    std::optional<torch::Tensor> output_opt,
+    std::optional<torch::Tensor> residual = std::nullopt,
+    std::optional<torch::Tensor> residual_scale = std::nullopt
 ) {
     TORCH_CHECK(x_int8.dim() >= 1,
         "x_int8 must have at least one dimension");
@@ -569,6 +684,22 @@ torch::Tensor int8_linear_prequantized_impl(
 
     std::vector<int64_t> out_sizes(orig_sizes.begin(), orig_sizes.end() - 1);
     out_sizes.push_back(n);
+    TORCH_CHECK(residual.has_value() == residual_scale.has_value(),
+        "residual and residual_scale must be supplied together");
+    const bool has_residual = residual.has_value();
+    if (has_residual) {
+        TORCH_CHECK(residual->device() == x_int8.device() &&
+                    residual->scalar_type() == out_dtype &&
+                    residual->sizes() == at::IntArrayRef(out_sizes) &&
+                    residual->is_contiguous(),
+            "residual must be contiguous output-shaped tensor on the XPU");
+        TORCH_CHECK(residual_scale->device() == x_int8.device() &&
+                    residual_scale->scalar_type() == out_dtype &&
+                    residual_scale->dim() == 1 &&
+                    residual_scale->numel() == n &&
+                    residual_scale->is_contiguous(),
+            "residual_scale must be contiguous output-dtype [N] on the XPU");
+    }
     torch::Tensor output;
     if (output_opt.has_value()) {
         output = *output_opt;
@@ -598,9 +729,42 @@ torch::Tensor int8_linear_prequantized_impl(
         bias_f32 = bias->to(x_int8.device()).to(torch::kFloat32).reshape({1, n}).contiguous();
     }
 
+#if defined(OMNI_XPU_ARCH_BMG)
+    // AR/CFG has two activation rows. A subgroup shares each weight row while
+    // accumulating both outputs, then applies scales and bias in this launch.
+    if (m == 2 && k % 16 == 0 && k <= 65536) {
+        if (!output_opt.has_value()) {
+            output = torch::empty(
+                {m, n},
+                torch::TensorOptions().dtype(out_dtype).device(x_int8.device()));
+        }
+        switch (out_dtype_code) {
+            case 0:
+                launch_int8_two_row<float>(
+                    x_int8, x_scale, weight, weight_scale, bias_f32,
+                    has_residual ? *residual : torch::Tensor(),
+                    has_residual ? *residual_scale : torch::Tensor(), output);
+                break;
+            case 1:
+                launch_int8_two_row<sycl::half>(
+                    x_int8, x_scale, weight, weight_scale, bias_f32,
+                    has_residual ? *residual : torch::Tensor(),
+                    has_residual ? *residual_scale : torch::Tensor(), output);
+                break;
+            case 2:
+                launch_int8_two_row<sycl::ext::oneapi::bfloat16>(
+                    x_int8, x_scale, weight, weight_scale, bias_f32,
+                    has_residual ? *residual : torch::Tensor(),
+                    has_residual ? *residual_scale : torch::Tensor(), output);
+                break;
+        }
+        return output.reshape(out_sizes);
+    }
+#endif
+
     sycl::queue& queue = omni_xpu::utils::get_queue(x_int8.device());
     auto state = get_or_create_int8_scaled_primitive(
-        m, k, n, static_cast<int>(out_dtype_code), has_bias,
+        m, k, n, static_cast<int>(out_dtype_code), has_bias, has_residual,
         w_scale_is_scalar, x_int8.device(), queue);
     if (!output_opt.has_value()) {
         // Preserve the established allocation order for every existing
@@ -627,6 +791,16 @@ torch::Tensor int8_linear_prequantized_impl(
         args.emplace(
             DNNL_ARG_BIAS,
             dnnl::memory(state->bias_md, state->engine, bias_f32.data_ptr()));
+    }
+    if (has_residual) {
+        args.emplace(
+            DNNL_ARG_ATTR_MULTIPLE_POST_OP(0) | DNNL_ARG_SRC_1,
+            dnnl::memory(state->residual_scale_md, state->engine,
+                         residual_scale->data_ptr()));
+        args.emplace(
+            DNNL_ARG_ATTR_MULTIPLE_POST_OP(1) | DNNL_ARG_SRC_1,
+            dnnl::memory(state->residual_md, state->engine,
+                         residual->data_ptr()));
     }
     state->primitive.execute(stream, args);
 
@@ -671,6 +845,23 @@ torch::Tensor int8_linear_prequantized_out(
         out_dtype_code,
         output);
 }
+
+#if defined(OMNI_XPU_ARCH_BMG)
+torch::Tensor int8_linear_prequantized_residual(
+    torch::Tensor x_int8,
+    torch::Tensor x_scale,
+    torch::Tensor weight,
+    torch::Tensor weight_scale,
+    std::optional<torch::Tensor> bias,
+    int64_t out_dtype_code,
+    torch::Tensor residual,
+    torch::Tensor residual_scale
+) {
+    return int8_linear_prequantized_impl(
+        x_int8, x_scale, weight, weight_scale, bias, out_dtype_code,
+        std::nullopt, residual, residual_scale);
+}
+#endif
 
 #if defined(OMNI_XPU_ARCH_BMG)
 std::tuple<torch::Tensor, torch::Tensor> int8_linear_pair_prequantized(

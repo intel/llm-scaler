@@ -311,6 +311,20 @@ struct RowwiseQuantizeKrea2FFNDownBMGConfig {
     static constexpr int VectorWidth = OMNI_ROWQ_VECTOR_WIDTH(8);
 };
 
+// The BF16 K12288 down-projection producer appears at both cache-hit and fill
+// row counts. Keep admission structural; the one-row SLM path preserves the
+// public INT8 bytes and FP32 scale bits while avoiding the generic second
+// global-memory read. The floor is a conservative boundary below the measured
+// M4032 hit route, not a whitelist of captured sequence lengths.
+struct RowwiseQuantizeK12288BMGConfig {
+    static constexpr int Columns = 12288;
+    static constexpr int MinimumRows = 4032;
+    static constexpr int SubgroupSize = 32;
+    static constexpr int SubgroupsPerRow = OMNI_ROWQ_SUBGROUPS_PER_ROW(32);
+    static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
+    static constexpr int VectorWidth = OMNI_ROWQ_VECTOR_WIDTH(8);
+};
+
 // BMG was tuned independently for the same Boogu Image Turbo 1024x1024 FP16
 // shapes. VEC16/SG20, which is the PTL-H winner, regresses BMG's K=3360 route.
 // A process-isolated BMG sweep selected VEC8/SG16 while preserving byte-exact
@@ -963,6 +977,14 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(
                 reinterpret_cast<int8_t*>(output.data_ptr()),
                 scales.data_ptr<float>(), M, x.device(),
                 "quantize_int8_rowwise_large_bmg");
+        } else if (M >= RowwiseQuantizeK12288BMGConfig::MinimumRows &&
+                   K == RowwiseQuantizeK12288BMGConfig::Columns) {
+            quantize_int8_rowwise_large_ptl_kernel<
+                bf16, RowwiseQuantizeK12288BMGConfig>(
+                reinterpret_cast<const bf16*>(x.data_ptr()),
+                reinterpret_cast<int8_t*>(output.data_ptr()),
+                scales.data_ptr<float>(), M, x.device(),
+                "quantize_int8_rowwise_k12288_bmg");
         } else {
 #endif
         quantize_int8_rowwise_kernel<bf16>(

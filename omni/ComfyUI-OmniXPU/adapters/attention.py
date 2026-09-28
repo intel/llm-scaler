@@ -1,8 +1,10 @@
 import glob
+import hashlib
 import logging
 import os
 import sys
 from importlib.machinery import EXTENSION_SUFFIXES
+from pathlib import Path
 
 import torch
 
@@ -22,7 +24,14 @@ _attention_traced_contracts = set()
 
 _MINIMAX_H3_H56_CUTE_MIN_SEQUENCE = 31
 _MINIMAX_H3_VAE_D64_CUTE_MIN_SEQUENCE = 6
+_CUTE_D128_MAX_DENSE_ELEMENTS = (1 << 31) - 1
+# Short rectangular queries can lose their CUTE advantage to tail work.
+_BMG_D128_PREFIX_MIN_QUERY = 2048
 _VALIDATE_OUTPUT_ENV = "OMNIXPU_VALIDATE_ATTENTION_OUTPUT"
+_MASKED_D128_DSO_ENV = "OMNIXPU_EXPERIMENTAL_MASKED_D128_DSO"
+_MASKED_D128_SHA_ENV = "OMNIXPU_EXPERIMENTAL_MASKED_D128_SHA256"
+_MASKED_D128_PARTITIONS_ENV = "OMNIXPU_EXPERIMENTAL_MASKED_D128_PARTITIONS"
+_masked_d128_loaded = None
 
 # ── Attention backend selection ──────────────────────────────────────────────
 # OMNI_ATTN_BACKEND selects which attention routing policy the patched ComfyUI
@@ -253,19 +262,44 @@ def _is_minimax_h3_h56_bhld(tensor, seq):
     )
 
 
-def _is_minimax_h3_vae_d64_bhld(tensor, seq, *, value):
+def _is_minimax_h3_vae_d64_bhld(tensor, seq, batch, *, value):
     try:
         shape = tuple(tensor.shape)
         strides = tuple(tensor.stride())
     except (AttributeError, TypeError):
         return False
-    sequence_stride = 32 * (3 * 64 if value else 64)
-    head_stride = 3 * 64 if value else 64
-    return (
-        shape == (1, 32, seq, 64)
-        and strides
-        == (seq * sequence_stride, head_stride, sequence_stride, 1)
-    )
+    if shape != (batch, 32, seq, 64):
+        return False
+    packed = (seq * 32 * 3 * 64, 3 * 64, 32 * 3 * 64, 1)
+    separate = (seq * 32 * 64, 64, 32 * 64, 1)
+    return strides == packed if value else strides in (separate, packed)
+
+
+def _minimax_h3_vae_d64_qk_for_native(tensor):
+    if tensor.stride()[1] == 64:
+        return tensor
+    # ComfyUI 0.37 keeps Q/K as slices of packed [Q,K,V] after in-place
+    # RMS/RoPE. The native B1 kernel needs dense BLHD-backed Q/K; V keeps its
+    # validated interleaved view. Materialize only the two required carriers.
+    return tensor.transpose(1, 2).contiguous().transpose(1, 2)
+
+
+def _run_minimax_h3_vae_d64(q, k, v, batch, seq, heads, width):
+    if batch == 1:
+        out = _backend_sdp.sdp_minimax_h3_vae_d64(
+            _minimax_h3_vae_d64_qk_for_native(q),
+            _minimax_h3_vae_d64_qk_for_native(k), v,
+        )
+        return out.transpose(1, 2).reshape(batch, seq, heads * width)
+    pieces = []
+    for index in range(batch):
+        q_part = _minimax_h3_vae_d64_qk_for_native(q[index:index + 1])
+        k_part = _minimax_h3_vae_d64_qk_for_native(k[index:index + 1])
+        out = _backend_sdp.sdp_minimax_h3_vae_d64(
+            q_part, k_part, v[index:index + 1],
+        )
+        pieces.append(out.transpose(1, 2).reshape(1, seq, heads * width))
+    return torch.cat(pieces, dim=0)
 
 
 def _use_bmg_minimax_h3_vae_d64(
@@ -295,16 +329,16 @@ def _use_bmg_minimax_h3_vae_d64(
         and q.device.type == "xpu"
         and k.device == q.device
         and v.device == q.device
-        and b == 1
+        and 1 <= b <= 4
         and heads == 32
         and dim_head == 64
         and q_len == kv_len
         and q_len >= _MINIMAX_H3_VAE_D64_CUTE_MIN_SEQUENCE
         and skip_reshape
         and not skip_output_reshape
-        and _is_minimax_h3_vae_d64_bhld(q, q_len, value=False)
-        and _is_minimax_h3_vae_d64_bhld(k, q_len, value=False)
-        and _is_minimax_h3_vae_d64_bhld(v, q_len, value=True)
+        and _is_minimax_h3_vae_d64_bhld(q, q_len, b, value=False)
+        and _is_minimax_h3_vae_d64_bhld(k, q_len, b, value=False)
+        and _is_minimax_h3_vae_d64_bhld(v, q_len, b, value=True)
     )
 
 
@@ -356,6 +390,100 @@ def _is_dense_bld(tensor, batch, seq, width):
         and len(strides) == 3
         and strides == (seq * width, width, 1)
     )
+
+
+def _b1_dense_segment_bhld(tensor, seq, heads, dim_head, skip_reshape):
+    """Normalize only the unused B1 stride of a dense sequence slice."""
+    width = heads * dim_head
+    if skip_reshape:
+        shape = (1, heads, seq, dim_head)
+        if tuple(tensor.shape) != shape:
+            return None
+        stride = tuple(tensor.stride())
+        if len(stride) != 4 or stride[3] != 1:
+            return None
+        packed = stride[1:3] == (seq * dim_head, dim_head)
+        blhd_backed = stride[1:3] == (dim_head, width)
+        if not (packed or blhd_backed):
+            return None
+        return tensor.as_strided(
+            shape, (seq * width, stride[1], stride[2], 1),
+            tensor.storage_offset(),
+        )
+    shape = (1, seq, width)
+    if tuple(tensor.shape) != shape or tuple(tensor.stride())[1:] != (width, 1):
+        return None
+    normalized = tensor.as_strided(
+        shape, (seq * width, width, 1), tensor.storage_offset()
+    )
+    return normalized.view(1, seq, heads, dim_head).transpose(1, 2)
+
+
+def _prepare_experimental_masked_d128(
+    q, k, v, mask, b, heads, dim_head, q_len, kv_len,
+    skip_reshape, attn_precision, kwargs,
+):
+    """Opt-in actual-bool-mask sidecar; default and unsupported calls are unchanged."""
+    variant = os.environ.get(_MASKED_D128_PARTITIONS_ENV)
+    if not (variant in ("1", "4", "direct") and os.environ.get(_MASKED_D128_DSO_ENV)
+            and os.environ.get(_MASKED_D128_SHA_ENV)
+            and _backend_name == "cute" and _omni_xpu_target() == "bmg"
+            and _torch_supports_versioned_routes()
+            and not torch.compiler.is_compiling()
+            and b == 1 and heads == 32 and dim_head == 128
+            and q_len > 0 and kv_len > 0
+            and q.dtype == k.dtype == v.dtype == torch.bfloat16
+            and q.device.type == "xpu" and k.device == q.device == v.device
+            and mask is not None and mask.device == q.device
+            and mask.dtype == torch.bool and mask.ndim == 2
+            and tuple(mask.shape) == (q_len, kv_len)
+            and mask.is_contiguous()
+            and attn_precision is None
+            and not kwargs.get("is_causal", False)
+            and not kwargs.get("dropout_p", 0.0)
+            and not kwargs.get("enable_gqa", False)
+            and "scale" not in kwargs
+            and kwargs.get("_inside_attn_wrapper", True) is True
+            and not (set(kwargs) - {"transformer_options", "is_causal", "dropout_p",
+                                    "enable_gqa", "_inside_attn_wrapper"})
+            and not any(getattr(t, "requires_grad", False) for t in (q, k, v))
+            and q_len * 4096 <= _CUTE_D128_MAX_DENSE_ELEMENTS
+            and kv_len * 4096 <= _CUTE_D128_MAX_DENSE_ELEMENTS
+            and q_len * kv_len <= _CUTE_D128_MAX_DENSE_ELEMENTS
+            and (variant == "direct" or
+                 int(variant) * 32 * q_len * 144 <= _CUTE_D128_MAX_DENSE_ELEMENTS)):
+        return None
+    tensors = tuple(
+        _b1_dense_segment_bhld(t, length, heads, dim_head, skip_reshape)
+        for t, length in ((q, q_len), (k, kv_len), (v, kv_len))
+    )
+    if any(t is None for t in tensors):
+        return None
+    return (variant, *tensors)
+
+
+def _run_experimental_masked_d128(prepared, mask):
+    global _masked_d128_loaded
+    configured_path = os.environ[_MASKED_D128_DSO_ENV]
+    expected = os.environ[_MASKED_D128_SHA_ENV]
+    identity = (configured_path, expected)
+    if _masked_d128_loaded != identity:
+        if _masked_d128_loaded is not None:
+            raise RuntimeError("masked D128 sidecar identity cannot change in process")
+        path = Path(configured_path).resolve()
+        if len(expected) != 64 or not path.is_file():
+            raise RuntimeError("masked D128 sidecar path/SHA is incomplete")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != expected:
+            raise RuntimeError("masked D128 sidecar SHA mismatch")
+        torch.ops.load_library(str(path))
+        _masked_d128_loaded = identity
+    if prepared[0] == "direct":
+        op = torch.ops.qwen21_masked_direct_d128.sdp_direct
+    else:
+        namespace = torch.ops.qwen21_masked_d128
+        op = namespace.sdp if prepared[0] == "1" else namespace.sdp_split4
+    return op(*prepared[1:], mask)
 
 
 _ANIMATE2_CROSS_ENV = "OMNIXPU_ANIMATE2_CROSS"
@@ -438,10 +566,26 @@ def _prepare_bmg_d128_bhld_cute(
     kv_len,
     skip_reshape,
     skip_output_reshape,
+    mask,
+    attn_precision,
+    kwargs,
 ):
     capability = getattr(_backend_sdp, "supports_d128_bhld", None)
     self_attention = q_len == kv_len and q_len >= 768
     cross_attention = kv_len == 1024 and q_len >= 1024
+    prefix_rectangular = (
+        b == 1
+        and heads == 32
+        and q_len >= _BMG_D128_PREFIX_MIN_QUERY
+        and kv_len > q_len
+        and mask is None
+        and attn_precision is None
+        and not kwargs.get("is_causal", False)
+        and not kwargs.get("dropout_p", 0.0)
+        and not any(getattr(t, "requires_grad", False) for t in (q, k, v))
+        and q_len * heads * dim_head <= _CUTE_D128_MAX_DENSE_ELEMENTS
+        and kv_len * heads * dim_head <= _CUTE_D128_MAX_DENSE_ELEMENTS
+    )
     minimax_h3_attention = (
         b == 1
         and heads == 56
@@ -459,6 +603,7 @@ def _prepare_bmg_d128_bhld_cute(
         or (b == 1 and cross_attention)
         or minimax_h3_attention
         or animate2_attention
+        or prefix_rectangular
     )
     if not (
         _backend_name == "cute"
@@ -481,7 +626,13 @@ def _prepare_bmg_d128_bhld_cute(
     ):
         return None
 
-    if skip_reshape:
+    if prefix_rectangular:
+        q_bhld = _b1_dense_segment_bhld(q, q_len, heads, dim_head, skip_reshape)
+        k_bhld = _b1_dense_segment_bhld(k, kv_len, heads, dim_head, skip_reshape)
+        v_bhld = _b1_dense_segment_bhld(v, kv_len, heads, dim_head, skip_reshape)
+        if any(tensor is None for tensor in (q_bhld, k_bhld, v_bhld)):
+            return None
+    elif skip_reshape:
         q_bhld, k_bhld, v_bhld = q, k, v
     else:
         width = heads * dim_head
@@ -762,6 +913,9 @@ def apply():
                 kv_len,
                 skip_reshape,
                 skip_output_reshape,
+                mask,
+                attn_precision,
+                kwargs,
             )
             if target == "bmg"
             else None
@@ -825,9 +979,42 @@ def apply():
             and bmg_minimax_h3_vae_d64_contract not in _attention_failed_contracts
         )
 
+        masked_prepared = _prepare_experimental_masked_d128(
+            q, k, v, mask, b, heads, dim_head, q_len, kv_len,
+            skip_reshape, attn_precision, kwargs,
+        ) if target == "bmg" else None
+        masked_contract = (
+            "masked_d128", masked_prepared[0], q_len, kv_len,
+            tuple(q.stride()), tuple(k.stride()), tuple(v.stride()),
+        ) if masked_prepared is not None else None
+        if masked_contract is not None and masked_contract not in _attention_failed_contracts:
+            try:
+                out = _run_experimental_masked_d128(masked_prepared, mask)
+                if not torch.compiler.is_compiling():
+                    _cute_call_count += 1
+                route = ("bmg_b1_bf16_d128_masked_direct"
+                         if masked_prepared[0] == "direct" else
+                         "bmg_b1_bf16_d128_masked_split" + masked_prepared[0])
+                _record_attention_route(route)
+                log_debug_event(
+                    "kernel", "attention",
+                    {"q": masked_prepared[1], "k": masked_prepared[2],
+                     "v": masked_prepared[3], "mask": mask},
+                    details={"backend": "cute", "route": route},
+                )
+                if skip_output_reshape:
+                    return out
+                return out.transpose(1, 2).reshape(b, q_len, heads * dim_head)
+            except Exception as error:
+                if is_fatal_accelerator_error(error):
+                    raise
+                _attention_failed_contracts.add(masked_contract)
+                log.warning("[OmniXPU] experimental masked D128 route failed "
+                            "for Q=%d KV=%d; using Torch: %s", q_len, kv_len, error)
+
         # Constraint check
         reasons = []
-        if b != 1 and bmg_d128_prepared is None:
+        if b != 1 and bmg_d128_prepared is None and not use_bmg_minimax_h3_vae_d64:
             reasons.append(f"batch={b}")
         if (
             bmg_d128_contract is not None
@@ -935,6 +1122,8 @@ def apply():
                 route = (
                     f"animate2_b{b}_{tag}_d128_q{q_len}_kv{kv_len}_cross"
                 )
+            elif b == 1 and q_len < kv_len:
+                route = "bmg_b1_bf16_d128_prefix_rectangular"
             else:
                 route = f"bmg_b{b}_bf16_d128_kv1024_cross"
             route_call_count = _record_attention_route(route)
@@ -1092,9 +1281,8 @@ def apply():
                 details={"backend": "cute", "route": route},
             )
             try:
-                out = _backend_sdp.sdp_minimax_h3_vae_d64(q, k, v)
-                return out.transpose(1, 2).reshape(
-                    b, q_len, heads * dim_head
+                return _run_minimax_h3_vae_d64(
+                    q, k, v, b, q_len, heads, dim_head,
                 )
             except Exception as error:
                 if is_fatal_accelerator_error(error):

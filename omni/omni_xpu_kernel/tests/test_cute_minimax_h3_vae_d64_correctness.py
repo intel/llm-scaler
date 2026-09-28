@@ -89,3 +89,39 @@ def test_minimax_h3_video_vae_d64_rejects_wrong_layout_and_dtype():
     ).transpose(1, 2)
     with pytest.raises(RuntimeError, match="requires FP16"):
         cute.sdp_minimax_h3_vae_d64(q, q, q)
+
+
+@pytest.mark.skipif(
+    not has_bmg_h3_vae_d64(), reason="MiniMax H3 VideoVAE D64 unavailable"
+)
+@pytest.mark.parametrize("batch", [2, 3, 4])
+def test_minimax_h3_video_vae_d64_batched_packed_qkv_matches_sdpa(batch):
+    from omni_xpu_kernel import cute
+
+    sequence, heads, width = 1797, 32, 64
+    torch.xpu.manual_seed_all(20260926)
+    qkv = torch.randn(
+        (batch, sequence, heads, 3 * width),
+        device="xpu", dtype=torch.float16,
+    )
+    q, k, v = (part.transpose(1, 2) for part in qkv.chunk(3, dim=-1))
+    assert q.stride() == k.stride() == v.stride() == (
+        sequence * heads * 3 * width, 3 * width, heads * 3 * width, 1,
+    )
+    pieces = []
+    for index in range(batch):
+        q_part = q[index:index + 1].transpose(1, 2).contiguous().transpose(1, 2)
+        k_part = k[index:index + 1].transpose(1, 2).contiguous().transpose(1, 2)
+        assert q_part.stride() == k_part.stride() == (
+            sequence * heads * width, width, heads * width, 1,
+        )
+        pieces.append(cute.sdp_minimax_h3_vae_d64(
+            q_part, k_part, v[index:index + 1],
+        ))
+    actual = torch.cat(pieces, dim=0)
+    expected = F.scaled_dot_product_attention(q, k, v)
+    torch.xpu.synchronize()
+    error = (actual.float() - expected.float()).abs()
+    assert actual.shape == q.shape
+    assert torch.isfinite(actual).all()
+    assert float(error.max().item()) <= 0.0078125

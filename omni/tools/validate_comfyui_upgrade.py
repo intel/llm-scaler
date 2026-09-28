@@ -59,6 +59,19 @@ def provider_snapshot() -> dict[str, dict[str, object]]:
     return {name: distribution_snapshot(name) for name in PROVIDER_DISTRIBUTIONS}
 
 
+def require_provider_versions(
+    snapshots: dict[str, dict[str, object]],
+    expected_versions: dict[str, str],
+) -> None:
+    for name, expected in expected_versions.items():
+        actual = str(snapshots[name]["version"])
+        if actual != expected:
+            raise RuntimeError(
+                f"provider {name} source version changed: expected {expected!r}, "
+                f"got {actual!r}"
+            )
+
+
 def run(command: list[str], *, environment: dict[str, str] | None = None) -> None:
     subprocess.run(command, check=True, env=environment)
 
@@ -204,11 +217,18 @@ def main() -> int:
         parser.error("--comfyui-revision must be a full lowercase Git commit")
     if not args.kitchen_version or not args.aimdo_version:
         parser.error("official Kitchen and AIMDO versions must be explicit")
+    expected_provider_versions = {
+        "comfy-kitchen-xpu-runtime": os.environ[
+            "OMNI_COMFY_KITCHEN_PROVIDER_VERSION"
+        ],
+        "comfy-aimdo-xpu-runtime": os.environ["OMNI_COMFY_AIMDO_PROVIDER_VERSION"],
+    }
     if not COMFYUI_ROOT.joinpath(".git").exists() or not UPDATE_SCRIPT.is_file():
         raise RuntimeError("this check must run inside the focused ComfyUI image")
 
     require_runtime_constraints()
     before = provider_snapshot()
+    require_provider_versions(before, expected_provider_versions)
     official_before = {
         name: importlib.metadata.version(name) for name in OFFICIAL_DISTRIBUTIONS
     }
@@ -302,6 +322,7 @@ def main() -> int:
                 "official_before": official_before,
                 "official_upgraded": upgraded_official,
                 "official_after": official_after,
+                "expected_provider_versions": expected_provider_versions,
                 "provider_versions": {
                     name: snapshot["version"] for name, snapshot in before.items()
                 },

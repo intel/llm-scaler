@@ -529,45 +529,65 @@ def test_required_mode_refuses_disabled_dynamic_vram(runtime, monkeypatch, tmp_p
 
 
 @pytest.mark.parametrize(
-    ("compatible_versions", "vendored_hash", "expected_error"),
+    ("canonical_import", "source_version", "official_version"),
     (
-        (["0.2.31"], hashlib.sha256(b"different").hexdigest(), "hash mismatch"),
-        (["0.2.30"], None, "is incompatible"),
+        ("comfy_kitchen", "0.2.33", "0.2.35"),
+        ("comfy_aimdo", "0.5.3", "0.5.5"),
     ),
 )
-def test_discovery_rejects_incompatible_or_tampered_provider(
+@pytest.mark.parametrize(
+    ("source_owner", "compatible", "tampered", "expected_error"),
+    (
+        ("xiangyuT", True, False, None),
+        ("xiangyuT", True, True, "hash mismatch"),
+        ("xiangyuT", False, False, "is incompatible"),
+        ("unregistered", True, False, "source repository"),
+    ),
+)
+def test_discovery_validates_provider_provenance_and_compatibility(
     runtime,
     monkeypatch,
     tmp_path,
-    compatible_versions,
-    vendored_hash,
+    canonical_import,
+    source_version,
+    official_version,
+    source_owner,
+    compatible,
+    tampered,
     expected_error,
 ):
+    canonical_distribution = canonical_import.replace("_", "-")
+    provider_package = canonical_import + "_xpu_runtime"
+    provider_distribution = canonical_distribution + "-xpu-runtime"
+    provider_id = canonical_import + ".xpu"
+    repository_name = canonical_distribution + ("-xpu" if source_owner == "xiangyuT" else "")
+    repository = f"https://github.com/{source_owner}/{repository_name}.git"
+    is_aimdo = canonical_import == "comfy_aimdo"
     provider_root = tmp_path / "site"
-    vendor_root = provider_root / "comfy_kitchen_xpu_runtime" / "_vendor"
-    canonical_root = vendor_root / "comfy_kitchen"
+    vendor_root = provider_root / provider_package / "_vendor"
+    canonical_root = vendor_root / canonical_import
     canonical_root.mkdir(parents=True)
     vendored = canonical_root / "__init__.py"
     vendored.write_text("VALUE = 1\n", encoding="utf-8")
     relative = vendored.relative_to(provider_root).as_posix()
     manifest = {
         "schema_version": 1,
-        "provider_id": "comfy_kitchen.xpu",
+        "provider_id": provider_id,
         "provider_distribution": {
-            "name": "comfy-kitchen-xpu-runtime",
-            "version": "0.2.31",
+            "name": provider_distribution,
+            "version": source_version,
         },
-        "provider_package": "comfy_kitchen_xpu_runtime",
+        "provider_package": provider_package,
         "canonical_distribution": {
-            "name": "comfy-kitchen",
-            "compatible_versions": compatible_versions,
+            "name": canonical_distribution,
+            "compatible_versions": [source_version, official_version] if compatible else [source_version],
         },
-        "canonical_import": "comfy_kitchen",
+        "canonical_import": canonical_import,
         "source": {
-            "repository": "https://github.com/xiangyuT/comfy-kitchen-xpu.git",
+            "repository": repository,
             "revision": "a" * 40,
-            "distribution": "comfy-kitchen",
-            "version": "0.2.31",
+            "distribution": canonical_distribution,
+            "version": source_version,
             "wheel_sha256": "b" * 64,
         },
         "runtime": {
@@ -576,18 +596,18 @@ def test_discovery_rejects_incompatible_or_tampered_provider(
             "xpu_targets": ["bmg"],
         },
         "activation": {
-            "strategy": "canonical_meta_path",
-            "requires_dynamic_vram": False,
+            "strategy": "canonical_control_overlay" if is_aimdo else "canonical_meta_path",
+            "requires_dynamic_vram": is_aimdo,
         },
-        "vendor_root": "comfy_kitchen_xpu_runtime/_vendor",
+        "vendor_root": provider_package + "/_vendor",
         "vendored_files": {
-            relative: vendored_hash or hashlib.sha256(vendored.read_bytes()).hexdigest()
+            relative: hashlib.sha256(b"different" if tampered else vendored.read_bytes()).hexdigest()
         },
     }
 
     class FakeDistribution:
-        version = "0.2.31"
-        metadata = {"Name": "comfy-kitchen-xpu-runtime"}
+        version = source_version
+        metadata = {"Name": provider_distribution}
         files = tuple(PurePath for PurePath in (Path(relative),))
 
         @staticmethod
@@ -595,7 +615,7 @@ def test_discovery_rejects_incompatible_or_tampered_provider(
             return provider_root / path
 
     class FakeEntryPoint:
-        name = "comfy_kitchen.xpu"
+        name = provider_id
         dist = FakeDistribution()
 
         @staticmethod
@@ -604,7 +624,7 @@ def test_discovery_rejects_incompatible_or_tampered_provider(
 
     monkeypatch.setattr(runtime, "_entry_points", lambda: (FakeEntryPoint(),))
     monkeypatch.setattr(
-        runtime.importlib.metadata, "version", lambda name: "0.2.31"
+        runtime.importlib.metadata, "version", lambda name: official_version
     )
     monkeypatch.setattr(
         runtime, "_torch_version_without_import", lambda: "2.13.0+xpu"
@@ -613,9 +633,15 @@ def test_discovery_rejects_incompatible_or_tampered_provider(
 
     providers, errors = runtime.discover_providers()
 
-    assert providers == {}
-    assert len(errors) == 1
-    assert expected_error in errors[0]
+    if expected_error is None:
+        assert errors == []
+        assert set(providers) == {provider_id}
+        assert providers[provider_id].version == source_version
+        assert providers[provider_id].manifest["source"]["repository"] == repository
+    else:
+        assert providers == {}
+        assert len(errors) == 1
+        assert expected_error in errors[0]
 
 
 def test_discovery_is_fatal_if_provider_metadata_imports_torch(

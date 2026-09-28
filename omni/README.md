@@ -140,27 +140,27 @@ see [ComfyUI usage](docs/COMFYUI.md).
 
 ## Image contents
 
-The focused image contains:
+The focused source build selects:
 
-- upstream [ComfyUI v0.35.0](https://github.com/Comfy-Org/ComfyUI/tree/v0.35.0),
-  pinned to `40c4fcdf513a4523e39d54a9d391908af8df8171`;
+- upstream [ComfyUI v0.37.0](https://github.com/Comfy-Org/ComfyUI/tree/v0.37.0),
+  pinned to `73c9bad4d21e7addbe1d13bc92eee0f1431b017d`;
 - `omni_xpu_kernel`, built for the selected Torch minor and XPU target;
-- official `comfy-kitchen==0.2.33` plus the co-installable XPU runtime provider
-  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/9a46ea72e3e9a639ec9cfc0af8d763614eb00b4d),
+- official `comfy-kitchen==0.2.35` plus the matching co-installable XPU runtime provider
+  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/20a69c1ef0cbbb73675e3115aa78c0ea70a9a2b1),
   including the managed GGUF and Nunchaku W4A16 routes;
-- official `comfy-aimdo==0.5.3` plus the co-installable XPU runtime provider
-  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/a79b5668d0a79a957796bd9c539577a70d384aa1),
+- official `comfy-aimdo==0.5.5` plus the co-installable XPU runtime provider
+  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/cc3729fc59eeab77bd4c8b28b80e49c9faa855d4),
   built with its Level Zero backend and native allocator hook;
 - [`ComfyUI-GGUF-XPU`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),
   with GGUF, SentencePiece, and Protobuf dependencies installed from the same
   pinned checkout's requirements;
-- [`ComfyUI-nunchaku-XPU==1.2.1+xpu.3`](https://github.com/xiangyuT/ComfyUI-nunchaku-XPU/commit/cc0f6236b6c329178ad4ef58452a874e774c7b8e),
+- [`ComfyUI-nunchaku-XPU==1.2.1+xpu.3`](https://github.com/xiangyuT/ComfyUI-nunchaku-XPU/commit/9f5604445f56154dd44e8b4acfed1aef868003c5),
   with its `nunchaku_torch` runtime bundled in the same pinned checkout;
 - ComfyUI native **Model Sparse Attention** (SOL, SLA and VSA), backed by
   Kitchen and the packaged `omni_xpu_kernel` XPU operators; see
   [usage and legacy-node migration](docs/SPARSE_ATTENTION.md);
 - [ComfyUI-OmniXPU](ComfyUI-OmniXPU/README.md);
-- ComfyUI v0.35.0 integrated Node Manager plus pinned VideoHelperSuite,
+- ComfyUI v0.37.0 integrated Node Manager plus pinned VideoHelperSuite,
   Easy-Use, KJNodes, CacheDiT, and ControlNet auxiliary nodes;
 - an exact installed Python dependency snapshot at
   `/llm/manifests/comfyui-python-freeze.txt`.

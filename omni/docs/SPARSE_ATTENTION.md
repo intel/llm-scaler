@@ -12,8 +12,8 @@ no longer installs the legacy custom node.
 
 Use the matched ComfyUI, Kitchen XPU provider, `omni_xpu_kernel` and
 ComfyUI-OmniXPU sources selected by this checkout's
-[image build](IMAGE_BUILD.md). The current build pins ComfyUI 0.35.0 and
-Kitchen 0.2.33. Installing a newer ComfyUI alone does not provide the XPU
+[image build](IMAGE_BUILD.md). The current build pins ComfyUI 0.37.0 and
+Kitchen 0.2.35. Installing a newer ComfyUI alone does not provide the XPU
 backend; an older native wheel may expose legacy Sol operators while lacking
 the complete API needed by the built-in node.
 

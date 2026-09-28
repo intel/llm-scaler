@@ -1,8 +1,41 @@
 """Quantized Sol-Attn orchestration over the native CUTE/SYCL operators."""
 from __future__ import annotations
 
+import contextlib
 import math
+import weakref
 import torch
+
+
+_NULL_ALLOCATION_CONTEXT = contextlib.nullcontext()
+_allocation_context_factory = lambda: _NULL_ALLOCATION_CONTEXT
+_ROPE_FREQ_CACHE = {}
+
+
+def set_allocation_context_factory(factory):
+    """Use Kitchen's current allocation context for persistent RoPE copies."""
+    global _allocation_context_factory
+    if not callable(factory):
+        raise TypeError("allocation context factory must be callable")
+    _allocation_context_factory = factory
+    _ROPE_FREQ_CACHE.clear()
+
+
+def _cached_rope_freqs(rope_freqs, t, rot):
+    """Cache only a layout copy; contiguous 2x2 coefficients need no copy."""
+    shape = (1, t, 1, rot // 2, 2, 2)
+    if rope_freqs.is_contiguous():
+        return rope_freqs.reshape(shape)
+    context = _allocation_context_factory()
+    key = (id(rope_freqs), rope_freqs._version, t, rot)
+    hit = _ROPE_FREQ_CACHE.get(key)
+    if hit is not None and hit[0]() is rope_freqs and hit[1] is context:
+        return hit[2]
+    with context:
+        packed = rope_freqs.reshape(shape).contiguous()
+    _ROPE_FREQ_CACHE.clear()
+    _ROPE_FREQ_CACHE[key] = (weakref.ref(rope_freqs), context, packed)
+    return packed
 
 
 def _ops():
@@ -32,7 +65,7 @@ def _prepare_chunked(qkv_chunks,t,h,rope_freqs,qk_norm_weights,kmean,vscale,
     if len(qk_norm_weights)!=2 or any(not isinstance(w,torch.Tensor) or w.shape!=(128,) or not w.is_floating_point() for w in qk_norm_weights):
         raise ValueError('qk_norm_weights must contain two floating [128] tensors')
     weights=tuple(w.to(device=dev,dtype=torch.bfloat16).contiguous() for w in qk_norm_weights)
-    freqs=rope_freqs.reshape(1,t,1,rot//2,2,2)
+    freqs=_cached_rope_freqs(rope_freqs,t,rot)
     n=(t+63)//64
     if block_len is None: lengths=torch.empty(0,device=dev,dtype=torch.int32)
     elif block_len.device!=dev or block_len.dtype!=torch.int32 or block_len.shape!=(n,):
@@ -50,7 +83,7 @@ def _prepare_chunked(qkv_chunks,t,h,rope_freqs,qk_norm_weights,kmean,vscale,
         factory=lambda:iter(retained)
 
     def produce(km,vs):
-        c=ops.producer_begin(rope_freqs,t,h,vs)
+        c=ops.producer_begin(freqs,t,h,vs)
         offset=0
         for chunk in (factory() if factory is not None else qkv_chunks):
             if not isinstance(chunk,torch.Tensor) or chunk.ndim!=2 or chunk.shape[1]!=3*h*128 or chunk.dtype!=torch.bfloat16 or chunk.device!=dev:

@@ -54,6 +54,36 @@ def test_chunked_norm_carriers_bootstrap_and_replay(tokens,chunk_size,heads,rot,
     check(c,expected)
 
 
+def test_chunked_noncontiguous_rope_freqs_reuses_registered_layout_copy():
+    from omni_xpu_kernel.cute import sol_attn_v2
+
+    tokens, heads, rot = 64, 3, 8
+    source = torch.randn(tokens, 3 * heads * 128, device="xpu", dtype=torch.bfloat16)
+    base = torch.eye(2, device="xpu", dtype=torch.bfloat16)
+    freqs = base.expand(1, tokens, 1, rot // 2, 2, 2).contiguous()
+    noncontiguous = torch.stack((freqs, freqs), dim=-1)[..., 0]
+    assert not noncontiguous.is_contiguous()
+    weights = (torch.ones(128, device="xpu", dtype=torch.bfloat16),) * 2
+    kmean = torch.zeros(heads, 128, device="xpu")
+    vscale = torch.ones(heads, 128, device="xpu")
+
+    def prepare(frequency):
+        return sol_attn_v2._prepare_chunked(
+            [source], tokens, heads, frequency, weights,
+            kmean, vscale, 128 ** -0.5, 1.0, 1e-6, None,
+        )[0]
+
+    expected = prepare(freqs)
+    first = prepare(noncontiguous)
+    cached = next(iter(sol_attn_v2._ROPE_FREQ_CACHE.values()))[2]
+    second = prepare(noncontiguous)
+    assert next(iter(sol_attn_v2._ROPE_FREQ_CACHE.values()))[2] is cached
+    for actual, wanted in zip(first, expected):
+        torch.testing.assert_close(actual, wanted)
+    for actual, wanted in zip(second, expected):
+        torch.testing.assert_close(actual, wanted)
+
+
 @pytest.mark.parametrize('kind',['short','overflow','unaligned','width','dtype','rank'])
 def test_chunked_rejects_bad_coverage_and_projection(kind):
     from omni_xpu_kernel.cute.sol_attn_v2 import _prepare_chunked

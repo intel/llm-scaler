@@ -24,21 +24,23 @@ ARG IMAGE_TAG
 ARG SYCL_TLA_REPOSITORY=https://github.com/intel/sycl-tla.git
 ARG SYCL_TLA_COMMIT=2fc09973bfdf15755090fcb0e3b6ad236408a992
 ARG COMFYUI_REPOSITORY=https://github.com/Comfy-Org/ComfyUI.git
-ARG COMFYUI_COMMIT=40c4fcdf513a4523e39d54a9d391908af8df8171
-ARG COMFYUI_VERSION=0.35.0
-ARG COMFYUI_FRONTEND_VERSION=1.51.10
-ARG COMFYUI_WORKFLOW_TEMPLATES_VERSION=0.11.57
+ARG COMFYUI_COMMIT=73c9bad4d21e7addbe1d13bc92eee0f1431b017d
+ARG COMFYUI_VERSION=0.37.0
+ARG COMFYUI_FRONTEND_VERSION=1.52.7
+ARG COMFYUI_WORKFLOW_TEMPLATES_VERSION=0.11.66
 ARG COMFYUI_MANAGER_VERSION=4.2.2
 ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
-ARG COMFY_KITCHEN_COMMIT=9a46ea72e3e9a639ec9cfc0af8d763614eb00b4d
-ARG COMFY_KITCHEN_VERSION=0.2.33
+ARG COMFY_KITCHEN_COMMIT=20a69c1ef0cbbb73675e3115aa78c0ea70a9a2b1
+ARG COMFY_KITCHEN_VERSION=0.2.35
+ARG COMFY_KITCHEN_PROVIDER_VERSION=0.2.35
 ARG COMFY_AIMDO_REPOSITORY=https://github.com/xiangyuT/comfy-aimdo-xpu.git
-ARG COMFY_AIMDO_COMMIT=a79b5668d0a79a957796bd9c539577a70d384aa1
-ARG COMFY_AIMDO_VERSION=0.5.3
+ARG COMFY_AIMDO_COMMIT=cc3729fc59eeab77bd4c8b28b80e49c9faa855d4
+ARG COMFY_AIMDO_VERSION=0.5.5
+ARG COMFY_AIMDO_PROVIDER_VERSION=0.5.5
 ARG COMFY_GGUF_REPOSITORY=https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git
 ARG COMFY_GGUF_COMMIT=39671fe73117ba97de7011e7e06e32599dcda06d
 ARG COMFY_NUNCHAKU_REPOSITORY=https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git
-ARG COMFY_NUNCHAKU_COMMIT=cc0f6236b6c329178ad4ef58452a874e774c7b8e
+ARG COMFY_NUNCHAKU_COMMIT=9f5604445f56154dd44e8b4acfed1aef868003c5
 ARG COMFY_NUNCHAKU_VERSION=1.2.1+xpu.3
 ARG LLM_SCALER_SOURCE_REVISION=unknown
 ARG LLM_SCALER_SOURCE_DIRTY=unknown
@@ -315,7 +317,7 @@ FROM python-base AS kitchen-wheel
 
 ARG COMFY_KITCHEN_REPOSITORY
 ARG COMFY_KITCHEN_COMMIT
-ARG COMFY_KITCHEN_VERSION
+ARG COMFY_KITCHEN_PROVIDER_VERSION
 ARG TORCH_VERSION
 ARG XPU_TARGET
 
@@ -331,7 +333,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     mkdir -p /wheels/kitchen-source /wheels/kitchen-provider && \
     pip wheel . --wheel-dir /wheels/kitchen-source \
         --no-deps --no-build-isolation && \
-    source_wheels=(/wheels/kitchen-source/comfy_kitchen-${COMFY_KITCHEN_VERSION}-*.whl) && \
+    source_wheels=(/wheels/kitchen-source/comfy_kitchen-${COMFY_KITCHEN_PROVIDER_VERSION}-*.whl) && \
     test "${#source_wheels[@]}" -eq 1 && \
     python packaging/xpu_runtime_provider/build_wheel.py \
         --source-wheel "${source_wheels[0]}" \
@@ -345,7 +347,7 @@ FROM python-base AS aimdo-wheel
 
 ARG COMFY_AIMDO_REPOSITORY
 ARG COMFY_AIMDO_COMMIT
-ARG COMFY_AIMDO_VERSION
+ARG COMFY_AIMDO_PROVIDER_VERSION
 ARG TORCH_VERSION
 ARG XPU_TARGET
 
@@ -362,10 +364,10 @@ RUN cd /llm && \
     UR_INCLUDE_DIR=/opt/venv/include/unified-runtime \
         ./scripts/build-linux-xpu.sh && \
     mkdir -p /wheels/aimdo-source /wheels/aimdo-provider && \
-    SETUPTOOLS_SCM_PRETEND_VERSION="${COMFY_AIMDO_VERSION}" \
+    SETUPTOOLS_SCM_PRETEND_VERSION="${COMFY_AIMDO_PROVIDER_VERSION}" \
         pip wheel . --wheel-dir /wheels/aimdo-source \
             --no-deps --no-build-isolation && \
-    source_wheels=(/wheels/aimdo-source/comfy_aimdo-${COMFY_AIMDO_VERSION}-*.whl) && \
+    source_wheels=(/wheels/aimdo-source/comfy_aimdo-${COMFY_AIMDO_PROVIDER_VERSION}-*.whl) && \
     test "${#source_wheels[@]}" -eq 1 && \
     python packaging/xpu_runtime_provider/build_wheel.py \
         --source-wheel "${source_wheels[0]}" \
@@ -405,9 +407,8 @@ FROM comfyui-deps AS builder-comfyui
 ARG IMAGE_TAG
 ARG XPU_TARGET
 ARG MAX_JOBS
-ARG COMFYUI_VERSION
-ARG COMFY_KITCHEN_VERSION
-ARG COMFY_AIMDO_VERSION
+ARG COMFY_KITCHEN_PROVIDER_VERSION
+ARG COMFY_AIMDO_PROVIDER_VERSION
 
 ENV TORCH_XPU_ARCH_LIST=${XPU_TARGET} \
     OMNI_XPU_DEVICE=${XPU_TARGET} \
@@ -434,8 +435,8 @@ COPY --from=kernel-wheel /wheels/ /wheels/
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-deps --force-reinstall \
         /wheels/omni_xpu_kernel-*.whl \
-        /wheels/providers/comfy_kitchen_xpu_runtime-${COMFY_KITCHEN_VERSION}-*.whl \
-        /wheels/providers/comfy_aimdo_xpu_runtime-${COMFY_AIMDO_VERSION}-*.whl && \
+        /wheels/providers/comfy_kitchen_xpu_runtime-${COMFY_KITCHEN_PROVIDER_VERSION}-*.whl \
+        /wheels/providers/comfy_aimdo_xpu_runtime-${COMFY_AIMDO_PROVIDER_VERSION}-*.whl && \
     pip check
 
 # The local custom node is intentionally a thin ComfyUI integration layer. It
@@ -497,9 +498,11 @@ ARG COMFYUI_MANAGER_VERSION
 ARG COMFY_KITCHEN_REPOSITORY
 ARG COMFY_KITCHEN_COMMIT
 ARG COMFY_KITCHEN_VERSION
+ARG COMFY_KITCHEN_PROVIDER_VERSION
 ARG COMFY_AIMDO_REPOSITORY
 ARG COMFY_AIMDO_COMMIT
 ARG COMFY_AIMDO_VERSION
+ARG COMFY_AIMDO_PROVIDER_VERSION
 ARG COMFY_GGUF_COMMIT
 ARG COMFY_NUNCHAKU_COMMIT
 ARG COMFY_NUNCHAKU_VERSION
@@ -532,10 +535,10 @@ LABEL org.opencontainers.image.version="${IMAGE_TAG}" \
       com.intel.omni.comfy-kitchen.version="${COMFY_KITCHEN_VERSION}" \
       com.intel.omni.comfy-aimdo.version="${COMFY_AIMDO_VERSION}" \
       com.intel.omni.comfy-kitchen-xpu-runtime.repository="${COMFY_KITCHEN_REPOSITORY}" \
-      com.intel.omni.comfy-kitchen-xpu-runtime.version="${COMFY_KITCHEN_VERSION}" \
+      com.intel.omni.comfy-kitchen-xpu-runtime.version="${COMFY_KITCHEN_PROVIDER_VERSION}" \
       com.intel.omni.comfy-kitchen-xpu-runtime.revision="${COMFY_KITCHEN_COMMIT}" \
       com.intel.omni.comfy-aimdo-xpu-runtime.repository="${COMFY_AIMDO_REPOSITORY}" \
-      com.intel.omni.comfy-aimdo-xpu-runtime.version="${COMFY_AIMDO_VERSION}" \
+      com.intel.omni.comfy-aimdo-xpu-runtime.version="${COMFY_AIMDO_PROVIDER_VERSION}" \
       com.intel.omni.comfy-aimdo-xpu-runtime.revision="${COMFY_AIMDO_COMMIT}" \
       com.intel.omni.comfy-gguf.revision="${COMFY_GGUF_COMMIT}" \
       com.intel.omni.comfy-nunchaku.version="${COMFY_NUNCHAKU_VERSION}" \
@@ -563,9 +566,11 @@ ENV OMNIXPU_INTERPOLATE_FIX=0 \
     OMNI_COMFYUI_WORKFLOW_TEMPLATES_VERSION="${COMFYUI_WORKFLOW_TEMPLATES_VERSION}" \
     OMNI_COMFYUI_MANAGER_VERSION="${COMFYUI_MANAGER_VERSION}" \
     OMNI_COMFY_KITCHEN_VERSION="${COMFY_KITCHEN_VERSION}" \
+    OMNI_COMFY_KITCHEN_PROVIDER_VERSION="${COMFY_KITCHEN_PROVIDER_VERSION}" \
     OMNI_COMFY_KITCHEN_PROVIDER_REPOSITORY="${COMFY_KITCHEN_REPOSITORY}" \
     OMNI_COMFY_KITCHEN_PROVIDER_REVISION="${COMFY_KITCHEN_COMMIT}" \
     OMNI_COMFY_AIMDO_VERSION="${COMFY_AIMDO_VERSION}" \
+    OMNI_COMFY_AIMDO_PROVIDER_VERSION="${COMFY_AIMDO_PROVIDER_VERSION}" \
     OMNI_COMFY_AIMDO_PROVIDER_REPOSITORY="${COMFY_AIMDO_REPOSITORY}" \
     OMNI_COMFY_AIMDO_PROVIDER_REVISION="${COMFY_AIMDO_COMMIT}" \
     OMNI_COMFY_GGUF_REVISION="${COMFY_GGUF_COMMIT}" \

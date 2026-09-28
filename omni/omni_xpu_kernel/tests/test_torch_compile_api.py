@@ -14,7 +14,7 @@ import pytest
 import torch
 
 import omni_xpu_kernel as omni
-from omni_xpu_kernel import cute, fp8, gguf, int8, layout, linear, norm, rotary, sdp, svdq
+from omni_xpu_kernel import cute, fp8, gguf, int8, kitchen, layout, linear, norm, rotary, sdp, svdq
 
 
 APIS = {
@@ -42,6 +42,13 @@ APIS = {
     "sdp": ("sdp",),
     "linear": ("onednn_w8a16_fp8", "try_onednn_w8a16_fp8"),
     "layout": ("cat_pad_bmg",),
+    "kitchen": ("deltanet_conv_step", "gated_delta_decode_fused",
+                "gemv_awq_w4a16",
+                "group_norm_silu_pad3d", "group_norm_silu_pad3d_out",
+                "fp16_linear", "fp16_conv3d", "fp16_conv3d_out",
+                "rms_norm_for_int8", "rms_norm_quantize_int8",
+                "rms_norm_convrot_quantize_int8",
+                "scaled_residual"),
 }
 API_NAMES = tuple(f"{module}.{name}" for module, names in APIS.items() for name in names)
 
@@ -92,6 +99,64 @@ def case(api, *, dtype=torch.bfloat16, rows=3):
         x = _rand((rows, 2048), torch.float16)
         weight = _rand((1024, 2048), torch.float32).to(torch.float8_e4m3fn)
         return function, (x, weight, torch.full((1024,), 0.125, device="xpu")), {}
+    if module == "kitchen":
+        if name == "gemv_awq_w4a16":
+            x = _rand((1, 128), torch.bfloat16)
+            packed = torch.randint(
+                0, 256, (32, 64), device="xpu", dtype=torch.uint8,
+            ).view(torch.int8)
+            scales = _rand((2, 32), torch.bfloat16).abs() * 0.01
+            zeros = _rand((2, 32), torch.bfloat16) * 0.01
+            return function, (x, packed, scales, zeros, None, 64), {}
+        if name == "deltanet_conv_step":
+            proj = _rand((1, 2, 16), dtype).contiguous()
+            state = _rand((1, 16, 3), dtype).contiguous()
+            weight = _rand((16, 1, 4), dtype).contiguous()
+            snapshots = torch.empty((1, 1, 16, 3), device="xpu", dtype=dtype)
+            return function, (proj, state, weight, None, snapshots), {}
+        if name == "gated_delta_decode_fused":
+            x = _rand((1, 2, 32), dtype).contiguous()
+            state = _rand((1, 2, 8, 8), torch.float32).contiguous()
+            mixed = _rand((1, 32, 2), dtype).contiguous()
+            weight = _rand((2, 32), dtype).contiguous()
+            bias = _rand((2,), torch.float32).contiguous()
+            decay = -bias.abs() - 0.5
+            z = _rand((1, 2, 16), dtype).contiguous()
+            norm_weight = torch.ones(8, device="xpu", dtype=dtype)
+            snapshots = torch.empty((1, 1, 2, 8, 8), device="xpu", dtype=torch.float32)
+            return function, (mixed, x, weight, weight, bias, decay, state,
+                              8, 1, 8**-0.5, z, norm_weight, 1e-6, snapshots), {}
+        if name in ("group_norm_silu_pad3d", "group_norm_silu_pad3d_out"):
+            x = _rand((1, 4, 2, 5, 6), dtype)
+            if name.endswith("_out"):
+                out = torch.empty((1, 4, 3, 7, 8), device="xpu", dtype=dtype)
+                return function, (x, None, None, 2, 1e-6,
+                                  [1, 1, 1, 1, 1], True, True, out), {}
+            return function, (x, None, None, 2, 1e-6, [1, 1, 1, 1, 1], True), {}
+        if name == "fp16_linear":
+            x = _rand((rows, 16), torch.float16)
+            weight = _rand((8, 16), torch.float16)
+            return function, (x, weight), {}
+        if name in ("fp16_conv3d", "fp16_conv3d_out"):
+            x = _rand((1, 4, 3, 5, 5), torch.float16)
+            weight = _rand((6, 4, 2, 3, 3), torch.float16)
+            if name.endswith("_out"):
+                out = torch.empty((1, 6, 2, 3, 3), device="xpu", dtype=torch.float16)
+                return function, (x, weight, None, None, [1, 1, 1], out), {}
+            return function, (x, weight), {}
+        if name == "rms_norm_for_int8":
+            x = _rand((rows, 32), dtype)
+            return function, (x, torch.ones(32, device="xpu", dtype=dtype)), {}
+        if name == "rms_norm_quantize_int8":
+            x = _rand((rows, 32), dtype)
+            return function, (x, torch.ones(32, device="xpu", dtype=dtype)), {}
+        if name == "rms_norm_convrot_quantize_int8":
+            x = _rand((rows, 256), dtype)
+            return function, (x, torch.ones(256, device="xpu", dtype=dtype)), {}
+        if name == "scaled_residual":
+            x = _rand((rows, 32), dtype)
+            return function, (x, _rand(x.shape, dtype),
+                              torch.ones(32, device="xpu", dtype=dtype)), {}
     if module == "svdq":
         x = _rand((rows, 128), dtype)
         packed = _packed(32)
@@ -250,7 +315,7 @@ def test_public_tensor_inventory_has_no_unclassified_api():
             if f.name.startswith("supports_") or f.name.endswith("_supported") or f.name == "is_available" or "_cache_" in f.name:continue
             actual.add(module + "." + f.name)
     assert actual == set(API_NAMES)
-    assert len(actual) == 75
+    assert len(actual) == 87
 
 
 @pytest.mark.parametrize("api", API_NAMES)

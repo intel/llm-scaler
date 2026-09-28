@@ -3,6 +3,9 @@
 #include <sycl/ext/intel/esimd.hpp>
 
 #include <tuple>
+#include <vector>
+#include <cmath>
+#include <functional>
 
 #include "kernel_tuning_overrides.h"
 #include "utils.h"
@@ -49,6 +52,101 @@ inline simd<float, GroupSize> load_rotated(
     simd<InputT, GroupSize> rounded = values;
     simd<float, GroupSize> result = rounded;
     return result;
+}
+
+template<typename InputT, int GroupSize>
+inline simd<float, GroupSize> load_rms_rotated(
+    const InputT* __restrict__ input,
+    const InputT* __restrict__ norm_weight,
+    float inverse_rms) {
+    const simd<InputT, GroupSize> source =
+        block_load<InputT, GroupSize>(input);
+    const simd<InputT, GroupSize> gamma =
+        block_load<InputT, GroupSize>(norm_weight);
+    simd<float, GroupSize> normalized = source;
+    normalized *= inverse_rms;
+    normalized *= simd<float, GroupSize>(gamma);
+    // Match the separate RMSNorm output's input-dtype rounding before rotation.
+    const simd<InputT, GroupSize> norm_rounded = normalized;
+    simd<float, GroupSize> values = norm_rounded;
+    radix4_hadamard_stage<1, GroupSize>(values);
+    values *= 1.0f / sycl::sqrt(static_cast<float>(GroupSize));
+    const simd<InputT, GroupSize> rotated_rounded = values;
+    return simd<float, GroupSize>(rotated_rounded);
+}
+
+template<typename InputT, int GroupSize>
+void rms_norm_convrot_quantize_kernel(
+    const InputT* __restrict__ input,
+    const InputT* __restrict__ norm_weight,
+    int8_t* __restrict__ output,
+    float* __restrict__ scales,
+    int64_t rows,
+    int64_t groups,
+    float epsilon,
+    const at::Device& device) {
+    constexpr int WorkGroupSize = OMNI_CONVROT_QUANT_WG_SIZE;
+    const int64_t padded =
+        (rows + WorkGroupSize - 1) / WorkGroupSize * WorkGroupSize;
+    auto cgf = [&](sycl::handler& handle) {
+        handle.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(padded),
+                              sycl::range<1>(WorkGroupSize)),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                const int64_t row = item.get_global_id(0);
+                if (row >= rows) return;
+                const int64_t width = groups * GroupSize;
+                const int64_t row_start = row * width;
+                float square_sum = 0.0f;
+                for (int64_t group = 0; group < groups; ++group) {
+                    const int64_t offset = group * GroupSize;
+                    const simd<InputT, GroupSize> source =
+                        block_load<InputT, GroupSize>(input + row_start + offset);
+                    const simd<float, GroupSize> values = source;
+                    square_sum += reduce<float>(
+                        values * values, std::plus<>{});
+                }
+                const float inverse_rms = 1.0f / sycl::sqrt(
+                    square_sum / static_cast<float>(width) + epsilon);
+
+                float row_max = 0.0f;
+                for (int64_t group = 0; group < groups; ++group) {
+                    const int64_t offset = group * GroupSize;
+                    const simd<float, GroupSize> values =
+                        load_rms_rotated<InputT, GroupSize>(
+                            input + row_start + offset,
+                            norm_weight + offset, inverse_rms);
+                    const float group_max = hmax<float>(
+                        sycl::ext::intel::esimd::abs<float, GroupSize>(values));
+                    row_max = group_max > row_max ? group_max : row_max;
+                }
+                float scale = row_max / 127.0f;
+                if (scale < 1e-30f) scale = 1e-30f;
+                const float inverse_scale = 1.0f / scale;
+                scales[row] = scale;
+
+                const simd<float, GroupSize> clamp_lo(-128.0f);
+                const simd<float, GroupSize> clamp_hi(127.0f);
+                for (int64_t group = 0; group < groups; ++group) {
+                    const int64_t offset = group * GroupSize;
+                    const simd<float, GroupSize> values =
+                        load_rms_rotated<InputT, GroupSize>(
+                            input + row_start + offset,
+                            norm_weight + offset, inverse_rms);
+                    simd<float, GroupSize> quantized =
+                        sycl::ext::intel::esimd::rnde<float, GroupSize>(
+                            values * inverse_scale);
+                    quantized = sycl::ext::intel::esimd::max<float, GroupSize>(
+                        sycl::ext::intel::esimd::min<float, GroupSize>(
+                            quantized, clamp_hi), clamp_lo);
+                    const simd<int8_t, GroupSize> packed = quantized;
+                    block_store<int8_t, GroupSize>(
+                        output + row_start + offset, packed);
+                }
+            });
+    };
+    utils::submit_kernel(
+        cgf, device, "kitchen_rms_norm_convrot_quantize_int8");
 }
 
 template<typename InputT, int GroupSize>
@@ -154,6 +252,68 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_fused(
         dispatch_group<bf16>(input, output, scales, group_size);
     } else {
         dispatch_group<fp16>(input, output, scales, group_size);
+    }
+    return {output, scales};
+}
+
+std::tuple<torch::Tensor, torch::Tensor> rms_norm_convrot_quantize_int8(
+    torch::Tensor input,
+    torch::Tensor norm_weight,
+    double eps,
+    int64_t group_size) {
+    TORCH_CHECK(input.device().is_xpu() && input.dim() >= 1 &&
+                    input.is_contiguous() && input.size(-1) > 0,
+                "input must be contiguous XPU [...,K] with K>0");
+    TORCH_CHECK(input.scalar_type() == torch::kBFloat16 ||
+                    input.scalar_type() == torch::kFloat16,
+                "input must be BF16 or FP16");
+    TORCH_CHECK(norm_weight.device() == input.device() &&
+                    norm_weight.scalar_type() == input.scalar_type() &&
+                    norm_weight.dim() == 1 &&
+                    norm_weight.numel() == input.size(-1) &&
+                    norm_weight.is_contiguous(),
+                "norm_weight must be contiguous input-dtype [K] on XPU");
+    TORCH_CHECK(group_size == 64 || group_size == 256,
+                "group_size must be 64 or 256");
+    TORCH_CHECK(input.size(-1) % group_size == 0,
+                "group_size must divide the input width");
+    TORCH_CHECK(std::isfinite(eps) && eps >= 0.0,
+                "eps must be finite and nonnegative");
+    const int64_t width = input.size(-1);
+    const int64_t rows = input.numel() / width;
+    auto output = torch::empty(input.sizes(), input.options().dtype(torch::kInt8));
+    std::vector<int64_t> scale_sizes = input.sizes().vec();
+    scale_sizes.back() = 1;
+    auto scales = torch::empty(scale_sizes, input.options().dtype(torch::kFloat));
+    if (rows == 0) return {output, scales};
+    const int64_t groups = width / group_size;
+    const float epsilon = static_cast<float>(eps);
+    auto* q_ptr = output.data_ptr<int8_t>();
+    auto* scale_ptr = scales.data_ptr<float>();
+    if (input.scalar_type() == torch::kBFloat16) {
+        const auto* x_ptr = reinterpret_cast<const bf16*>(input.data_ptr());
+        const auto* w_ptr = reinterpret_cast<const bf16*>(norm_weight.data_ptr());
+        if (group_size == 64) {
+            rms_norm_convrot_quantize_kernel<bf16, 64>(
+                x_ptr, w_ptr, q_ptr, scale_ptr, rows, groups, epsilon,
+                input.device());
+        } else {
+            rms_norm_convrot_quantize_kernel<bf16, 256>(
+                x_ptr, w_ptr, q_ptr, scale_ptr, rows, groups, epsilon,
+                input.device());
+        }
+    } else {
+        const auto* x_ptr = reinterpret_cast<const fp16*>(input.data_ptr());
+        const auto* w_ptr = reinterpret_cast<const fp16*>(norm_weight.data_ptr());
+        if (group_size == 64) {
+            rms_norm_convrot_quantize_kernel<fp16, 64>(
+                x_ptr, w_ptr, q_ptr, scale_ptr, rows, groups, epsilon,
+                input.device());
+        } else {
+            rms_norm_convrot_quantize_kernel<fp16, 256>(
+                x_ptr, w_ptr, q_ptr, scale_ptr, rows, groups, epsilon,
+                input.device());
+        }
     }
     return {output, scales};
 }

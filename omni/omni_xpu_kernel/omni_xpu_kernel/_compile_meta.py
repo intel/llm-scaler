@@ -15,6 +15,64 @@ def void(*args, **kwargs):
     return None
 
 
+def kitchen_delta_conv(proj, conv_state, conv_w, conv_b=None, snapshots=None):
+    return proj.new_empty((proj.shape[0], proj.shape[2], proj.shape[1]))
+
+
+def kitchen_gated_delta(mixed_qkv, x, w_a, w_b, dt_bias, g_decay, state,
+                        key_dim, key_heads, scale, z, norm_weight, eps,
+                        snapshots=None):
+    return x.new_empty((x.shape[0], x.shape[1], state.shape[1], state.shape[3]))
+
+
+def kitchen_rms_norm_quantize(input, weight, eps=1e-6):
+    return (
+        input.new_empty(input.shape, dtype=torch.int8),
+        input.new_empty((*input.shape[:-1], 1), dtype=torch.float32),
+    )
+
+
+def kitchen_rms_norm_convrot_quantize(input, weight, eps=1e-6, group_size=256):
+    return kitchen_rms_norm_quantize(input, weight, eps)
+
+
+def kitchen_group_norm_pad(input, weight=None, bias=None, groups=32,
+                           eps=1e-6, pad=(0, 0, 0, 0, 0), silu=True,
+                           zero_pad=False):
+    n, c, t, h, w = input.shape
+    return input.new_empty((n, t + pad[4], h + pad[2] + pad[3],
+                            w + pad[0] + pad[1], c)).permute(0, 4, 1, 2, 3)
+
+
+def kitchen_awq(input, packed, scales, zeros, bias=None, group_size=64):
+    return input.new_empty((*input.shape[:-1], packed.shape[0]),
+                           dtype=scales.dtype)
+
+
+def kitchen_group_norm_pad_out(input, weight, bias, groups, eps, pad, silu,
+                               zero_pad, out):
+    return None
+
+
+def kitchen_linear(input, weight, bias=None, residual=None,
+                   residual_scale=None):
+    return input.new_empty((*input.shape[:-1], weight.shape[0]))
+
+
+def kitchen_conv3d(input, weight, bias=None, residual=None,
+                   stride=(1, 1, 1)):
+    n, _, t, h, w = input.shape
+    out_t = (t - weight.shape[2]) // stride[0] + 1
+    out_h = (h - weight.shape[3]) // stride[1] + 1
+    out_w = (w - weight.shape[4]) // stride[2] + 1
+    return input.new_empty((n, out_t, out_h, out_w, weight.shape[0])).permute(
+        0, 4, 1, 2, 3)
+
+
+def kitchen_conv3d_out(input, weight, bias, residual, stride, out):
+    return None
+
+
 def norm_projection(input, norm_weight, proj_weight, eps=1e-6):
     return input.new_empty((*input.shape[:-1], proj_weight.shape[0]))
 

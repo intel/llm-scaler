@@ -129,6 +129,68 @@ def require_equal(label: str, actual: str, expected: str) -> None:
         raise RuntimeError(f"{label}: expected {expected!r}, got {actual!r}")
 
 
+def require_provider_version_compatibility(
+    provider_id: str,
+    manifest: dict[str, object],
+    *,
+    official_version: str,
+    provider_version: str,
+    source_repository: str,
+) -> None:
+    """Require the pinned source wheel to declare compatibility with the official package."""
+
+    provider_distribution = manifest.get("provider_distribution")
+    canonical_distribution = manifest.get("canonical_distribution")
+    source = manifest.get("source")
+    if not all(
+        isinstance(value, dict)
+        for value in (provider_distribution, canonical_distribution, source)
+    ):
+        raise RuntimeError(f"{provider_id} manifest is missing version contract fields")
+
+    require_equal(
+        f"{provider_id} provider manifest distribution version",
+        str(provider_distribution.get("version", "")),
+        provider_version,
+    )
+    require_equal(
+        f"{provider_id} provider manifest source version",
+        str(source.get("version", "")),
+        provider_version,
+    )
+    require_equal(
+        f"{provider_id} provider manifest source repository",
+        str(source.get("repository", "")),
+        source_repository,
+    )
+    compatible_versions = canonical_distribution.get("compatible_versions")
+    if not isinstance(compatible_versions, list) or not all(
+        isinstance(version, str) for version in compatible_versions
+    ):
+        raise RuntimeError(
+            f"{provider_id} manifest compatible_versions must be a string list"
+        )
+    if official_version not in compatible_versions:
+        raise RuntimeError(
+            f"{provider_id} source {provider_version} is incompatible with "
+            f"official version {official_version}; accepts {compatible_versions}"
+        )
+
+
+def require_provider_package_is_disjoint(
+    distribution_name: str,
+    canonical_import: str,
+    distribution_files,
+) -> None:
+    """Ensure the private provider distribution owns no official package files."""
+
+    conflicting_prefix = f"{canonical_import}/"
+    if any(str(path).startswith(conflicting_prefix) for path in distribution_files):
+        raise RuntimeError(
+            f"{distribution_name} illegally owns canonical {canonical_import} files"
+        )
+
+
 def require_full_revision(label: str, revision: str) -> None:
     if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
         raise RuntimeError(
@@ -538,10 +600,20 @@ def main() -> None:
     expected_onednn_patch_sha256 = os.environ["OMNI_ONEDNN_PATCH_SHA256"]
     expected_comfyui = os.environ["OMNI_COMFYUI_VERSION"]
     expected_kitchen = os.environ["OMNI_COMFY_KITCHEN_VERSION"]
+    expected_kitchen_provider = os.environ[
+        "OMNI_COMFY_KITCHEN_PROVIDER_VERSION"
+    ]
+    expected_kitchen_provider_repository = os.environ[
+        "OMNI_COMFY_KITCHEN_PROVIDER_REPOSITORY"
+    ]
     expected_kitchen_provider_revision = os.environ[
         "OMNI_COMFY_KITCHEN_PROVIDER_REVISION"
     ]
     expected_aimdo = os.environ["OMNI_COMFY_AIMDO_VERSION"]
+    expected_aimdo_provider = os.environ["OMNI_COMFY_AIMDO_PROVIDER_VERSION"]
+    expected_aimdo_provider_repository = os.environ[
+        "OMNI_COMFY_AIMDO_PROVIDER_REPOSITORY"
+    ]
     expected_aimdo_provider_revision = os.environ[
         "OMNI_COMFY_AIMDO_PROVIDER_REVISION"
     ]
@@ -555,8 +627,8 @@ def main() -> None:
             "torchvision": expected_torchvision,
             "torchaudio": expected_torchaudio,
             "omni-xpu-kernel": importlib.metadata.version("omni-xpu-kernel"),
-            "comfy-kitchen-xpu-runtime": expected_kitchen,
-            "comfy-aimdo-xpu-runtime": expected_aimdo,
+            "comfy-kitchen-xpu-runtime": expected_kitchen_provider,
+            "comfy-aimdo-xpu-runtime": expected_aimdo_provider,
         }
     )
 
@@ -615,18 +687,24 @@ def main() -> None:
     provider_expectations = {
         "comfy_aimdo.xpu": (
             expected_aimdo,
+            expected_aimdo_provider,
+            expected_aimdo_provider_repository,
             expected_aimdo_provider_revision,
             "comfy_aimdo",
         ),
         "comfy_kitchen.xpu": (
             expected_kitchen,
+            expected_kitchen_provider,
+            expected_kitchen_provider_repository,
             expected_kitchen_provider_revision,
             "comfy_kitchen",
         ),
     }
     provider_details = {}
     for provider_id, (
-        expected_version,
+        expected_official_version,
+        expected_provider_version,
+        expected_repository,
         expected_revision,
         canonical_import,
     ) in provider_expectations.items():
@@ -635,7 +713,14 @@ def main() -> None:
         require_equal(
             f"{provider_id} distribution version",
             importlib.metadata.version(distribution_name),
-            expected_version,
+            expected_provider_version,
+        )
+        require_provider_version_compatibility(
+            provider_id,
+            provider.manifest,
+            official_version=expected_official_version,
+            provider_version=expected_provider_version,
+            source_repository=expected_repository,
         )
         require_equal(
             f"{provider_id} manifest source revision",
@@ -646,15 +731,14 @@ def main() -> None:
             f"{provider_id} manifest source revision", expected_revision
         )
         distribution = importlib.metadata.distribution(distribution_name)
-        if any(
-            str(path).startswith(f"{canonical_import}/")
-            for path in (distribution.files or ())
-        ):
-            raise RuntimeError(
-                f"{distribution_name} illegally owns canonical {canonical_import} files"
-            )
+        require_provider_package_is_disjoint(
+            distribution_name,
+            canonical_import,
+            distribution.files or (),
+        )
         provider_details[provider_id] = {
-            "version": expected_version,
+            "official_version": expected_official_version,
+            "provider_version": expected_provider_version,
             "revision": expected_revision,
             "canonical_root": str(provider.canonical_root),
         }
@@ -705,6 +789,9 @@ def main() -> None:
 
     comfyui_version = run_path("/llm/ComfyUI/comfyui_version.py")["__version__"]
     require_equal("ComfyUI version", comfyui_version, expected_comfyui)
+    # The vendored package has no parent pyproject.toml, so Kitchen resolves
+    # __version__ from the installed canonical distribution. Provider/source
+    # versions are checked independently against the provider manifest above.
     require_equal(
         "Kitchen module version",
         comfy_kitchen.__version__,
@@ -892,9 +979,11 @@ def main() -> None:
         f"manager={comfyui_dependency_versions['comfyui-manager']}, "
         f"kitchen={expected_kitchen}, "
         "kitchen_provider="
+        f"{provider_details['comfy_kitchen.xpu']['provider_version']}@"
         f"{provider_details['comfy_kitchen.xpu']['revision'][:12]}, "
         f"aimdo={expected_aimdo}, "
         "aimdo_provider="
+        f"{provider_details['comfy_aimdo.xpu']['provider_version']}@"
         f"{provider_details['comfy_aimdo.xpu']['revision'][:12]}, "
         f"provider_wheels={provider_wheel_hashes}, "
         f"runtime_constraints={runtime_constraints}, "

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import ast
+import functools
 import importlib.util
+import hashlib
+import os
 import sys
 import types
 from pathlib import Path
@@ -14,6 +18,31 @@ import torch
 _PLUGIN = Path(__file__).parents[1] / "ComfyUI-OmniXPU"
 _PATCHES = _PLUGIN / "patches"
 _ADAPTERS = _PLUGIN / "adapters"
+
+
+def _pinned_comfy_wrap_attn():
+    key = "OMNIXPU_TEST_COMFY_ATTENTION_SOURCE"
+    if key not in os.environ:
+        pytest.skip(f"set {key} to the pinned Comfy attention.py for this integration check")
+    source = Path(os.environ[key])
+    if not source.is_file():
+        pytest.fail(f"explicit pinned Comfy source is missing: {source}")
+    contents = source.read_bytes()
+    if hashlib.sha256(contents).hexdigest() != "9cafaafaf93ff53e8cbefb5e4a204014019985df2da8c1996bf40f1235fc2960":
+        pytest.fail("explicit Comfy attention.py is not pinned 73c9 source")
+    module = ast.parse(contents.decode("utf-8"), filename=str(source))
+    functions = [node for node in module.body
+                 if isinstance(node, ast.FunctionDef) and node.name == "wrap_attn"]
+    if len(functions) != 1:
+        pytest.fail("pinned Comfy source does not define exactly one wrap_attn")
+    namespace = {
+        "functools": functools,
+        # This focused fixture calls wrap_attn with plain fake tensors, so its
+        # container branch must remain false without importing Comfy runtime.
+        "AttentionTensorContainer": type("AttentionTensorContainer", (), {}),
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), namespace)
+    return namespace["wrap_attn"]
 
 
 def _load_module(name: str, path: Path):
@@ -37,6 +66,7 @@ class _FakeTensor:
         stride=None,
         batch=1,
         non_finite=False,
+        storage_offset=0,
     ):
         if pre_shaped:
             self.shape = (batch, heads, seq, dim_head)
@@ -52,6 +82,7 @@ class _FakeTensor:
         self.dtype = dtype
         self.device = types.SimpleNamespace(type="xpu")
         self.non_finite = non_finite
+        self._storage_offset = storage_offset
         self._non_finite_checks = []
 
     @classmethod
@@ -62,6 +93,7 @@ class _FakeTensor:
         tensor.dtype = source.dtype
         tensor.device = source.device
         tensor.non_finite = source.non_finite
+        tensor._storage_offset = source._storage_offset
         tensor._non_finite_checks = source._non_finite_checks
         return tensor
 
@@ -113,8 +145,29 @@ class _FakeTensor:
         dims[dim0], dims[dim1] = dims[dim1], dims[dim0]
         return self.permute(*dims)
 
+    def __getitem__(self, key):
+        if not isinstance(key, slice):
+            raise TypeError("the attention fixture supports batch slices only")
+        start, stop, step = key.indices(self.shape[0])
+        if step != 1:
+            raise ValueError("the attention fixture requires unit batch steps")
+        result = self._with_metadata(
+            self, (stop - start, *self.shape[1:]), self._stride,
+        )
+        result._storage_offset += start * self._stride[0]
+        return result
+
     def stride(self):
         return self._stride
+
+    def storage_offset(self):
+        return self._storage_offset
+
+    def as_strided(self, shape, stride, storage_offset=None):
+        tensor = self._with_metadata(self, shape, stride)
+        if storage_offset is not None:
+            tensor._storage_offset = storage_offset
+        return tensor
 
     def __ne__(self, other):
         self._non_finite_checks.append(True)
@@ -123,6 +176,18 @@ class _FakeTensor:
     @property
     def non_finite_checks(self):
         return len(self._non_finite_checks)
+
+
+class _FakeMask:
+    def __init__(self, q, kv, *, dtype=torch.bool, contiguous=True, rank=2):
+        self.shape = (q, kv) if rank == 2 else (1, 1, q, kv)
+        self.ndim = rank
+        self.dtype = dtype
+        self.device = types.SimpleNamespace(type="xpu")
+        self._contiguous = contiguous
+
+    def is_contiguous(self):
+        return self._contiguous
 
 
 def _load_patch(
@@ -138,6 +203,7 @@ def _load_patch(
     d128_bhld_error=None,
     h3_vae_d64_capable=True,
     h3_vae_d64_error=None,
+    wrap_attn=None,
 ):
     if backend is None:
         monkeypatch.delenv("OMNI_ATTN_BACKEND", raising=False)
@@ -168,7 +234,7 @@ def _load_patch(
         return None
 
     attention = types.ModuleType("comfy.ldm.modules.attention")
-    attention.wrap_attn = lambda fn: fn
+    attention.wrap_attn = wrap_attn or (lambda fn: fn)
     attention.attention_basic = original_attention
     attention.attention_pytorch = torch_attention
     attention.optimized_attention = original_attention
@@ -752,6 +818,363 @@ def test_bmg_b1_self_keeps_legacy_cute_route(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("q_len", "kv_len", "pre_shaped"),
+    [
+        (2048, 2049, False),
+        (2049, 4099, True),
+        (4032, 4040, False),
+        (4032, 8078, True),
+        (4032, 12188, False),
+        (4097, 8222, True),
+        (2048, (2 ** 31 - 1) // 4096, True),
+    ],
+)
+def test_bmg_b1_dense_prefix_rectangular_uses_cute(
+    monkeypatch, q_len, kv_len, pre_shaped
+):
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=q_len, heads=32, pre_shaped=pre_shaped)
+    kv = _FakeTensor(seq=kv_len, heads=32, pre_shaped=pre_shaped)
+
+    result = attention.optimized_attention(
+        q, kv, kv, heads=32, skip_reshape=pre_shaped
+    )
+
+    assert isinstance(result, _FakeTensor)
+    assert result.shape == (1, q_len, 32 * 128)
+    assert calls == ["cute_d128_bhld"]
+    assert patch.get_stats()["routes"] == {
+        "bmg_b1_bf16_d128_prefix_rectangular": 1
+    }
+
+
+def test_bmg_b1_dense_prefix_rectangular_keeps_bhld_output_request(monkeypatch):
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=2049, heads=32)
+    kv = _FakeTensor(seq=6150, heads=32)
+
+    result = attention.optimized_attention(
+        q, kv, kv, heads=32, skip_reshape=True, skip_output_reshape=True
+    )
+
+    assert result.shape == (1, 32, 2049, 128)
+    assert calls == ["cute_d128_bhld"]
+    assert patch.get_stats()["routes"] == {
+        "bmg_b1_bf16_d128_prefix_rectangular": 1
+    }
+
+
+def test_bmg_b1_prefix_segment_normalizes_unused_batch_stride(monkeypatch):
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(
+        seq=2049, heads=32, pre_shaped=False,
+        stride=(2200 * 4096, 4096, 1), storage_offset=151 * 4096,
+    )
+    kv = _FakeTensor(seq=2050, heads=32, pre_shaped=False)
+    prepared = []
+
+    def observe(q_bhld, k_bhld, v_bhld):
+        prepared.append((q_bhld, k_bhld, v_bhld))
+        return q_bhld
+
+    monkeypatch.setattr(patch._backend_sdp, "sdp_bhld_d128", observe)
+    result = attention.optimized_attention(q, kv, kv, heads=32)
+
+    assert result.shape == (1, 2049, 4096)
+    assert calls == []
+    assert len(prepared) == 1
+    q_bhld, k_bhld, v_bhld = prepared[0]
+    assert q_bhld.stride() == (2049 * 4096, 128, 4096, 1)
+    assert q_bhld.storage_offset() == q.storage_offset()
+    assert k_bhld.stride() == v_bhld.stride() == (2050 * 4096, 128, 4096, 1)
+    assert patch.get_stats()["routes"] == {
+        "bmg_b1_bf16_d128_prefix_rectangular": 1
+    }
+
+
+def test_bmg_b1_prefix_segment_cpu_tensor_view_has_no_copy(monkeypatch):
+    patch, _, _ = _load_patch(monkeypatch, target="bmg")
+    width = 32 * 128
+    backing = torch.arange(23 * width, dtype=torch.float32).view(1, 23, width)
+    segment = backing[:, 7:17]
+    assert segment.stride(0) == 23 * width
+    assert segment.storage_offset() == 7 * width
+
+    for source, pre_shaped in (
+        (segment, False),
+        (segment.view(1, 10, 32, 128).transpose(1, 2), True),
+    ):
+        view = patch._b1_dense_segment_bhld(source, 10, 32, 128, pre_shaped)
+        expected = segment.view(1, 10, 32, 128).transpose(1, 2)
+        assert view.shape == (1, 32, 10, 128)
+        assert view.stride() == (10 * width, 128, width, 1)
+        assert view.storage_offset() == source.storage_offset()
+        assert view.data_ptr() == source.data_ptr()
+        assert view.untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
+        assert torch.equal(view, expected)
+
+    assert patch._b1_dense_segment_bhld(segment[:, ::2], 5, 32, 128, False) is None
+    packed = torch.empty(1, 32, 23, 128)[:, :, 7:17]
+    assert patch._b1_dense_segment_bhld(packed, 10, 32, 128, True) is None
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU unavailable")
+def test_bmg_b1_prefix_segment_xpu_dispatch_preserves_source_storage(monkeypatch):
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    width = 32 * 128
+    backing = torch.randn((1, 2055, width), device="xpu", dtype=torch.bfloat16)
+    q = backing[:, 6:2055]
+    k = torch.randn((1, 2057, width), device="xpu", dtype=torch.bfloat16)[:, 7:]
+    v = torch.randn((1, 2059, width), device="xpu", dtype=torch.bfloat16)[:, 9:]
+    prepared = []
+
+    def observe(q_bhld, k_bhld, v_bhld):
+        prepared.append((q_bhld, k_bhld, v_bhld))
+        return q_bhld
+
+    monkeypatch.setattr(patch._backend_sdp, "sdp_bhld_d128", observe)
+    out = attention.optimized_attention(q, k, v, heads=32)
+
+    assert calls == []
+    assert len(prepared) == 1
+    for source, tensor in zip((q, k, v), prepared[0]):
+        assert tensor.data_ptr() == source.data_ptr()
+        assert tensor.untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
+        assert tensor.storage_offset() == source.storage_offset()
+    assert prepared[0][0].stride() == (2049 * width, 128, width, 1)
+    assert out.shape == (1, 2049, width)
+    assert out.data_ptr() == q.data_ptr()
+    assert patch.get_stats()["routes"] == {
+        "bmg_b1_bf16_d128_prefix_rectangular": 1
+    }
+
+
+@pytest.mark.parametrize(
+    ("q_len", "kv_len", "batch", "kwargs"),
+    [
+        (1024, 2048, 1, {}),
+        (1025, 2050, 1, {}),
+        (2047, 4095, 1, {}),
+        (1024, 1024, 1, {"mask": _FakeTensor(seq=1024, heads=32)}),
+        (2048, 4096, 1, {"mask": _FakeTensor(seq=2048, heads=32)}),
+        (2048, 4096, 1, {"attn_precision": "fp32"}),
+        (2048, 4096, 1, {"dropout_p": 0.1}),
+        (2048, 4096, 1, {"is_causal": True}),
+        (2048, 4096, 1, {"enable_gqa": True}),
+        (2048, 4096, 1, {"scale": 0.5}),
+        (4032, 12188, 2, {}),
+        (2048, (2 ** 31 - 1) // 4096 + 1, 1, {}),
+    ],
+)
+def test_bmg_b1_prefix_rectangular_unsupported_semantics_keep_fallback(
+    monkeypatch, q_len, kv_len, batch, kwargs
+):
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=q_len, heads=32, batch=batch)
+    kv = _FakeTensor(seq=kv_len, heads=32, batch=batch)
+
+    result = attention.optimized_attention(
+        q, kv, kv, heads=32, skip_reshape=True, **kwargs
+    )
+
+    assert result == "torch-output"
+    assert calls == ["torch"]
+    assert patch.get_stats()["routes"] == {}
+
+
+def test_bmg_b1_prefix_rectangular_requires_dense_layout_and_no_grad(monkeypatch):
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=2049, heads=32)
+    kv = _FakeTensor(seq=8193, heads=32)
+    q.requires_grad = True
+
+    assert attention.optimized_attention(
+        q, kv, kv, heads=32, skip_reshape=True
+    ) == "torch-output"
+
+    q.requires_grad = False
+    q._stride = (2049 * 4096, 128, 8192, 1)
+    assert attention.optimized_attention(
+        q, kv, kv, heads=32, skip_reshape=True
+    ) == "torch-output"
+
+    assert calls == ["torch", "torch"]
+    assert patch.get_stats()["routes"] == {}
+
+
+@pytest.mark.parametrize("variant", ["1", "4"])
+@pytest.mark.parametrize(
+    ("q_len", "kv_len"),
+    [(335, 335), (8, 8), (38, 4078), (6, 4046),
+     (78, 8156), (6, 8084), (75, 10659)],
+)
+def test_bmg_masked_d128_opt_in_uses_actual_mask_route(
+    monkeypatch, variant, q_len, kv_len,
+):
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_DSO", "/new/sidecar.so")
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_SHA256", "a" * 64)
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_PARTITIONS", variant)
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=q_len, heads=32, pre_shaped=False)
+    kv = _FakeTensor(seq=kv_len, heads=32, pre_shaped=False)
+    mask = _FakeMask(q_len, kv_len)
+    prepared = []
+
+    def sidecar(values, actual_mask):
+        prepared.append((values, actual_mask))
+        return values[1]
+
+    monkeypatch.setattr(patch, "_run_experimental_masked_d128", sidecar)
+    result = attention.optimized_attention(q, kv, kv, heads=32, mask=mask)
+    assert result.shape == (1, q_len, 4096)
+    assert calls == [] and len(prepared) == 1
+    assert prepared[0][0][0] == variant and prepared[0][1] is mask
+    assert patch.get_stats()["routes"] == {
+        f"bmg_b1_bf16_d128_masked_split{variant}": 1
+    }
+
+
+@pytest.mark.parametrize("variant", ["1", "4", "direct"])
+def test_bmg_masked_d128_accepts_pinned_comfy_wrap_marker_only(monkeypatch, variant):
+    wrap_attn = _pinned_comfy_wrap_attn()
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_DSO", "/new/sidecar.so")
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_SHA256", "a" * 64)
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_PARTITIONS", variant)
+    patch, attention, calls = _load_patch(
+        monkeypatch, target="bmg", wrap_attn=wrap_attn,
+    )
+    q = _FakeTensor(seq=335, heads=32, pre_shaped=False)
+    kv = _FakeTensor(seq=335, heads=32, pre_shaped=False)
+    mask = _FakeMask(335, 335)
+    selected = []
+    monkeypatch.setattr(patch, "_run_experimental_masked_d128",
+                        lambda prepared, actual_mask: selected.append(prepared) or prepared[1])
+    result = attention.optimized_attention(q, kv, kv, heads=32, mask=mask)
+    assert result.shape == (1, 335, 4096)
+    assert len(selected) == 1 and selected[0][0] == variant and calls == []
+    route = ("bmg_b1_bf16_d128_masked_direct" if variant == "direct"
+             else f"bmg_b1_bf16_d128_masked_split{variant}")
+    assert patch.get_stats()["routes"] == {route: 1}
+
+    # A caller-supplied false marker is not a trusted wrapper marker; the
+    # actual Comfy wrapper only inserts True when the key is absent.
+    assert attention.optimized_attention(
+        q, kv, kv, heads=32, mask=mask, _inside_attn_wrapper=False,
+    ) == "torch-output"
+    assert attention.optimized_attention(
+        q, kv, kv, heads=32, mask=mask, unknown_semantics=True,
+    ) == "torch-output"
+    assert len(selected) == 1 and calls == ["torch", "torch"]
+
+
+def test_bmg_masked_d128_direct_is_explicit_and_keeps_other_masks_on_torch(monkeypatch):
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_DSO", "/new/direct-sidecar.so")
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_SHA256", "b" * 64)
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_PARTITIONS", "direct")
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=335, heads=32, pre_shaped=False)
+    kv = _FakeTensor(seq=335, heads=32, pre_shaped=False)
+    mask = _FakeMask(335, 335)
+    selected = []
+    monkeypatch.setattr(patch, "_run_experimental_masked_d128",
+                        lambda prepared, actual_mask: selected.append(prepared) or prepared[1])
+    result = attention.optimized_attention(q, kv, kv, heads=32, mask=mask)
+    assert result.shape == (1, 335, 4096)
+    assert len(selected) == 1 and selected[0][0] == "direct"
+    assert patch.get_stats()["routes"] == {"bmg_b1_bf16_d128_masked_direct": 1}
+    assert calls == []
+
+    assert attention.optimized_attention(
+        q, kv, kv, heads=32, mask=_FakeMask(335, 335, dtype=torch.float32),
+    ) == "torch-output"
+    assert attention.optimized_attention(
+        q, kv, kv, heads=32, mask=mask, scale=0.1,
+    ) == "torch-output"
+    assert len(selected) == 1 and calls == ["torch", "torch"]
+
+
+def test_bmg_masked_d128_opt_in_preserves_segment_offset_and_bhld_output(monkeypatch):
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_DSO", "/new/sidecar.so")
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_SHA256", "a" * 64)
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_PARTITIONS", "4")
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=75, heads=32, pre_shaped=False,
+                    stride=(11000 * 4096, 4096, 1), storage_offset=10584 * 4096)
+    kv = _FakeTensor(seq=10659, heads=32, pre_shaped=False)
+    seen = []
+    monkeypatch.setattr(patch, "_run_experimental_masked_d128",
+                        lambda values, mask: seen.append(values) or values[1])
+    result = attention.optimized_attention(
+        q, kv, kv, heads=32, mask=_FakeMask(75, 10659),
+        skip_output_reshape=True,
+    )
+    assert result.shape == (1, 32, 75, 128) and calls == []
+    assert seen[0][1].storage_offset() == q.storage_offset()
+    assert seen[0][1].stride() == (75 * 4096, 128, 4096, 1)
+
+
+@pytest.mark.parametrize("bad_mask", [
+    {"dtype": torch.float32}, {"contiguous": False}, {"rank": 4},
+    {"q": 74}, {"kv": 10658},
+])
+def test_bmg_masked_d128_nonbool_or_broadcast_mask_keeps_torch(
+    monkeypatch, bad_mask,
+):
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_DSO", "/new/sidecar.so")
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_SHA256", "a" * 64)
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_PARTITIONS", "4")
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=75, heads=32)
+    kv = _FakeTensor(seq=10659, heads=32)
+    mask = _FakeMask(bad_mask.get("q", 75), bad_mask.get("kv", 10659),
+                     **{k: v for k, v in bad_mask.items() if k not in ("q", "kv")})
+    assert attention.optimized_attention(
+        q, kv, kv, heads=32, mask=mask, skip_reshape=True,
+    ) == "torch-output"
+    assert calls == ["torch"] and patch.get_stats()["routes"] == {}
+
+
+def test_bmg_masked_d128_missing_opt_in_and_other_semantics_keep_torch(monkeypatch):
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=75, heads=32)
+    kv = _FakeTensor(seq=10659, heads=32)
+    mask = _FakeMask(75, 10659)
+    assert attention.optimized_attention(
+        q, kv, kv, heads=32, mask=mask, skip_reshape=True,
+    ) == "torch-output"
+    for key, value in (("scale", 0.5), ("dropout_p", 0.1),
+                       ("is_causal", True), ("enable_gqa", True)):
+        monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_DSO", "/new/sidecar.so")
+        monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_SHA256", "a" * 64)
+        monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_PARTITIONS", "1")
+        assert attention.optimized_attention(
+            q, kv, kv, heads=32, mask=mask, skip_reshape=True, **{key: value},
+        ) == "torch-output"
+    assert calls == ["torch"] * 5 and patch.get_stats()["routes"] == {}
+
+
+def test_bmg_masked_d128_grad_and_mask_address_limit_fall_back(monkeypatch):
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_DSO", "/new/sidecar.so")
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_SHA256", "a" * 64)
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_PARTITIONS", "1")
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=75, heads=32)
+    kv = _FakeTensor(seq=10659, heads=32)
+    q.requires_grad = True
+    assert attention.optimized_attention(
+        q, kv, kv, heads=32, mask=_FakeMask(75, 10659), skip_reshape=True,
+    ) == "torch-output"
+    q.requires_grad = False
+    large_q = _FakeTensor(seq=40000, heads=32)
+    large_kv = _FakeTensor(seq=60000, heads=32)
+    assert attention.optimized_attention(
+        large_q, large_kv, large_kv, heads=32,
+        mask=_FakeMask(40000, 60000), skip_reshape=True,
+    ) == "torch-output"
+    assert calls == ["torch", "torch"] and patch.get_stats()["routes"] == {}
+
+
+@pytest.mark.parametrize(
     ("seq", "qk_stride", "v_stride"),
     [
         (31, (7168, 128, 21504, 1), (7168, 128, 21504, 1)),
@@ -1035,6 +1458,57 @@ def test_bmg_minimax_h3_video_vae_d64_uses_structural_cute(
     assert patch.get_stats()["routes"] == {
         "minimax_h3_video_vae_fp16_d64": 1
     }
+
+
+@pytest.mark.parametrize("batch", [2, 3, 4])
+def test_bmg_minimax_h3_video_vae_d64_batched_packed_qkv(monkeypatch, batch):
+    patch, attention, calls = _load_patch(
+        monkeypatch, target="bmg", torch_version="2.13.0+xpu",
+    )
+    seq = 1797
+    packed_stride = (seq * 6144, 192, 6144, 1)
+    q = _FakeTensor(
+        batch=batch, seq=seq, heads=32, dim_head=64,
+        dtype=torch.float16, stride=packed_stride,
+    )
+    k = _FakeTensor(
+        batch=batch, seq=seq, heads=32, dim_head=64,
+        dtype=torch.float16, stride=packed_stride,
+    )
+    v = _FakeTensor(
+        batch=batch, seq=seq, heads=32, dim_head=64,
+        dtype=torch.float16, stride=packed_stride,
+    )
+
+    def cat_batches(values, dim=0):
+        assert dim == 0 and len(values) == batch
+        shape = (sum(value.shape[0] for value in values), *values[0].shape[1:])
+        return _FakeTensor._with_metadata(
+            values[0], shape, _FakeTensor._contiguous_stride(shape),
+        )
+
+    monkeypatch.setattr(torch, "cat", cat_batches)
+    result = attention.optimized_attention(q, k, v, heads=32, skip_reshape=True)
+    assert result.shape == (batch, seq, 2048)
+    assert calls == ["cute_h3_vae_d64"] * batch
+    assert patch.get_stats()["fallback"] == 0
+    assert patch.get_stats()["routes"] == {
+        "minimax_h3_video_vae_fp16_d64": 1,
+    }
+
+
+def test_bmg_minimax_h3_video_vae_d64_packed_qk_materialization(monkeypatch):
+    patch, _, _ = _load_patch(monkeypatch, target="bmg")
+    seq = 261
+    qkv = torch.randn(4, seq, 32, 192)
+    q, k, v = (part.transpose(1, 2) for part in qkv.chunk(3, dim=-1))
+    assert patch._is_minimax_h3_vae_d64_bhld(q, seq, 4, value=False)
+    assert patch._is_minimax_h3_vae_d64_bhld(k, seq, 4, value=False)
+    assert patch._is_minimax_h3_vae_d64_bhld(v, seq, 4, value=True)
+    prepared = patch._minimax_h3_vae_d64_qk_for_native(q[:1])
+    assert prepared.stride() == (seq * 2048, 64, 2048, 1)
+    assert torch.equal(prepared, q[:1])
+    assert not torch._C._is_alias_of(prepared, q)
 
 
 def test_bmg_minimax_h3_video_vae_d64_rejects_wrong_v_stride(monkeypatch):

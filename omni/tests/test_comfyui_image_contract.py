@@ -77,16 +77,16 @@ COMPONENT_PINS = {
     ),
     "COMFYUI_COMMIT": (
         "COMFYUI_COMMIT",
-        "40c4fcdf513a4523e39d54a9d391908af8df8171",
+        "73c9bad4d21e7addbe1d13bc92eee0f1431b017d",
     ),
-    "COMFYUI_VERSION": ("COMFYUI_VERSION", "0.35.0"),
+    "COMFYUI_VERSION": ("COMFYUI_VERSION", "0.37.0"),
     "COMFYUI_FRONTEND_VERSION": (
         "COMFYUI_FRONTEND_VERSION",
-        "1.51.10",
+        "1.52.7",
     ),
     "COMFYUI_WORKFLOW_TEMPLATES_VERSION": (
         "COMFYUI_WORKFLOW_TEMPLATES_VERSION",
-        "0.11.57",
+        "0.11.66",
     ),
     "COMFYUI_MANAGER_VERSION": ("COMFYUI_MANAGER_VERSION", "4.2.2"),
     "COMFY_KITCHEN_REPOSITORY": (
@@ -95,18 +95,26 @@ COMPONENT_PINS = {
     ),
     "COMFY_KITCHEN_COMMIT": (
         "KITCHEN_COMMIT",
-        "9a46ea72e3e9a639ec9cfc0af8d763614eb00b4d",
+        "20a69c1ef0cbbb73675e3115aa78c0ea70a9a2b1",
     ),
-    "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.33"),
+    "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.35"),
+    "COMFY_KITCHEN_PROVIDER_VERSION": (
+        "KITCHEN_PROVIDER_VERSION",
+        "0.2.35",
+    ),
     "COMFY_AIMDO_REPOSITORY": (
         "AIMDO_REPOSITORY",
         "https://github.com/xiangyuT/comfy-aimdo-xpu.git",
     ),
     "COMFY_AIMDO_COMMIT": (
         "AIMDO_COMMIT",
-        "a79b5668d0a79a957796bd9c539577a70d384aa1",
+        "cc3729fc59eeab77bd4c8b28b80e49c9faa855d4",
     ),
-    "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.5.3"),
+    "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.5.5"),
+    "COMFY_AIMDO_PROVIDER_VERSION": (
+        "AIMDO_PROVIDER_VERSION",
+        "0.5.5",
+    ),
     "COMFY_GGUF_REPOSITORY": (
         "GGUF_REPOSITORY",
         "https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git",
@@ -121,7 +129,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_NUNCHAKU_COMMIT": (
         "NUNCHAKU_COMMIT",
-        "cc0f6236b6c329178ad4ef58452a874e774c7b8e",
+        "9f5604445f56154dd44e8b4acfed1aef868003c5",
     ),
     "COMFY_NUNCHAKU_VERSION": ("NUNCHAKU_VERSION", "1.2.1+xpu.3"),
 }
@@ -549,11 +557,12 @@ class ComfyUIImageContractTest(unittest.TestCase):
         )
         self.assertIn("./scripts/build-linux-xpu.sh", dockerfile)
         self.assertIn(
-            'SETUPTOOLS_SCM_PRETEND_VERSION="${COMFY_AIMDO_VERSION}"',
+            'SETUPTOOLS_SCM_PRETEND_VERSION="${COMFY_AIMDO_PROVIDER_VERSION}"',
             dockerfile,
         )
         self.assertIn(
-            "/wheels/aimdo-source/comfy_aimdo-${COMFY_AIMDO_VERSION}-*.whl",
+            "/wheels/aimdo-source/comfy_aimdo-"
+            "${COMFY_AIMDO_PROVIDER_VERSION}-*.whl",
             dockerfile,
         )
         self.assertIn(
@@ -562,7 +571,7 @@ class ComfyUIImageContractTest(unittest.TestCase):
         )
         self.assertIn(
             "/wheels/providers/comfy_aimdo_xpu_runtime-"
-            "${COMFY_AIMDO_VERSION}-*.whl",
+            "${COMFY_AIMDO_PROVIDER_VERSION}-*.whl",
             dockerfile,
         )
         self.assertEqual(
@@ -622,6 +631,16 @@ class ComfyUIImageContractTest(unittest.TestCase):
             'PIP_CONSTRAINT="/llm/manifests/omni-runtime-constraints.txt"',
             dockerfile,
         )
+        self.assertIn(
+            "/wheels/kitchen-source/comfy_kitchen-"
+            "${COMFY_KITCHEN_PROVIDER_VERSION}-*.whl",
+            dockerfile,
+        )
+        self.assertIn(
+            "/wheels/providers/comfy_kitchen_xpu_runtime-"
+            "${COMFY_KITCHEN_PROVIDER_VERSION}-*.whl",
+            dockerfile,
+        )
         self.assertNotIn(
             "/wheels/comfy_kitchen-${COMFY_KITCHEN_VERSION}-*.whl",
             dockerfile,
@@ -668,6 +687,115 @@ class ComfyUIImageContractTest(unittest.TestCase):
             Path("/llm/ComfyUI/user"),
         )
 
+    def test_provider_source_versions_are_compatible(self):
+        validator = load_validator()
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+
+        self.assertEqual(COMPONENT_PINS["COMFY_KITCHEN_VERSION"][1], "0.2.35")
+        self.assertEqual(
+            COMPONENT_PINS["COMFY_KITCHEN_PROVIDER_VERSION"][1], "0.2.35"
+        )
+        self.assertEqual(COMPONENT_PINS["COMFY_AIMDO_VERSION"][1], "0.5.5")
+        self.assertEqual(
+            COMPONENT_PINS["COMFY_AIMDO_PROVIDER_VERSION"][1], "0.5.5"
+        )
+        for label, expected in (
+            (
+                'com.intel.omni.comfy-kitchen.version="${COMFY_KITCHEN_VERSION}"',
+                "official Kitchen version",
+            ),
+            (
+                'com.intel.omni.comfy-kitchen-xpu-runtime.version="${COMFY_KITCHEN_PROVIDER_VERSION}"',
+                "Kitchen provider version",
+            ),
+            (
+                'com.intel.omni.comfy-aimdo.version="${COMFY_AIMDO_VERSION}"',
+                "official AIMDO version",
+            ),
+            (
+                'com.intel.omni.comfy-aimdo-xpu-runtime.version="${COMFY_AIMDO_PROVIDER_VERSION}"',
+                "AIMDO provider version",
+            ),
+        ):
+            with self.subTest(label=expected):
+                self.assertIn(label, dockerfile)
+
+        pairs = (
+            ("comfy_kitchen.xpu", "0.2.35", "0.2.35", "https://github.com/xiangyuT/comfy-kitchen-xpu.git"),
+            ("comfy_aimdo.xpu", "0.5.5", "0.5.5", "https://github.com/xiangyuT/comfy-aimdo-xpu.git"),
+        )
+        for provider_id, source_version, official_version, source_repository in pairs:
+            with self.subTest(
+                provider_id=provider_id,
+                source_version=source_version,
+                official_version=official_version,
+            ):
+                manifest = {
+                    "provider_distribution": {"version": source_version},
+                    "source": {
+                        "version": source_version,
+                        "repository": source_repository,
+                    },
+                    "canonical_distribution": {
+                        "compatible_versions": [source_version, official_version]
+                    },
+                }
+                validator.require_provider_version_compatibility(
+                    provider_id,
+                    manifest,
+                    official_version=official_version,
+                    provider_version=source_version,
+                    source_repository=source_repository,
+                )
+                if official_version != source_version:
+                    manifest["canonical_distribution"] = {
+                        "compatible_versions": [source_version]
+                    }
+                    with self.assertRaisesRegex(RuntimeError, "incompatible"):
+                        validator.require_provider_version_compatibility(
+                            provider_id,
+                            manifest,
+                            official_version=official_version,
+                            provider_version=source_version,
+                            source_repository=source_repository,
+                        )
+
+        mismatched_manifest = {
+            "provider_distribution": {"version": "0.2.34"},
+            "source": {
+                "version": "0.2.35",
+                "repository": "https://github.com/xiangyuT/comfy-kitchen-xpu.git",
+            },
+            "canonical_distribution": {
+                "compatible_versions": ["0.2.35"]
+            },
+        }
+        with self.assertRaisesRegex(RuntimeError, "distribution version"):
+            validator.require_provider_version_compatibility(
+                "comfy_kitchen.xpu",
+                mismatched_manifest,
+                official_version="0.2.35",
+                provider_version="0.2.35",
+                source_repository="https://github.com/xiangyuT/comfy-kitchen-xpu.git",
+            )
+        validator.require_provider_package_is_disjoint(
+            "comfy-kitchen-xpu-runtime",
+            "comfy_kitchen",
+            (
+                "comfy_kitchen_xpu_runtime/provider.json",
+                "comfy_kitchen_xpu_runtime/_vendor/comfy_kitchen/__init__.py",
+            ),
+        )
+        with self.assertRaisesRegex(RuntimeError, "illegally owns canonical"):
+            validator.require_provider_package_is_disjoint(
+                "comfy-kitchen-xpu-runtime",
+                "comfy_kitchen",
+                (
+                    "comfy_kitchen/__init__.py",
+                    "comfy_kitchen_xpu_runtime/provider.json",
+                ),
+            )
+
     def test_upgrade_path_preserves_provider_ownership_and_runtime_constraints(self):
         update_script = UPDATE_COMFYUI.read_text(encoding="utf-8")
         upgrade_validator = UPGRADE_VALIDATOR.read_text(encoding="utf-8")
@@ -685,6 +813,9 @@ class ComfyUIImageContractTest(unittest.TestCase):
             with self.subTest(distribution=distribution):
                 self.assertIn(distribution, upgrade_validator)
         self.assertIn("provider_snapshot()", upgrade_validator)
+        self.assertIn("require_provider_versions(before, expected_provider_versions)", upgrade_validator)
+        self.assertIn('"OMNI_COMFY_KITCHEN_PROVIDER_VERSION"', upgrade_validator)
+        self.assertIn('"OMNI_COMFY_AIMDO_PROVIDER_VERSION"', upgrade_validator)
         self.assertIn("official package or ComfyUI upgrade changed", upgrade_validator)
         self.assertIn('"OMNIXPU_PROVIDER_BOOTSTRAP": mode', upgrade_validator)
         self.assertIn('activation_probe("auto")', upgrade_validator)

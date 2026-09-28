@@ -614,6 +614,80 @@ class TestInt8LinearPrequantized:
 
         torch.testing.assert_close(out.float(), ref.float(), rtol=0.02, atol=0.2)
 
+    @pytest.mark.parametrize("n,k", [(17, 32), (1024, 4096)])
+    @pytest.mark.parametrize("out_dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("scalar_scale", [False, True])
+    @pytest.mark.parametrize("with_bias", [False, True])
+    def test_two_row_int8_matches_int32_reference(
+        self, device, seed, n, k, out_dtype, scalar_scale, with_bias
+    ):
+        """AR/CFG M=2 uses the same signed dot and scale/bias contract as CUDA."""
+        if device.type != "xpu":
+            pytest.skip("native two-row INT8 requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        x = torch.randint(-127, 128, (2, k), device=device, dtype=torch.int8)
+        weight = torch.randint(-127, 128, (n, k), device=device, dtype=torch.int8)
+        x_scale = torch.rand(2, device=device) * 0.01 + 0.001
+        weight_scale = torch.rand(1 if scalar_scale else n, device=device) * 0.01 + 0.001
+        bias = torch.randn(n, device=device) if with_bias else None
+        actual = int8.int8_linear_prequantized(
+            x, x_scale, weight, weight_scale, bias, out_dtype,
+        )
+
+        accum = x.cpu().to(torch.int32) @ weight.cpu().to(torch.int32).T
+        expected = accum.float() * x_scale.cpu()[:, None]
+        expected *= weight_scale.cpu().reshape(1, -1)
+        if bias is not None:
+            expected += bias.cpu()
+        expected = expected.to(out_dtype)
+        tolerance = 1e-5 if out_dtype == torch.float32 else 2 * torch.finfo(out_dtype).eps
+        torch.testing.assert_close(
+            actual.cpu().float(), expected.float(),
+            rtol=tolerance, atol=tolerance,
+        )
+
+    @pytest.mark.parametrize("m,n,k", [(2, 96, 256), (8, 64, 128)])
+    @pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("scalar_scale", [False, True])
+    @pytest.mark.parametrize("with_bias", [False, True])
+    def test_int8_residual_epilogue_matches_int32_reference(
+        self, device, seed, m, n, k, out_dtype, scalar_scale, with_bias
+    ):
+        if device.type != "xpu":
+            pytest.skip("native INT8 residual epilogue requires XPU")
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(native, "int8_linear_prequantized_residual"):
+            pytest.skip("native INT8 residual epilogue is unavailable")
+        x = torch.randint(-127, 128, (m, k), device=device, dtype=torch.int8)
+        weight = torch.randint(-127, 128, (n, k), device=device, dtype=torch.int8)
+        x_scale = torch.rand(m, device=device) * 0.01 + 0.001
+        weight_scale = torch.rand(1 if scalar_scale else n, device=device) * 0.01 + 0.001
+        bias = torch.randn(n, device=device, dtype=out_dtype) if with_bias else None
+        residual = torch.randn(m, n, device=device, dtype=out_dtype)
+        residual_scale = torch.randn(n, device=device, dtype=out_dtype)
+        dtype_code = 1 if out_dtype == torch.float16 else 2
+        actual = native.int8_linear_prequantized_residual(
+            x, x_scale, weight, weight_scale, bias, dtype_code,
+            residual, residual_scale,
+        )
+
+        accum = x.cpu().to(torch.int32) @ weight.cpu().to(torch.int32).T
+        expected = accum.float() * x_scale.cpu()[:, None]
+        expected *= weight_scale.cpu().reshape(1, -1)
+        if bias is not None:
+            expected += bias.cpu().float()
+        expected = residual.cpu().float() + residual_scale.cpu().float() * expected
+        expected = expected.to(out_dtype)
+        tolerance = 2 * torch.finfo(out_dtype).eps
+        torch.testing.assert_close(
+            actual.cpu().float(), expected.float(),
+            rtol=tolerance, atol=tolerance,
+        )
+
     def test_dynamic_and_prequantized_share_primitive_cache(self, device, seed):
         """Both entry points use the same scaled oneDNN primitive key."""
         if device.type != "xpu":
