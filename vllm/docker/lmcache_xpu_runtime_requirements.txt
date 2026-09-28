@@ -1,0 +1,63 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+# Fully pinned Python dependency closure for the validated LMCache XPU path:
+# multiprocess transport, shared-memory L1, filesystem L2, HTTP health/status,
+# and OTLP/Prometheus observability. Install with --no-deps so this file, rather
+# than LMCache's cross-platform requirements/common.txt, is authoritative.
+# torch, triton-xpu, vLLM, transformers, and their dependencies are owned by
+# the base vLLM image and are deliberately absent here.
+aiofiles==25.1.0
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+attrs==26.1.0
+blake3==1.0.9
+certifi==2026.7.22
+charset-normalizer==3.5.1
+click==8.5.0
+fastapi==0.136.3
+frozenlist==1.8.0
+googleapis-common-protos==1.75.3
+grpcio==1.83.1
+h11==0.16.0
+httpcore==1.0.9
+httptools==0.8.0
+httpx==0.28.1
+idna==3.19
+importlib-metadata==8.7.1
+llvmlite==0.47.0
+msgspec==0.21.1
+multidict==6.7.1
+numba==0.65.0
+numpy==2.2.6
+opentelemetry-api==1.40.0
+opentelemetry-exporter-otlp==1.40.0
+opentelemetry-exporter-otlp-proto-common==1.40.0
+opentelemetry-exporter-otlp-proto-grpc==1.40.0
+opentelemetry-exporter-otlp-proto-http==1.40.0
+opentelemetry-exporter-prometheus==0.61b0
+opentelemetry-proto==1.40.0
+opentelemetry-sdk==1.40.0
+opentelemetry-semantic-conventions==0.61b0
+prometheus-client==0.24.1
+propcache==0.5.2
+protobuf==6.33.6
+psutil==7.2.2
+py-cpuinfo==9.0.0
+pydantic==2.13.5
+pydantic-core==2.46.5
+pyyaml==6.0.3
+pyzmq==27.2.0
+requests==2.34.2
+sortedcontainers==2.4.0
+starlette==1.6.0
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+urllib3==2.7.0
+uvicorn==0.52.4
+yarl==1.24.5
+zipp==4.1.0
