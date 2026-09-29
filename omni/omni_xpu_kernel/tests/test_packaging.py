@@ -17,7 +17,7 @@ VERSION_FILE = PROJECT_ROOT / "omni_xpu_kernel" / "_version.py"
 PYPROJECT_FILE = PROJECT_ROOT / "pyproject.toml"
 IMAGE_VERSION = "0.2.0-b2"
 BASE_VERSION = "0.2.0b2"
-SUPPORTED_TORCH_MINORS = ("2.10", "2.11", "2.12", "2.13")
+SUPPORTED_TORCH_MINORS = ("2.10", "2.11", "2.12", "2.13", "2.14")
 SUPPORTED_XPU_TARGETS = ("bmg", "ptl-h")
 VERSION_NAMESPACE = run_path(str(VERSION_FILE))
 TORCH_VERSION = VERSION_NAMESPACE["get_installed_torch_version"]()
@@ -87,6 +87,7 @@ def test_kernel_version_is_exposed_by_package_metadata():
         ("2.12.0+xpu", "2.12.0", "2.12", "torch212"),
         ("2.12.1+xpu", "2.12.1", "2.12", "torch212"),
         ("2.13.0+xpu", "2.13.0", "2.13", "torch213"),
+        ("2.14.0+xpu", "2.14.0", "2.14", "torch214"),
     ],
 )
 def test_supported_torch_minors_select_distinct_wheel_tags(
@@ -113,6 +114,18 @@ def test_windows_onednn_contract_tracks_torch_minor(monkeypatch):
 
     assert get_contract("2.12.0+xpu") == ("2025.3.0", (3, 9, 1), "2025.3")
     assert get_contract("2.13.0+xpu") == ("2026.0.0", (3, 11, 2), "2026.0")
+
+
+def test_linux_cxx_standard_tracks_torch_headers(monkeypatch):
+    monkeypatch.chdir(PROJECT_ROOT)
+    monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "0")
+    monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
+    namespace = run_path(str(PROJECT_ROOT / "setup.py"),
+                         run_name="__linux_cxx_standard_test__")
+    get_standard = namespace["get_linux_cxx_standard"]
+
+    assert get_standard("2.13.0+xpu") == "-std=c++17"
+    assert get_standard("2.14.0+xpu") == "-std=c++20"
 
 
 def test_windows_compile_env_adds_aot_companion_tools(monkeypatch, tmp_path):
@@ -213,7 +226,7 @@ def test_inconsistent_installed_wheel_metadata_is_rejected(monkeypatch, tmp_path
         get_build_info(packaged_version_file)
 
 
-@pytest.mark.parametrize("torch_version", ["2.9.1+xpu", "2.14.0+xpu", "invalid"])
+@pytest.mark.parametrize("torch_version", ["2.9.1+xpu", "2.15.0+xpu", "invalid"])
 def test_unsupported_torch_versions_are_rejected(torch_version):
     with pytest.raises(RuntimeError, match="Torch minor|Unsupported Torch version"):
         VERSION_NAMESPACE["get_torch_minor"](torch_version)

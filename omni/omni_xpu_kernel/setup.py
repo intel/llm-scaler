@@ -78,6 +78,14 @@ BUILD_XPU_TARGET = VERSION_NAMESPACE["get_build_xpu_target"]()
 PACKAGE_VERSION = VERSION_NAMESPACE["get_package_version"](
     BUILD_TORCH_VERSION, BUILD_XPU_TARGET
 )
+
+
+def get_linux_cxx_standard(torch_version):
+    """Use the language level required by the selected Torch headers."""
+    torch_minor = VERSION_NAMESPACE["get_torch_minor"](torch_version)
+    return "-std=c++20" if torch_minor == "2.14" else "-std=c++17"
+
+
 XPU_ARCH_MACROS = {
     "bmg": "OMNI_XPU_ARCH_BMG",
     "ptl-h": "OMNI_XPU_ARCH_PTL_H",
@@ -914,6 +922,7 @@ class ICPXBuildExt(build_ext):
             cmd = [
                 icpx,
                 "-fsycl",
+                get_linux_cxx_standard(BUILD_TORCH_VERSION),
             ]
             
             if is_lgrf:
@@ -948,7 +957,7 @@ class ICPXBuildExt(build_ext):
                 cute_aot_target = get_cute_aot_target(BUILD_XPU_TARGET)
                 print(f"CUTE AOT target: {cute_aot_target}")
                 cmd += [
-                    "-std=c++17", "-O3", "-DNDEBUG", "-fPIC", "-shared",
+                    "-O3", "-DNDEBUG", "-fPIC", "-shared",
                     "-fsycl-targets=spir64_gen",
                     "-Xsycl-target-backend", f"-device {cute_aot_target}",
                     "-Xspirv-translator",
@@ -989,7 +998,6 @@ class ICPXBuildExt(build_ext):
                     "-O3", "-DNDEBUG",
                     f"-D{XPU_ARCH_MACRO}=1",
                     "-fPIC", "-shared",
-                    "-std=c++17",
                 ]
                 cmd += get_kernel_tuning_compile_args(windows=False)
                 # torch/include contains another oneDNN header tree. Put the

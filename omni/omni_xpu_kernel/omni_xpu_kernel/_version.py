@@ -14,7 +14,7 @@ from pathlib import Path
 # they were compiled against.
 __image_version__ = "0.2.0-b2"
 __base_version__ = "0.2.0b2"
-__supported_torch_minors__ = ("2.10", "2.11", "2.12", "2.13")
+__supported_torch_minors__ = ("2.10", "2.11", "2.12", "2.13", "2.14")
 __supported_xpu_targets__ = ("bmg", "ptl-h")
 
 
