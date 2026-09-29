@@ -15,6 +15,10 @@ class NativeConvRot:
     def prepare_convrot_hadamard(self, exemplar, group_size, fp32):
         self.events.append(('prepare', group_size, fp32))
 
+    def clear_convrot_hadamard_cache(self, device_index):
+        self.events.append(('clear', device_index))
+        return 1
+
     def rotate_convrot(self, value, group_size):
         self.events.append(('rotate', group_size))
         return value
@@ -66,3 +70,15 @@ def test_convrot_persistent_cache_precedes_tensor_route(monkeypatch):
 def test_convrot_allocation_context_requires_factory():
     with pytest.raises(TypeError, match='allocation context factory'):
         int8.set_allocation_context_factory(None)
+
+
+def test_convrot_cache_release_waits_for_xpu_before_dropping_owner(monkeypatch):
+    events = []
+    monkeypatch.setattr(int8, '_get_native', lambda: NativeConvRot(events))
+    monkeypatch.setattr(torch.xpu, 'synchronize',
+                        lambda device: events.append(('synchronize', device)))
+    assert int8.clear_convrot_hadamard_cache(0) == 1
+    assert events == [('synchronize', 0), ('clear', 0)]
+    with pytest.raises(ValueError, match='device index'):
+        int8.clear_convrot_hadamard_cache(-1)
+    assert events == [('synchronize', 0), ('clear', 0)]

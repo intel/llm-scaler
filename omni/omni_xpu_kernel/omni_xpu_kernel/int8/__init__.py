@@ -106,6 +106,20 @@ def prepare_convrot_hadamard(exemplar: torch.Tensor, group_size: int = 256,
                                              fp32=fp32))
 
 
+def clear_convrot_hadamard_cache(device_index: int) -> int:
+    """Synchronize one XPU device, then release its persistent ConvRot matrices."""
+    if type(device_index) is not int or device_index < 0:
+        raise ValueError("ConvRot cache device index must be nonnegative")
+    native = _get_native()
+    if native is None:
+        return 0
+    clear = getattr(native, "clear_convrot_hadamard_cache", None)
+    if clear is None:
+        raise RuntimeError("native ConvRot cache release is unavailable")
+    torch.xpu.synchronize(device_index)
+    return int(clear(device_index))
+
+
 def _native_rotate_convrot(native, x, group_size):
     _prepare_native_convrot_hadamard(native, x, group_size)
     return native.rotate_convrot(x, group_size)
@@ -1566,6 +1580,7 @@ __all__ = [
     "int8_linear_shared_input",
     "rotate_convrot",
     "prepare_convrot_hadamard",
+    "clear_convrot_hadamard_cache",
     "set_allocation_context_factory",
     "quantize_int8_convrot_weight",
     "dequantize_int8_convrot_weight",
