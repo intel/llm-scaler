@@ -37,6 +37,7 @@ Example:
 
 import contextlib
 import os
+import sys
 import threading
 from typing import Optional, Tuple
 
@@ -1556,6 +1557,21 @@ def int8_cache_clear() -> None:
         native.int8_cache_clear()
 
 
+def release_onednn_int8_cache() -> int:
+    """Flush linked oneDNN primitive state after all XPU work has stopped."""
+    if sys.platform != "linux":
+        raise RuntimeError("oneDNN INT8 cache release is Linux-only")
+    native = _get_native()
+    release = getattr(native, "release_onednn_int8_cache", None)
+    if release is None:
+        raise RuntimeError("native oneDNN INT8 cache release is unavailable")
+    for device_index in range(torch.xpu.device_count()):
+        torch.xpu.synchronize(device_index)
+    _clear_krea2_activation_cache()
+    _clear_bmg_qkv_activation_cache()
+    return int(release())
+
+
 def int8_cache_stats() -> dict:
     """Return INT8 primitive cache counters and size."""
     native = _get_native()
@@ -1585,5 +1601,6 @@ __all__ = [
     "quantize_int8_convrot_weight",
     "dequantize_int8_convrot_weight",
     "int8_cache_clear",
+    "release_onednn_int8_cache",
     "int8_cache_stats",
 ]

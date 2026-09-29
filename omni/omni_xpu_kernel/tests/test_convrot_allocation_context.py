@@ -1,6 +1,7 @@
 """Persistent ConvRot cache allocation stays in the caller's owner context."""
 
 import contextlib
+import sys
 
 import pytest
 import torch
@@ -18,6 +19,10 @@ class NativeConvRot:
     def clear_convrot_hadamard_cache(self, device_index):
         self.events.append(('clear', device_index))
         return 1
+
+    def release_onednn_int8_cache(self):
+        self.events.append(('release_onednn',))
+        return 4
 
     def rotate_convrot(self, value, group_size):
         self.events.append(('rotate', group_size))
@@ -82,3 +87,19 @@ def test_convrot_cache_release_waits_for_xpu_before_dropping_owner(monkeypatch):
     with pytest.raises(ValueError, match='device index'):
         int8.clear_convrot_hadamard_cache(-1)
     assert events == [('synchronize', 0), ('clear', 0)]
+
+
+@pytest.mark.skipif(sys.platform != 'linux', reason='Linux-only cache release')
+def test_onednn_cache_release_waits_for_visible_xpu(monkeypatch):
+    events = []
+    monkeypatch.setattr(int8, '_get_native', lambda: NativeConvRot(events))
+    monkeypatch.setattr(torch.xpu, 'device_count', lambda: 1)
+    monkeypatch.setattr(torch.xpu, 'synchronize',
+                        lambda device: events.append(('synchronize', device)))
+    monkeypatch.setattr(int8, '_clear_krea2_activation_cache',
+                        lambda: events.append(('clear_krea2',)))
+    monkeypatch.setattr(int8, '_clear_bmg_qkv_activation_cache',
+                        lambda: events.append(('clear_qkv',)))
+    assert int8.release_onednn_int8_cache() == 4
+    assert events == [('synchronize', 0), ('clear_krea2',),
+                      ('clear_qkv',), ('release_onednn',)]

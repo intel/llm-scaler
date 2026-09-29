@@ -1,5 +1,5 @@
 diff --git a/comfy/model_prefetch.py b/comfy/model_prefetch.py
-index 2b5cd04..ddc7ed8 100644
+index 2b5cd04..ca1b338 100644
 --- a/comfy/model_prefetch.py
 +++ b/comfy/model_prefetch.py
 @@ -2,12 +2,18 @@ import logging
@@ -99,7 +99,7 @@ index 2b5cd04..ddc7ed8 100644
      if hasattr(ck, "set_allocation_context"):
          ck.set_allocation_context(pause_malloc_graph())
      graph._comfy_active = True
-@@ -85,22 +131,53 @@ def malloc_graph_end():
+@@ -85,22 +131,54 @@ def malloc_graph_end():
      thread_id = threading.get_ident()
      graph = MALLOC_GRAPHS.get(thread_id)
      if graph is not None and graph._comfy_active:
@@ -152,11 +152,12 @@ index 2b5cd04..ddc7ed8 100644
 +    for device in devices:
 +        removed += omni_int8.clear_convrot_hadamard_cache(device.index)
 +        removed += ck.clear_nvfp4_lut_cache(device.index)
++    removed += omni_int8.release_onednn_int8_cache()
 +    return removed
  
  def pin_modules(comfy_modules, device, dtype=None):
      registerable_size = 0
-@@ -211,32 +288,34 @@ def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_grap
+@@ -211,32 +289,34 @@ def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_grap
          if malloc_graph.iterate(malloc_scope if module is not None and not graph_hit else None):
              _malloc_graph_break()
  

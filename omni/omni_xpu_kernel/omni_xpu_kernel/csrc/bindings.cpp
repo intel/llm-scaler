@@ -217,6 +217,9 @@ namespace int8_ops {
     torch::Tensor dequantize_int8_simple_dtype(torch::Tensor q, torch::Tensor scale, int64_t output_dtype_code);
     void int8_cache_clear();
     std::tuple<int64_t, int64_t, int64_t> int8_cache_stats();
+#if defined(__linux__)
+    int64_t release_onednn_int8_cache();
+#endif
 }
 }
 
@@ -924,6 +927,10 @@ PYBIND11_MODULE(_C, m) {
         "Clear INT8 oneDNN primitive cache");
     int8.def("int8_cache_stats", &omni_xpu::int8_ops::int8_cache_stats,
         "Return INT8 cache stats as (hits, misses, size)");
+#if defined(__linux__)
+    int8.def("release_onednn_int8_cache", &omni_xpu::int8_ops::release_onednn_int8_cache,
+        "Release INT8 states and flush the linked oneDNN primitive cache after XPU work stops");
+#endif
 
     auto kitchen = m.def_submodule(
         "kitchen", "Native Comfy Kitchen XPU operators");
