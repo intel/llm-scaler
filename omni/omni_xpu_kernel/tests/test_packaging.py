@@ -507,6 +507,9 @@ def test_windows_onednn_runtime_bundle_contains_notices_and_hash(
     find_runtime = namespace["find_windows_onednn_runtime"]
     bundle_runtime = namespace["bundle_windows_onednn_runtime"]
     monkeypatch.setitem(find_runtime.__globals__, "IS_WINDOWS", True)
+    # Exercise the last declared Windows contract even when the host is a
+    # newer Linux-only Torch development build.
+    monkeypatch.setitem(find_runtime.__globals__, "BUILD_TORCH_VERSION", "2.13.0")
 
     dnnl_root = tmp_path / "oneapi" / "dnnl" / "2026.0"
     lib_dir = dnnl_root / "lib"
