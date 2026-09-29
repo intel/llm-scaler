@@ -411,6 +411,7 @@ ARG IMAGE_TAG
 ARG XPU_TARGET
 ARG MAX_JOBS
 ARG COMFY_KITCHEN_PROVIDER_VERSION
+ARG COMFY_KITCHEN_COMMIT
 ARG COMFY_AIMDO_PROVIDER_VERSION
 ARG TORCH_VERSION
 ARG COMFYUI_COMMIT
@@ -476,6 +477,7 @@ RUN if [ "${AIMDO_XPU_CALLER_PATCH}" = "1" ]; then \
         test "${TORCH_VERSION}" = "2.14.0+xpu" && \
         test "${COMFYUI_COMMIT}" = "73c9bad4d21e7addbe1d13bc92eee0f1431b017d" && \
         test "${COMFY_AIMDO_COMMIT}" = "36fb9349f083e4edbb3dc313408b66014397fa8e" && \
+        test "${COMFY_KITCHEN_COMMIT}" = "ea43fcf8e301143f1c716416a1e9ce277b1657d4" && \
         python -c 'import omni_xpu_kernel as omni; from omni_xpu_kernel import int8; assert callable(int8.set_allocation_context_factory) and hasattr(omni._load_extension().int8, "prepare_convrot_hadamard")' && \
         git -C /llm/ComfyUI apply --check \
             /llm/patches/comfyui-aimdo-torch214-memory-compiler.patch && \
