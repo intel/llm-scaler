@@ -64,6 +64,22 @@ AIMDO_REPOSITORY="${COMFY_AIMDO_REPOSITORY:-https://github.com/xiangyuT/comfy-ai
 AIMDO_COMMIT="${COMFY_AIMDO_COMMIT:-cc3729fc59eeab77bd4c8b28b80e49c9faa855d4}"
 AIMDO_VERSION="${COMFY_AIMDO_VERSION:-0.5.5}"
 AIMDO_PROVIDER_VERSION="${COMFY_AIMDO_PROVIDER_VERSION:-0.5.5}"
+AIMDO_CALLER_PATCH="${OMNI_AIMDO_TORCH214_CALLER_PATCH:-0}"
+case "${AIMDO_CALLER_PATCH}" in
+    0) ;;
+    1)
+        if [ "${TORCH_VERSION}" != "2.14.0+xpu" ] || \
+           [ "${COMFYUI_COMMIT}" != "73c9bad4d21e7addbe1d13bc92eee0f1431b017d" ] || \
+           [ "${AIMDO_COMMIT}" != "7cce203f025fcf04e9cf950801c28ed75e559e00" ]; then
+            echo "AIMDO caller patch requires Torch 2.14, selected ComfyUI and AIMDO revisions" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "OMNI_AIMDO_TORCH214_CALLER_PATCH must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
 GGUF_REPOSITORY="${COMFY_GGUF_REPOSITORY:-https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git}"
 GGUF_COMMIT="${COMFY_GGUF_COMMIT:-39671fe73117ba97de7011e7e06e32599dcda06d}"
 NUNCHAKU_REPOSITORY="${COMFY_NUNCHAKU_REPOSITORY:-https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git}"
@@ -113,6 +129,7 @@ DOCKER_ARGS=(
     --build-arg "COMFY_AIMDO_COMMIT=${AIMDO_COMMIT}"
     --build-arg "COMFY_AIMDO_VERSION=${AIMDO_VERSION}"
     --build-arg "COMFY_AIMDO_PROVIDER_VERSION=${AIMDO_PROVIDER_VERSION}"
+    --build-arg "AIMDO_XPU_CALLER_PATCH=${AIMDO_CALLER_PATCH}"
     --build-arg "COMFY_GGUF_REPOSITORY=${GGUF_REPOSITORY}"
     --build-arg "COMFY_GGUF_COMMIT=${GGUF_COMMIT}"
     --build-arg "COMFY_NUNCHAKU_REPOSITORY=${NUNCHAKU_REPOSITORY}"
