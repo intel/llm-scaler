@@ -35,6 +35,7 @@ Example:
     output = int8.int8_linear(x, w_int8, w_scale, convrot=True, convrot_groupsize=256)
 """
 
+import contextlib
 import os
 import threading
 from typing import Optional, Tuple
@@ -74,6 +75,40 @@ def _get_native():
         return getattr(mod, "int8", None)
     except (ImportError, AttributeError):
         return None
+
+
+_allocation_context_factory = contextlib.nullcontext
+
+
+def set_allocation_context_factory(factory) -> None:
+    """Select the caller context used for persistent ConvRot cache creation."""
+    global _allocation_context_factory
+    if not callable(factory):
+        raise TypeError("allocation context factory must be callable")
+    _allocation_context_factory = factory
+
+
+def _prepare_native_convrot_hadamard(native, exemplar, group_size, *, fp32=False):
+    prepare = getattr(native, "prepare_convrot_hadamard", None)
+    if prepare is None:
+        return False
+    with _allocation_context_factory():
+        prepare(exemplar, group_size, fp32)
+    return True
+
+
+def prepare_convrot_hadamard(exemplar: torch.Tensor, group_size: int = 256,
+                             *, fp32: bool = False) -> bool:
+    """Prepare a persistent native matrix under the caller's allocation context."""
+    native = _get_native()
+    return (native is not None and
+            _prepare_native_convrot_hadamard(native, exemplar, group_size,
+                                             fp32=fp32))
+
+
+def _native_rotate_convrot(native, x, group_size):
+    _prepare_native_convrot_hadamard(native, x, group_size)
+    return native.rotate_convrot(x, group_size)
 
 
 def _apply_input_act(
@@ -359,7 +394,7 @@ def _stream_h3_swiglu_int8_linear(
         chunk = x[start:stop]
         gate, up = chunk.chunk(2, dim=-1)
         activated = native.fused_silu_mul_exact_bf16(gate, up)
-        rotated = native.rotate_convrot(activated, 256)
+        rotated = _native_rotate_convrot(native, activated, 256)
         x_int8, x_scale = native.quantize_int8_rowwise_fused(rotated)
         output_chunk = output[start:stop]
         native.int8_linear_prequantized_out(
@@ -457,7 +492,7 @@ def _stream_h3_convrot_int8_linear(
     for start in range(0, rows, chunk_rows):
         stop = min(start + chunk_rows, rows)
         chunk = x[start:stop]
-        rotated = native.rotate_convrot(chunk, 256)
+        rotated = _native_rotate_convrot(native, chunk, 256)
         x_int8, x_scale = native.quantize_int8_rowwise_fused(rotated)
         output_chunk = output[start:stop]
         native.int8_linear_prequantized_out(
@@ -778,7 +813,7 @@ def _quantize_krea2_int8_convrot(
         return x_int8, x_scale
 
     _clear_krea2_activation_cache()
-    rotated = native.rotate_convrot(x, 256)
+    rotated = _native_rotate_convrot(native, x, 256)
     x_int8, x_scale = native.quantize_int8_rowwise_fused(rotated)
     _krea2_activation_cache.key = key
     _krea2_activation_cache.input = x
@@ -1232,7 +1267,7 @@ def int8_linear(
                     f"input features {x.shape[-1]}"
                 )
             if hasattr(native, "rotate_convrot"):
-                x = native.rotate_convrot(x, convrot_groupsize)
+                x = _native_rotate_convrot(native, x, convrot_groupsize)
             else:
                 from ._reference import _build_hadamard, _rotate_activation
 
@@ -1387,7 +1422,7 @@ def int8_linear_shared_input(
                     f"input features {x.shape[-1]}"
                 )
             if hasattr(native, "rotate_convrot"):
-                x = native.rotate_convrot(x, convrot_groupsize)
+                x = _native_rotate_convrot(native, x, convrot_groupsize)
             else:
                 from ._reference import _build_hadamard, _rotate_activation
 
@@ -1434,7 +1469,7 @@ def rotate_convrot(
         )
     native = _get_native()
     if native is not None and hasattr(native, "rotate_convrot"):
-        return native.rotate_convrot(x, group_size)
+        return _native_rotate_convrot(native, x, group_size)
 
     from ._reference import _build_hadamard, _rotate_activation
 
@@ -1466,6 +1501,7 @@ def quantize_int8_convrot_weight(
         )
     native = _get_native()
     if native is not None and hasattr(native, "quantize_int8_convrot_weight"):
+        _prepare_native_convrot_hadamard(native, weight, group_size)
         return native.quantize_int8_convrot_weight(
             weight, group_size, stochastic_rounding
         )
@@ -1492,6 +1528,7 @@ def dequantize_int8_convrot_weight(
         return torch.ops.omni_xpu.dequantize_int8_convrot_weight(q, scale, group_size)
     native = _get_native()
     if native is not None and hasattr(native, "dequantize_int8_convrot_weight"):
+        _prepare_native_convrot_hadamard(native, q, group_size, fp32=True)
         return native.dequantize_int8_convrot_weight(q, scale, group_size)
     return _ref_dequantize_int8_convrot_weight(q, scale, group_size)
 
@@ -1528,6 +1565,8 @@ __all__ = [
     "int8_linear_prequantized",
     "int8_linear_shared_input",
     "rotate_convrot",
+    "prepare_convrot_hadamard",
+    "set_allocation_context_factory",
     "quantize_int8_convrot_weight",
     "dequantize_int8_convrot_weight",
     "int8_cache_clear",

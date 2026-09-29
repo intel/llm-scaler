@@ -475,7 +475,8 @@ COPY ./patches /llm/patches
 RUN if [ "${AIMDO_XPU_CALLER_PATCH}" = "1" ]; then \
         test "${TORCH_VERSION}" = "2.14.0+xpu" && \
         test "${COMFYUI_COMMIT}" = "73c9bad4d21e7addbe1d13bc92eee0f1431b017d" && \
-        test "${COMFY_AIMDO_COMMIT}" = "7cce203f025fcf04e9cf950801c28ed75e559e00" && \
+        test "${COMFY_AIMDO_COMMIT}" = "36fb9349f083e4edbb3dc313408b66014397fa8e" && \
+        python -c 'import omni_xpu_kernel as omni; from omni_xpu_kernel import int8; assert callable(int8.set_allocation_context_factory) and hasattr(omni._load_extension().int8, "prepare_convrot_hadamard")' && \
         git -C /llm/ComfyUI apply --check \
             /llm/patches/comfyui-aimdo-torch214-memory-compiler.patch && \
         git -C /llm/ComfyUI apply \

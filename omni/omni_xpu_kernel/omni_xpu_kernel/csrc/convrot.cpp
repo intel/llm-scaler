@@ -76,6 +76,17 @@ torch::Tensor get_hadamard(
 
 }  // namespace
 
+void prepare_convrot_hadamard(torch::Tensor exemplar, int64_t group_size,
+                              bool fp32) {
+    TORCH_CHECK(exemplar.device().is_xpu(), "exemplar must be on XPU");
+    TORCH_CHECK(fp32 || exemplar.is_floating_point(),
+                "exemplar must be floating point unless fp32 is selected");
+    validate_group_size(group_size);
+    (void)get_hadamard(group_size,
+                       fp32 ? torch::kFloat32 : exemplar.scalar_type(),
+                       exemplar.device());
+}
+
 torch::Tensor rotate_convrot(torch::Tensor input, int64_t group_size) {
     TORCH_CHECK(input.device().is_xpu(), "input must be on XPU");
     TORCH_CHECK(input.is_floating_point(), "input must be floating point");

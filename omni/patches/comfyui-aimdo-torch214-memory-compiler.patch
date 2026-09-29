@@ -1,5 +1,5 @@
 diff --git a/comfy/model_prefetch.py b/comfy/model_prefetch.py
-index 2b5cd04..736c065 100644
+index 2b5cd04..724951a 100644
 --- a/comfy/model_prefetch.py
 +++ b/comfy/model_prefetch.py
 @@ -2,12 +2,18 @@ import logging
@@ -60,7 +60,7 @@ index 2b5cd04..736c065 100644
          graph = MALLOC_GRAPHS.get(threading.get_ident())
          if graph is not None and graph._comfy_active:
              graph.resume(sync=self.sync)
-@@ -69,13 +93,27 @@ def malloc_graph_begin(device):
+@@ -69,13 +93,35 @@ def malloc_graph_begin(device):
      thread_id = threading.get_ident()
      graph = MALLOC_GRAPHS.get(thread_id)
      if graph is None:
@@ -77,6 +77,14 @@ index 2b5cd04..736c065 100644
 +        graph._comfy_active = False
 +        if xpu_diagnostic:
 +            graph._comfy_compiler_scope = None
++            try:
++                from omni_xpu_kernel import int8 as omni_int8
++            except ImportError:
++                pass
++            else:
++                set_context = getattr(omni_int8, "set_allocation_context_factory", None)
++                if callable(set_context):
++                    set_context(pause_malloc_graph)
          MALLOC_GRAPHS[thread_id] = graph
      else:
          graph.push()
@@ -91,7 +99,7 @@ index 2b5cd04..736c065 100644
      if hasattr(ck, "set_allocation_context"):
          ck.set_allocation_context(pause_malloc_graph())
      graph._comfy_active = True
-@@ -85,22 +123,39 @@ def malloc_graph_end():
+@@ -85,22 +131,39 @@ def malloc_graph_end():
      thread_id = threading.get_ident()
      graph = MALLOC_GRAPHS.get(thread_id)
      if graph is not None and graph._comfy_active:
@@ -134,7 +142,7 @@ index 2b5cd04..736c065 100644
  
  def pin_modules(comfy_modules, device, dtype=None):
      registerable_size = 0
-@@ -211,32 +266,34 @@ def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_grap
+@@ -211,32 +274,34 @@ def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_grap
          if malloc_graph.iterate(malloc_scope if module is not None and not graph_hit else None):
              _malloc_graph_break()
  

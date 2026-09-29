@@ -203,6 +203,8 @@ namespace int8_ops {
     std::tuple<torch::Tensor, torch::Tensor> fused_gelu_tanh_quantize_rowwise(
         torch::Tensor input);
     torch::Tensor rotate_convrot(torch::Tensor input, int64_t group_size);
+    void prepare_convrot_hadamard(torch::Tensor exemplar, int64_t group_size,
+                                  bool fp32);
     std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_weight(
         torch::Tensor weight, int64_t group_size, int64_t stochastic_rounding);
     torch::Tensor dequantize_int8_convrot_weight(
@@ -885,6 +887,10 @@ PYBIND11_MODULE(_C, m) {
     int8.def("rotate_convrot", &omni_xpu::int8_ops::rotate_convrot,
         "Regular Hadamard rotation using a cached matrix multiplication on the last dimension",
         py::arg("input"), py::arg("group_size") = 256);
+    int8.def("prepare_convrot_hadamard", &omni_xpu::int8_ops::prepare_convrot_hadamard,
+        "Prepare the persistent ConvRot Hadamard matrix under the caller's allocation context",
+        py::arg("exemplar"), py::arg("group_size") = 256,
+        py::arg("fp32") = false);
     int8.def("quantize_int8_convrot_weight", &omni_xpu::int8_ops::quantize_int8_convrot_weight,
         "Native ConvRot weight rotation followed by row-wise INT8 quantization",
         py::arg("weight"), py::arg("group_size") = 256,

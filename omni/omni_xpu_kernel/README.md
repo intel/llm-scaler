@@ -504,6 +504,17 @@ it with `int8.int8_linear_prequantized`.
 For BF16/FP16 ConvRot inputs, `kitchen.rms_norm_convrot_quantize_int8` also
 performs the supported 64- or 256-channel rotation in that operation.
 
+### ConvRot cache ownership
+
+The native ConvRot route caches one Hadamard matrix per XPU device, dtype and
+group size. Callers with a temporary allocation scope can set
+`int8.set_allocation_context_factory(factory)` so the matrix is prepared under
+the caller's persistent-allocation context before ConvRot outputs are routed.
+The eager INT8 wrappers do this automatically. A compiled caller should call
+`int8.prepare_convrot_hadamard(example, group_size)` before entering its
+compiled region. Reset the factory to `contextlib.nullcontext` when the caller
+integration ends.
+
 ### Comfy Kitchen AWQ W4A16
 
 `kitchen.gemv_awq_w4a16` consumes Kitchen's row-major packed unsigned INT4
