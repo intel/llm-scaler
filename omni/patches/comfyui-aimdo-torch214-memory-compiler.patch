@@ -1,5 +1,5 @@
 diff --git a/comfy/model_management.py b/comfy/model_management.py
-index 9aa0a9d..1897ada 100644
+index 9aa0a9d..3f2ad18 100644
 --- a/comfy/model_management.py
 +++ b/comfy/model_management.py
 @@ -28,13 +28,17 @@ import platform
@@ -38,7 +38,7 @@ index 9aa0a9d..1897ada 100644
          for tensor in tensors:
              dest_view = dest_views.pop(0)
              dest2_view = dest2_views.pop(0) if dest2_views is not None else None
-@@ -1556,29 +1554,50 @@ def cast_to_gathered(tensors, r, non_blocking=False, stream=None, r2=None):
+@@ -1556,29 +1554,56 @@ def cast_to_gathered(tensors, r, non_blocking=False, stream=None, r2=None):
                  dest2_view.copy_(tensor if dest_view is None else dest_view, non_blocking=non_blocking)
 
 
@@ -61,7 +61,13 @@ index 9aa0a9d..1897ada 100644
 +        return
 +    wf_context = stream.as_context(stream) if hasattr(stream, "as_context") else stream
 +    with ExitStack() as contexts:
-+        if native_owner is not None and native_owner.installed():
++        diagnostic = native_owner is not None and native_owner.installed()
++        if diagnostic and getattr(getattr(stream, "device", None), "type", None) == "xpu":
++            caller = sys.modules.get("comfy.model_prefetch")
++            if caller is not None:
++                # Side-stream destinations must stay outside the owner graph.
++                contexts.enter_context(caller.pause_malloc_graph())
++        if diagnostic:
 +            registered = set()
 +            for value in values:
 +                for tensor in _cast_storage_tensors(value):
