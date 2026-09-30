@@ -1,3 +1,110 @@
+diff --git a/comfy/model_management.py b/comfy/model_management.py
+index 9aa0a9d..1897ada 100644
+--- a/comfy/model_management.py
++++ b/comfy/model_management.py
+@@ -28,13 +28,17 @@ import platform
+ import weakref
+ import gc
+ import os
+-from contextlib import contextmanager, nullcontext
++from contextlib import contextmanager, ExitStack, nullcontext
+ import comfy.memory_management
+ import comfy.system_memory
+ import comfy.utils
+ import comfy.quant_ops
+ import comfy_aimdo.host_buffer
+ import comfy_aimdo.vram_buffer
++try:
++    import comfy_aimdo.native_owner as native_owner
++except ImportError:
++    native_owner = None
+ from comfy.internal_logging import detail
+
+ from typing import TYPE_CHECKING
+@@ -1532,15 +1536,9 @@ def sync_stream(device, stream):
+
+
+ def cast_to_gathered(tensors, r, non_blocking=False, stream=None, r2=None):
+-    wf_context = nullcontext()
+-    if stream is not None:
+-       wf_context = stream
+-       if hasattr(wf_context, "as_context"):
+-           wf_context = wf_context.as_context(stream)
+-
+     dest_views = comfy.memory_management.interpret_gathered_like(tensors, r) if r is not None else [None] * len(tensors)
+     dest2_views = comfy.memory_management.interpret_gathered_like(tensors, r2) if r2 is not None else None
+-    with wf_context:
++    with _cast_stream_context(stream, tensors, r, r2):
+         for tensor in tensors:
+             dest_view = dest_views.pop(0)
+             dest2_view = dest2_views.pop(0) if dest2_views is not None else None
+@@ -1556,29 +1554,50 @@ def cast_to_gathered(tensors, r, non_blocking=False, stream=None, r2=None):
+                 dest2_view.copy_(tensor if dest_view is None else dest_view, non_blocking=non_blocking)
+
+
++def _cast_storage_tensors(value):
++    if isinstance(value, (list, tuple)):
++        for item in value:
++            yield from _cast_storage_tensors(item)
++    elif isinstance(value, comfy.quant_ops.QuantizedTensor):
++        names, _ = value.__tensor_flatten__()
++        for name in names:
++            yield from _cast_storage_tensors(getattr(value, name))
++    elif isinstance(value, torch.Tensor):
++        yield value
++
++
++@contextmanager
++def _cast_stream_context(stream, *values):
++    if stream is None:
++        yield
++        return
++    wf_context = stream.as_context(stream) if hasattr(stream, "as_context") else stream
++    with ExitStack() as contexts:
++        if native_owner is not None and native_owner.installed():
++            registered = set()
++            for value in values:
++                for tensor in _cast_storage_tensors(value):
++                    if not is_device_xpu(tensor.device):
++                        continue
++                    pointer = tensor.untyped_storage().data_ptr()
++                    if (pointer and pointer not in registered
++                            and native_owner.is_compiler_owner(pointer)):
++                        contexts.enter_context(native_owner.consumer_scope(tensor, stream))
++                        registered.add(pointer)
++        contexts.enter_context(wf_context)
++        yield
++
++
+ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, stream=None, r=None):
+     if device is None or weight.device == device:
+         if not copy:
+             if dtype is None or weight.dtype == dtype:
+                 return weight
+-        if stream is not None:
+-            wf_context = stream
+-            if hasattr(wf_context, "as_context"):
+-                wf_context = wf_context.as_context(stream)
+-            with wf_context:
+-                return weight.to(dtype=dtype, copy=copy)
+-        return weight.to(dtype=dtype, copy=copy)
++        with _cast_stream_context(stream, weight):
++            return weight.to(dtype=dtype, copy=copy)
+
+
+-    if stream is not None:
+-        wf_context = stream
+-        if hasattr(wf_context, "as_context"):
+-            wf_context = wf_context.as_context(stream)
+-        with wf_context:
+-            if r is None:
+-                r = torch.empty_like(weight, dtype=dtype, device=device)
+-            r.copy_(weight, non_blocking=non_blocking)
+-    else:
++    with _cast_stream_context(stream, weight, r):
+         if r is None:
+             r = torch.empty_like(weight, dtype=dtype, device=device)
+         r.copy_(weight, non_blocking=non_blocking)
 diff --git a/comfy/model_prefetch.py b/comfy/model_prefetch.py
 index 2b5cd04..ca1b338 100644
 --- a/comfy/model_prefetch.py
