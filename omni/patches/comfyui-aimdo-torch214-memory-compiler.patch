@@ -1,5 +1,5 @@
 diff --git a/comfy/model_management.py b/comfy/model_management.py
-index 9aa0a9d..3f2ad18 100644
+index 9aa0a9d..18d5b53 100644
 --- a/comfy/model_management.py
 +++ b/comfy/model_management.py
 @@ -28,13 +28,17 @@ import platform
@@ -21,7 +21,30 @@ index 9aa0a9d..3f2ad18 100644
  from comfy.internal_logging import detail
 
  from typing import TYPE_CHECKING
-@@ -1532,15 +1536,9 @@ def sync_stream(device, stream):
+@@ -1411,13 +1415,6 @@ def _register_cross_step(module):
+ def get_cast_buffer(offload_stream, device, size, ref):
+     global LARGEST_CASTED_WEIGHT
+
+-    if offload_stream is not None:
+-        wf_context = offload_stream
+-        if hasattr(wf_context, "as_context"):
+-            wf_context = wf_context.as_context(offload_stream)
+-    else:
+-        wf_context = nullcontext()
+-
+     cast_buffer = STREAM_CAST_BUFFERS.get(offload_stream, None)
+     if cast_buffer is None or cast_buffer.numel() < size:
+         if ref is LARGEST_CASTED_WEIGHT[0]:
+@@ -1431,7 +1428,7 @@ def get_cast_buffer(offload_stream, device, size, ref):
+             del STREAM_CAST_BUFFERS[offload_stream]
+             del cast_buffer
+             soft_empty_cache()
+-        with wf_context:
++        with _cast_stream_context(offload_stream):
+             cast_buffer = torch.empty((size), dtype=torch.int8, device=device)
+             STREAM_CAST_BUFFERS[offload_stream] = cast_buffer
+
+@@ -1532,15 +1529,9 @@ def sync_stream(device, stream):
 
 
  def cast_to_gathered(tensors, r, non_blocking=False, stream=None, r2=None):
@@ -38,7 +61,7 @@ index 9aa0a9d..3f2ad18 100644
          for tensor in tensors:
              dest_view = dest_views.pop(0)
              dest2_view = dest2_views.pop(0) if dest2_views is not None else None
-@@ -1556,29 +1554,56 @@ def cast_to_gathered(tensors, r, non_blocking=False, stream=None, r2=None):
+@@ -1556,29 +1547,56 @@ def cast_to_gathered(tensors, r, non_blocking=False, stream=None, r2=None):
                  dest2_view.copy_(tensor if dest_view is None else dest_view, non_blocking=non_blocking)
 
 
@@ -94,10 +117,8 @@ index 9aa0a9d..3f2ad18 100644
 -            with wf_context:
 -                return weight.to(dtype=dtype, copy=copy)
 -        return weight.to(dtype=dtype, copy=copy)
-+        with _cast_stream_context(stream, weight):
-+            return weight.to(dtype=dtype, copy=copy)
-
-
+-
+-
 -    if stream is not None:
 -        wf_context = stream
 -        if hasattr(wf_context, "as_context"):
@@ -107,6 +128,10 @@ index 9aa0a9d..3f2ad18 100644
 -                r = torch.empty_like(weight, dtype=dtype, device=device)
 -            r.copy_(weight, non_blocking=non_blocking)
 -    else:
++        with _cast_stream_context(stream, weight):
++            return weight.to(dtype=dtype, copy=copy)
++
++
 +    with _cast_stream_context(stream, weight, r):
          if r is None:
              r = torch.empty_like(weight, dtype=dtype, device=device)
