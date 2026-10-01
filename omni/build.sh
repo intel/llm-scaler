@@ -70,7 +70,7 @@ case "${AIMDO_CALLER_PATCH}" in
     1)
         if [ "${TORCH_VERSION}" != "2.14.0+xpu" ] || \
            [ "${COMFYUI_COMMIT}" != "73c9bad4d21e7addbe1d13bc92eee0f1431b017d" ] || \
-           [ "${AIMDO_COMMIT}" != "7f1d96a3f10550516519cc27d2b581791fbb1d56" ] || \
+           [ "${AIMDO_COMMIT}" != "17811375396ecbd22b577e5303551a9cf29a28c6" ] || \
            [ "${KITCHEN_COMMIT}" != "ea43fcf8e301143f1c716416a1e9ce277b1657d4" ]; then
             echo "AIMDO caller patch requires Torch 2.14 and selected ComfyUI, AIMDO and Kitchen revisions" >&2
             exit 1

@@ -476,7 +476,7 @@ COPY ./patches /llm/patches
 RUN if [ "${AIMDO_XPU_CALLER_PATCH}" = "1" ]; then \
         test "${TORCH_VERSION}" = "2.14.0+xpu" && \
         test "${COMFYUI_COMMIT}" = "73c9bad4d21e7addbe1d13bc92eee0f1431b017d" && \
-        test "${COMFY_AIMDO_COMMIT}" = "7f1d96a3f10550516519cc27d2b581791fbb1d56" && \
+        test "${COMFY_AIMDO_COMMIT}" = "17811375396ecbd22b577e5303551a9cf29a28c6" && \
         test "${COMFY_KITCHEN_COMMIT}" = "ea43fcf8e301143f1c716416a1e9ce277b1657d4" && \
         python -c 'import omni_xpu_kernel as omni; from omni_xpu_kernel import int8; assert callable(int8.set_allocation_context_factory) and hasattr(omni._load_extension().int8, "prepare_convrot_hadamard")' && \
         git -C /llm/ComfyUI apply --check \
