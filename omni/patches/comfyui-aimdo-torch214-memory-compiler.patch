@@ -19,12 +19,12 @@ index 9aa0a9d..18d5b53 100644
 +except ImportError:
 +    native_owner = None
  from comfy.internal_logging import detail
-
+ 
  from typing import TYPE_CHECKING
 @@ -1411,13 +1415,6 @@ def _register_cross_step(module):
  def get_cast_buffer(offload_stream, device, size, ref):
      global LARGEST_CASTED_WEIGHT
-
+ 
 -    if offload_stream is not None:
 -        wf_context = offload_stream
 -        if hasattr(wf_context, "as_context"):
@@ -43,10 +43,10 @@ index 9aa0a9d..18d5b53 100644
 +        with _cast_stream_context(offload_stream):
              cast_buffer = torch.empty((size), dtype=torch.int8, device=device)
              STREAM_CAST_BUFFERS[offload_stream] = cast_buffer
-
+ 
 @@ -1532,15 +1529,9 @@ def sync_stream(device, stream):
-
-
+ 
+ 
  def cast_to_gathered(tensors, r, non_blocking=False, stream=None, r2=None):
 -    wf_context = nullcontext()
 -    if stream is not None:
@@ -63,8 +63,8 @@ index 9aa0a9d..18d5b53 100644
              dest2_view = dest2_views.pop(0) if dest2_views is not None else None
 @@ -1556,29 +1547,56 @@ def cast_to_gathered(tensors, r, non_blocking=False, stream=None, r2=None):
                  dest2_view.copy_(tensor if dest_view is None else dest_view, non_blocking=non_blocking)
-
-
+ 
+ 
 +def _cast_storage_tensors(value):
 +    if isinstance(value, (list, tuple)):
 +        for item in value:
@@ -137,7 +137,7 @@ index 9aa0a9d..18d5b53 100644
              r = torch.empty_like(weight, dtype=dtype, device=device)
          r.copy_(weight, non_blocking=non_blocking)
 diff --git a/comfy/model_prefetch.py b/comfy/model_prefetch.py
-index 2b5cd04..ca1b338 100644
+index 2b5cd04..a0c880b 100644
 --- a/comfy/model_prefetch.py
 +++ b/comfy/model_prefetch.py
 @@ -2,12 +2,18 @@ import logging
@@ -159,7 +159,7 @@ index 2b5cd04..ca1b338 100644
  from comfy.cli_args import args
  import comfy.memory_management
  import comfy.model_management
-@@ -27,18 +33,36 @@ def _malloc_graph_break():
+@@ -27,18 +33,40 @@ def _malloc_graph_break():
      logging.debug("Comfy model compiler graph break")
  
  def malloc_graph_enabled(device):
@@ -179,26 +179,30 @@ index 2b5cd04..ca1b338 100644
  class _PauseMallocGraph:
      def __init__(self, sync=False):
          self.sync = sync
-+        self._xpu_contexts = []
++        self._xpu_contexts = threading.local()
  
      def __enter__(self):
          graph = MALLOC_GRAPHS.get(threading.get_ident())
          if graph is not None and graph._comfy_active:
 -            graph.pause(sync=self.sync)
 +            if getattr(graph, "_comfy_xpu_diagnostic", False):
++                contexts = getattr(self._xpu_contexts, "stack", None)
++                if contexts is None:
++                    contexts = self._xpu_contexts.stack = []
 +                context = native_owner.paused_graph_scope(graph, sync=self.sync)
 +                context.__enter__()
-+                self._xpu_contexts.append(context)
++                contexts.append(context)
 +            else:
 +                graph.pause(sync=self.sync)
  
      def __exit__(self, *args):
-+        if self._xpu_contexts:
-+            return self._xpu_contexts.pop().__exit__(*args)
++        contexts = getattr(self._xpu_contexts, "stack", None)
++        if contexts:
++            return contexts.pop().__exit__(*args)
          graph = MALLOC_GRAPHS.get(threading.get_ident())
          if graph is not None and graph._comfy_active:
              graph.resume(sync=self.sync)
-@@ -69,13 +93,35 @@ def malloc_graph_begin(device):
+@@ -69,13 +97,35 @@ def malloc_graph_begin(device):
      thread_id = threading.get_ident()
      graph = MALLOC_GRAPHS.get(thread_id)
      if graph is None:
@@ -237,7 +241,7 @@ index 2b5cd04..ca1b338 100644
      if hasattr(ck, "set_allocation_context"):
          ck.set_allocation_context(pause_malloc_graph())
      graph._comfy_active = True
-@@ -85,22 +131,54 @@ def malloc_graph_end():
+@@ -85,22 +135,54 @@ def malloc_graph_end():
      thread_id = threading.get_ident()
      graph = MALLOC_GRAPHS.get(thread_id)
      if graph is not None and graph._comfy_active:
@@ -295,7 +299,7 @@ index 2b5cd04..ca1b338 100644
  
  def pin_modules(comfy_modules, device, dtype=None):
      registerable_size = 0
-@@ -211,32 +289,34 @@ def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_grap
+@@ -211,32 +293,34 @@ def prefetch_queue_pop(queue, device, module, dtype=None, core=None, enable_grap
          if malloc_graph.iterate(malloc_scope if module is not None and not graph_hit else None):
              _malloc_graph_break()
  
