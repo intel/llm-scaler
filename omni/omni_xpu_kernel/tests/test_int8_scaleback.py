@@ -1,4 +1,4 @@
-"""Regression tests for the native fused scale-back bias length check."""
+"""Regression tests for native fused scale-back bias validation."""
 
 import pytest
 import torch
@@ -39,6 +39,31 @@ def test_rejects_wrong_bias_length(scaleback, n, bias_size, bias_dtype):
     dtype_code = 2 if bias_dtype == torch.bfloat16 else 0
     with pytest.raises(RuntimeError, match=message):
         scaleback(*_inputs(n), bias, dtype_code)
+
+
+@pytest.mark.parametrize("n", [64, 65])
+@pytest.mark.parametrize("dtype_code", [0, 1, 2])
+def test_rejects_cpu_bias(scaleback, n, dtype_code):
+    bias = torch.zeros(n, device="cpu")
+    with pytest.raises(
+        RuntimeError, match="bias must be on the same XPU device as gemm_result"
+    ):
+        scaleback(*_inputs(n), bias, dtype_code)
+
+
+@pytest.mark.parametrize("n", [64, 65])
+def test_rejects_other_xpu_bias(scaleback, n):
+    count = torch.xpu.device_count()
+    if count < 2:
+        pytest.skip("requires two XPU devices")
+
+    gemm, x_scale, w_scale = _inputs(n)
+    other_index = (gemm.device.index + 1) % count
+    bias = torch.zeros(n, device=f"xpu:{other_index}", dtype=torch.bfloat16)
+    with pytest.raises(
+        RuntimeError, match="bias must be on the same XPU device as gemm_result"
+    ):
+        scaleback(gemm, x_scale, w_scale, bias)
 
 
 @pytest.mark.parametrize("n", [64, 65])
