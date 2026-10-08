@@ -69,7 +69,10 @@ GGUF repository and commit must be updated together.
 The private sidecar build requires the Torch release supported by llm-scaler
 (currently `2.14.0+xpu`) and an explicitly selected AIMDO revision that contains
 the sidecar. `ComfyUI-OmniXPU/aimdo_release_compat.py` applies that release policy
-before building and before runtime takeover. Torch library hashes and a separate
+before building and before runtime takeover. After building and before packaging,
+the same script reads the sidecar's `aimdo_full_proxy_torch_version()` export and
+requires it to match installed Torch and the provider's declared `TORCH_VERSION`.
+It does not install the native allocator. Torch library hashes and a separate
 AIMDO ABI JSON file are not admission inputs. It does
 not require a fixed ComfyUI commit. The retired
 `OMNI_AIMDO_TORCH214_CALLER_PATCH=1` switch is rejected; no ComfyUI source patch

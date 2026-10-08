@@ -53,8 +53,10 @@ ComfyUI's tracked files unchanged. Build a sidecar-capable AIMDO revision with
 `AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC=1`, then start with
 `AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC=1`. llm-scaler checks the supported Torch
 release, currently `2.14.0+xpu`, before building or enabling this integration.
-It does not compare Torch library hashes. Public XPU memory-compiler availability
-remains disabled.
+After compilation and before packaging, the build also checks that the sidecar's
+exported Torch release matches both installed Torch and the provider's declared
+release. This check does not install the allocator. It does not compare Torch
+library hashes. Public XPU memory-compiler availability remains disabled.
 
 The adapter owns the XPU graph lifecycle and wraps cast, prefetch and explicit
 free-memory boundaries. It calls the original ComfyUI functions for copying,
@@ -68,6 +70,23 @@ Runtime interface changes detected after takeover stop startup and require a
 restart with the diagnostic disabled. The native allocator cannot be unloaded
 in place. This is a diagnostic interface contract, not arbitrary-revision or
 public memory-compiler qualification.
+
+**Known upgrade limitation — free-memory request consumption.** The diagnostic's
+additional process-cache cleanup relies on the prompt worker consuming flags
+with `PromptQueue.get_flags(reset=True)`, followed by GC and cache flushing.
+The current pinned worker uses `get_flags()` with that default. Source preflight
+rejects literal false arguments but does not resolve variables or `**kwargs`:
+a future worker change to `get_flags(reset=consume)` where `consume` is false,
+or an equivalent parameter expansion, can pass preflight while skipping the
+adapter's ConvRot/Hadamard, LUT and oneDNN INT8 cache cleanup. ComfyUI's original
+cleanup can still run. Non-consuming flag queries elsewhere remain valid.
+This is a limitation of the adapter's upgrade check, not a demonstrated defect
+in the current ComfyUI worker. Disable the diagnostic with
+`AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC=0` when upgrading to a worker with changed
+flag-consumption semantics until that path is validated. An explicit upstream
+cleanup lifecycle callback would remove this dependency; this integration does
+not attempt general AST value evaluation. See the
+[review discussion](https://github.com/intel/llm-scaler/pull/746#discussion_r4215679453).
 
 The provider distributions use private top-level package names and do not own
 any `comfy_kitchen/*` or `comfy_aimdo/*` file. The official packages can

@@ -371,7 +371,9 @@ RUN cd /llm && \
     AIMDO_TORCH_PYTHON=/opt/venv/bin/python \
         ./scripts/build-linux-xpu.sh && \
     if [ "${AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC}" = "1" ]; then \
-        test -f comfy_aimdo/aimdo_xpu_native_owner.so; \
+        /opt/venv/bin/python /tmp/check_aimdo_torch_release.py \
+            --torch-version "${TORCH_VERSION}" \
+            --native-owner comfy_aimdo/aimdo_xpu_native_owner.so; \
     fi && \
     mkdir -p /wheels/aimdo-source /wheels/aimdo-provider && \
     SETUPTOOLS_SCM_PRETEND_VERSION="${COMFY_AIMDO_PROVIDER_VERSION}" \
