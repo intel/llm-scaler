@@ -546,9 +546,15 @@ def test_admission_rejects_protocol_changes(runtime, tmp_path, mutation, message
         p = tmp_path / 'comfy/model_prefetch.py'
         p.write_text(p.read_text().replace('consumed = queue.pop(0)', 'consumed = queue.pop(1)'))
     elif mutation == 'gc_order':
+        import re
         p = tmp_path / 'main.py'
-        p.write_text(p.read_text().replace('gc.collect()\n                comfy.model_management.soft_empty_cache()',
-            'comfy.model_management.soft_empty_cache()\n                gc.collect()'))
+        changed, count = re.subn(
+            r'(?m)^([ \t]*)gc\.collect\(\)\n\1comfy\.model_management\.soft_empty_cache\(\)',
+            lambda match: match[1] + 'comfy.model_management.soft_empty_cache()\n' + match[1] + 'gc.collect()',
+            p.read_text(),
+        )
+        assert count == 1, 'fixture must reverse one actual GC/cache cleanup pair'
+        p.write_text(changed)
     elif mutation == 'peek':
         p = tmp_path / 'main.py'
         p.write_text(p.read_text().replace('flags = q.get_flags()', 'flags = q.get_flags(reset=False)'))

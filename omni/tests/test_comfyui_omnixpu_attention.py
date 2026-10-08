@@ -20,7 +20,7 @@ _PATCHES = _PLUGIN / "patches"
 _ADAPTERS = _PLUGIN / "adapters"
 
 
-def _pinned_comfy_wrap_attn():
+def _pinned_comfy_attention_namespace():
     key = "OMNIXPU_TEST_COMFY_ATTENTION_SOURCE"
     if key not in os.environ:
         pytest.skip(f"set {key} to the pinned Comfy attention.py for this integration check")
@@ -28,21 +28,21 @@ def _pinned_comfy_wrap_attn():
     if not source.is_file():
         pytest.fail(f"explicit pinned Comfy source is missing: {source}")
     contents = source.read_bytes()
-    if hashlib.sha256(contents).hexdigest() != "9cafaafaf93ff53e8cbefb5e4a204014019985df2da8c1996bf40f1235fc2960":
-        pytest.fail("explicit Comfy attention.py is not pinned 73c9 source")
+    if hashlib.sha256(contents).hexdigest() != "bc0a142275a9b1ebacd42d75d674ac6ce74e1c6bbdedeb8fc52706599d4ad498":
+        pytest.fail("explicit Comfy attention.py is not pinned b0b74356 source")
     module = ast.parse(contents.decode("utf-8"), filename=str(source))
-    functions = [node for node in module.body
-                 if isinstance(node, ast.FunctionDef) and node.name == "wrap_attn"]
-    if len(functions) != 1:
-        pytest.fail("pinned Comfy source does not define exactly one wrap_attn")
-    namespace = {
-        "functools": functools,
-        # This focused fixture calls wrap_attn with plain fake tensors, so its
-        # container branch must remain false without importing Comfy runtime.
-        "AttentionTensorContainer": type("AttentionTensorContainer", (), {}),
-    }
-    exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), namespace)
-    return namespace["wrap_attn"]
+    definitions = [node for node in module.body if
+                   (isinstance(node, ast.FunctionDef) and node.name == "wrap_attn") or
+                   (isinstance(node, ast.ClassDef) and node.name == "AttentionTensorContainer")]
+    if len(definitions) != 2:
+        pytest.fail("pinned Comfy source must define wrap_attn and AttentionTensorContainer")
+    namespace = {"functools": functools, "torch": torch}
+    exec(compile(ast.Module(body=definitions, type_ignores=[]), str(source), "exec"), namespace)
+    return namespace
+
+
+def _pinned_comfy_wrap_attn():
+    return _pinned_comfy_attention_namespace()["wrap_attn"]
 
 
 def _load_module(name: str, path: Path):
@@ -1065,6 +1065,46 @@ def test_bmg_masked_d128_accepts_pinned_comfy_wrap_marker_only(monkeypatch, vari
         q, kv, kv, heads=32, mask=mask, unknown_semantics=True,
     ) == "torch-output"
     assert len(selected) == 1 and calls == ["torch", "torch"]
+
+
+def test_pinned_comfy_containers_are_consumed_by_omnixpu(monkeypatch):
+    namespace = _pinned_comfy_attention_namespace()
+    container = namespace["AttentionTensorContainer"]
+    patch, attention, calls = _load_patch(
+        monkeypatch, target="bmg", torch_version="2.14.0+xpu",
+        wrap_attn=namespace["wrap_attn"],
+    )
+    carriers = [container(_FakeTensor(seq=64, heads=4)) for _ in range(3)]
+    result = attention.optimized_attention(
+        *carriers, heads=4, skip_reshape=True,
+        preferred_attention=types.SimpleNamespace(function=None),
+    )
+    assert all(value.tensor is None for value in carriers)
+    assert result.shape == (1, 64, 512)
+    assert calls in (["cute"], ["cute_d128_bhld"])
+
+
+def test_pinned_comfy_preferred_attention_owns_container_consumption(monkeypatch):
+    namespace = _pinned_comfy_attention_namespace()
+    container = namespace["AttentionTensorContainer"]
+    _, attention, calls = _load_patch(
+        monkeypatch, target="bmg", torch_version="2.14.0+xpu",
+        wrap_attn=namespace["wrap_attn"],
+    )
+    preferred_calls = []
+
+    @namespace["wrap_attn"]
+    def preferred(q, k, v, heads, **kwargs):
+        preferred_calls.append((q, k, v, heads))
+        return "preferred-output"
+
+    carriers = [container(_FakeTensor(seq=64, heads=4)) for _ in range(3)]
+    result = attention.optimized_attention(
+        *carriers, heads=4, skip_reshape=True,
+        preferred_attention=types.SimpleNamespace(function=preferred),
+    )
+    assert result == "preferred-output" and len(preferred_calls) == 1
+    assert calls == [] and all(value.tensor is None for value in carriers)
 
 
 def test_bmg_masked_d128_direct_is_explicit_and_keeps_other_masks_on_torch(monkeypatch):
