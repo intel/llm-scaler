@@ -1,5 +1,15 @@
 # omni_xpu_kernel Windows WHL 构建与 Portable 安装
 
+> **Windows Torch 2.14 开放构建 — 2026-10-08。** 构建代码已允许
+> `2.14.0+xpu`，沿用当前 oneAPI/oneDNN 2026.0、package 2026.0.0 /
+> native ABI 3.11.2 合同，并将三组 Windows 扩展的语言标准切换为 C++20。
+> Torch 2.14 的 wheel 身份按现有规则生成 `0.2.0b2+torch214.bmg`；
+> Python ABI、target、DLL/header ABI 检查和 CUTE 双重 opt-in 均保留。
+> 本轮只完成构建合同测试，尚未执行 Windows wheel build/安装态验收。
+> 以下 Torch 2.13 配方和 artifact SHA 保留为最近一次实测的历史身份；
+> 用 2.14 构建时，解释器、Torch 安装/断言和 wheel 选择必须一致改为
+> `2.14.0+xpu` / `torch214`，不能复用下列 Torch 2.13 wheel。
+
 本文只描述当前 Windows 构建合同：
 
 ```text

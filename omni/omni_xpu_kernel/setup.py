@@ -37,6 +37,7 @@ WINDOWS_ONEDNN_CONTRACTS = {
     "2.11": ("2025.3.0", (3, 9, 1), "2025.3"),
     "2.12": ("2025.3.0", (3, 9, 1), "2025.3"),
     "2.13": ("2026.0.0", (3, 11, 2), "2026.0"),
+    "2.14": ("2026.0.0", (3, 11, 2), "2026.0"),
 }
 
 
@@ -80,10 +81,18 @@ PACKAGE_VERSION = VERSION_NAMESPACE["get_package_version"](
 )
 
 
-def get_linux_cxx_standard(torch_version):
+def get_torch_cxx_standard(torch_version):
     """Use the language level required by the selected Torch headers."""
     torch_minor = VERSION_NAMESPACE["get_torch_minor"](torch_version)
-    return "-std=c++20" if torch_minor == "2.14" else "-std=c++17"
+    return "c++20" if torch_minor == "2.14" else "c++17"
+
+
+def get_linux_cxx_standard(torch_version):
+    return "-std=" + get_torch_cxx_standard(torch_version)
+
+
+def get_windows_cxx_standard(torch_version):
+    return "/std:" + get_torch_cxx_standard(torch_version)
 
 
 XPU_ARCH_MACROS = {
@@ -797,6 +806,7 @@ class ICPXBuildExt(build_ext):
             cmd = [
                 icpx,
                 "-fsycl",
+                get_windows_cxx_standard(BUILD_TORCH_VERSION),
             ]
             
             if is_lgrf:
@@ -805,7 +815,6 @@ class ICPXBuildExt(build_ext):
                     "-Xs", f"-device {BUILD_XPU_TARGET} -options -doubleGRF",
                     "/O2", "/DNDEBUG",
                     "/EHsc",
-                    "/std:c++17",
                     "/DNOMINMAX",
                     "/DWIN32_LEAN_AND_MEAN",
                     "-DBUILD_ESIMD_KERNEL_LIB",
@@ -840,7 +849,6 @@ class ICPXBuildExt(build_ext):
                     "-DNDEBUG",
                     "/MD",
                     "/EHsc",
-                    "/std:c++17",
                     "/LD",
                     "-fsycl-targets=spir64_gen",
                     "-Xsycl-target-backend=spir64_gen",
@@ -892,7 +900,6 @@ class ICPXBuildExt(build_ext):
                     "/DNOMINMAX",
                     "/DWIN32_LEAN_AND_MEAN",
                     "/EHsc",  # Enable C++ exception handling
-                    "/std:c++17",
                 ]
                 cmd += get_kernel_tuning_compile_args(windows=True)
                 # PyTorch XPU wheels also bundle oneDNN headers. Keep the

@@ -114,6 +114,9 @@ def test_windows_onednn_contract_tracks_torch_minor(monkeypatch):
 
     assert get_contract("2.12.0+xpu") == ("2025.3.0", (3, 9, 1), "2025.3")
     assert get_contract("2.13.0+xpu") == ("2026.0.0", (3, 11, 2), "2026.0")
+    assert get_contract("2.14.0+xpu") == ("2026.0.0", (3, 11, 2), "2026.0")
+    with pytest.raises(RuntimeError, match="No Windows oneDNN contract"):
+        get_contract("2.15.0+xpu")
 
 
 def test_linux_cxx_standard_tracks_torch_headers(monkeypatch):
@@ -126,6 +129,9 @@ def test_linux_cxx_standard_tracks_torch_headers(monkeypatch):
 
     assert get_standard("2.13.0+xpu") == "-std=c++17"
     assert get_standard("2.14.0+xpu") == "-std=c++20"
+    get_windows_standard = namespace["get_windows_cxx_standard"]
+    assert get_windows_standard("2.13.0+xpu") == "/std:c++17"
+    assert get_windows_standard("2.14.0+xpu") == "/std:c++20"
 
 
 def test_windows_compile_env_adds_aot_companion_tools(monkeypatch, tmp_path):
