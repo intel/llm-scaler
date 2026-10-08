@@ -11,6 +11,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {}
 # Resolve package directory (works regardless of how we're loaded)
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _PKG = "ComfyUI-OmniXPU"
+# ComfyUI registers directory custom nodes under their full path. Our named
+# child modules need this package alias for imports from the plugin root.
+sys.modules.setdefault(_PKG, sys.modules[__name__])
 
 
 def _load(rel_path, mod_name):
