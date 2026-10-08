@@ -1,16 +1,30 @@
 # omni_xpu_kernel Windows WHL 构建与 Portable 安装
 
-> **Windows Torch 2.14 开放构建 — 2026-10-08。** 构建代码已允许
-> `2.14.0+xpu`，沿用当前 oneAPI/oneDNN 2026.0、package 2026.0.0 /
-> native ABI 3.11.2 合同，并将三组 Windows 扩展的语言标准切换为 C++20。
+> **Windows Torch 2.14 构建合同更新 — 2026-10-09。** 构建代码允许
+> `2.14.0+xpu`，使用 oneAPI 2026.1、oneDNN package 2026.1.0 /
+> native ABI 3.12.0，并将三组 Windows 扩展的语言标准切换为 C++20。
 > Torch 2.14 的 wheel 身份按现有规则生成 `0.2.0b2+torch214.bmg`；
 > Python ABI、target、DLL/header ABI 检查和 CUTE 双重 opt-in 均保留。
 > 本轮只完成构建合同测试，尚未执行 Windows wheel build/安装态验收。
 > 以下 Torch 2.13 配方和 artifact SHA 保留为最近一次实测的历史身份；
-> 用 2.14 构建时，解释器、Torch 安装/断言和 wheel 选择必须一致改为
-> `2.14.0+xpu` / `torch214`，不能复用下列 Torch 2.13 wheel。
+> 用 2.14 构建时，Torch 安装/断言和 wheel 选择必须一致改为
+> `2.14.0+xpu` / `torch214`；compiler、oneDNN 和 ocloc 的安装目录必须
+> 对齐 `2026.1`，不能复用下列 Torch 2.13 wheel。
 
-本文只描述当前 Windows 构建合同：
+Windows 依赖按 Torch minor 选择：
+
+| Torch | oneAPI 安装系列 | oneDNN package / native ABI | C++ 标准 |
+|---|---|---|---|
+| 2.13.0+xpu | 2026.0 | 2026.0.0 / 3.11.2 | C++17 |
+| 2.14.0+xpu | 2026.1 | 2026.1.0 / 3.12.0 | C++20 |
+
+2.14 的依赖来自[官方 Windows wheel](https://download.pytorch.org/whl/xpu/torch-2.14.0%2Bxpu-cp313-cp313-win_amd64.whl)
+的 runtime metadata 和 bundled `oneapi/dnnl/dnnl_version.h`。
+`setup.py` 自动查找对应 oneAPI 系列，并校验 headers/runtime DLL 的 native ABI。
+Torch 2.14 Portable 对应 torchvision 0.29.0+xpu；现有 torchaudio 2.11.0+xpu
+例外保留。Python ABI、sycl-tla revision、BMG target 和版本命名规则沿用下列配方。
+
+以下各节保留最近一次已验收的 Torch 2.13 历史配方和 artifact 身份：
 
 ```text
 Python 3.13.14
