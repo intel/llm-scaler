@@ -174,6 +174,9 @@ torch::Tensor fused_scaleback(
 
     TORCH_CHECK(x_scale.numel() == M, "x_scale must have M=", M, " elements");
     TORCH_CHECK(w_scale.numel() == 1 || w_scale.numel() == N, "w_scale must be scalar or [N]");
+    TORCH_CHECK(!has_bias || bias->numel() == N,
+        "bias must contain exactly N=", N, " elements, got numel=",
+        has_bias ? bias->numel() : -1);
 
     torch::ScalarType out_dtype;
     switch (out_dtype_code) {
