@@ -12,6 +12,7 @@ Test structure mirrors comfy-kitchen's test_int8.py + test_qdq.py:
 """
 
 from contextlib import nullcontext
+import sys
 
 import pytest
 import torch
@@ -1870,6 +1871,25 @@ class TestXPUNativeInt8:
 
         assert stats2["hits"] > stats1["hits"], "Second call should hit cache"
         assert stats2["size"] == stats1["size"], "Cache size should not grow"
+
+    def test_onednn_cache_release_rebuilds_primitive(self, device, seed):
+        if device.type != "xpu" or sys.platform != "linux":
+            pytest.skip("Linux XPU oneDNN cache release requires native execution")
+
+        from omni_xpu_kernel import int8
+
+        int8.int8_cache_clear()
+        x = torch.randn(16, 128, device=device, dtype=torch.bfloat16)
+        w = torch.randn(64, 128, device=device, dtype=torch.bfloat16)
+        w_int8, w_scale = int8.quantize_int8_tensorwise(w)
+        before = int8.int8_linear(x, w_int8, w_scale, out_dtype=torch.bfloat16)
+        assert int8.int8_cache_stats()["size"] >= 1
+
+        assert int8.release_onednn_int8_cache() >= 1
+        assert int8.int8_cache_stats()["size"] == 0
+        after = int8.int8_linear(x, w_int8, w_scale, out_dtype=torch.bfloat16)
+        torch.testing.assert_close(after, before, rtol=0, atol=0)
+        assert int8.int8_cache_stats()["size"] >= 1
 
     def test_cache_miss_on_shape_change(self, device, seed):
         """Different GEMM shapes create separate cache entries."""

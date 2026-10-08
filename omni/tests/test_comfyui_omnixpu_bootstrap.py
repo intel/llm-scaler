@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import importlib
 import sys
 import types
 from pathlib import Path
@@ -32,6 +33,32 @@ def _load_registry(monkeypatch):
         _PLUGIN / "patches" / "__init__.py",
         package_path=_PLUGIN / "patches",
     )
+
+
+def test_directory_style_custom_node_load_supports_root_relative_imports(monkeypatch):
+    package_name = "ComfyUI-OmniXPU"
+    for name in list(sys.modules):
+        if name == package_name or name.startswith(package_name + "."):
+            monkeypatch.delitem(sys.modules, name)
+    torch = types.ModuleType("torch")
+    torch.xpu = types.SimpleNamespace(is_available=lambda: False)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    # Match the directory branch of upstream nodes.load_custom_node().
+    loaded_name = str(_PLUGIN).replace(".", "_x_")
+    spec = importlib.util.spec_from_file_location(loaded_name, _PLUGIN / "__init__.py")
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, loaded_name, module)
+    try:
+        spec.loader.exec_module(module)
+        compat = importlib.import_module(package_name + ".compiler_compat")
+        adapter = importlib.import_module(package_name + ".adapters.aimdo_memory_compiler")
+        assert sys.modules[package_name] is module
+        assert adapter.preflight is compat.preflight
+        assert callable(adapter.apply)
+    finally:
+        for name in list(sys.modules):
+            if name == package_name or name.startswith(package_name + "."):
+                sys.modules.pop(name, None)
 
 
 def test_generic_kitchen_operations_are_not_custom_node_components(monkeypatch):
@@ -66,6 +93,7 @@ def test_dynamic_vram_trim_runs_inside_lora_budget_wrapper(monkeypatch):
 def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     for name in (
         "OMNIXPU_ENABLE",
+        "AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC",
         "OMNIXPU_ATTENTION",
         "OMNIXPU_ROTARY",
         "OMNIXPU_NORM",
@@ -100,6 +128,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     assert config.large_video_preprocess
     assert not config.interpolate_fix
     assert not config.median_fix
+    assert not config.aimdo_memory_compiler
     assert not hasattr(config, "rope")
     assert not hasattr(config, "int8")
     assert not hasattr(config, "fp8_neg_zero_fix")
@@ -108,6 +137,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
 def test_disabled_components_are_reported_without_importing_modules(monkeypatch):
     patches = _load_registry(monkeypatch)
     cfg = types.SimpleNamespace(
+        aimdo_memory_compiler=False,
         attention=False,
         sparse_attention=False,
         rotary=False,

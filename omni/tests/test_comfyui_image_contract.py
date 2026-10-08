@@ -49,11 +49,11 @@ DEMO_ASSETS = {
 STACK_PINS = {
     "BASE_IMAGE": (
         "BASE_IMAGE",
-        "intel/omix:0.3.0-devel-ubuntu24.04@sha256:"
-        "53e2c4503beeea4aff906dea180933be672449bcf04eb38df3d89622a1cd0967",
+        "intel/omix:0.4.0-devel-ubuntu24.04@sha256:"
+        "ee48e296161b7da989ffbfbbb3390b428e842590eda6258e1f86def3970ef0b3",
     ),
-    "TORCH_VERSION": ("TORCH_VERSION", "2.13.0+xpu"),
-    "TORCHVISION_VERSION": ("TORCHVISION_VERSION", "0.28.0+xpu"),
+    "TORCH_VERSION": ("TORCH_VERSION", "2.14.0+xpu"),
+    "TORCHVISION_VERSION": ("TORCHVISION_VERSION", "0.29.0+xpu"),
     "TORCHAUDIO_VERSION": ("TORCHAUDIO_VERSION", "2.11.0+xpu"),
     "ONEDNN_VERSION": ("ONEDNN_VERSION", "2026.0.0"),
     "ONEDNN_SOURCE_REPOSITORY": (
@@ -95,7 +95,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_KITCHEN_COMMIT": (
         "KITCHEN_COMMIT",
-        "20a69c1ef0cbbb73675e3115aa78c0ea70a9a2b1",
+        "ea43fcf8e301143f1c716416a1e9ce277b1657d4",
     ),
     "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.35"),
     "COMFY_KITCHEN_PROVIDER_VERSION": (
@@ -108,7 +108,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_AIMDO_COMMIT": (
         "AIMDO_COMMIT",
-        "cc3729fc59eeab77bd4c8b28b80e49c9faa855d4",
+        "80ef0f9abdb384a47d81058b4bec87a201ff63e4",
     ),
     "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.5.5"),
     "COMFY_AIMDO_PROVIDER_VERSION": (

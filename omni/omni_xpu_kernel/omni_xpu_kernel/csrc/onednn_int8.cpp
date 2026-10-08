@@ -575,6 +575,23 @@ std::tuple<int64_t, int64_t, int64_t> int8_cache_stats() {
     };
 }
 
+#if defined(__linux__)
+int64_t release_onednn_int8_cache() {
+    const int64_t entries = std::get<2>(int8_cache_stats());
+    int8_cache_clear();
+
+    int capacity = 0;
+    TORCH_CHECK(dnnl_get_primitive_cache_capacity(&capacity) == dnnl_success,
+                "Could not read linked oneDNN primitive cache capacity");
+    const auto clear_status = dnnl_set_primitive_cache_capacity(0);
+    const auto restore_status = dnnl_set_primitive_cache_capacity(capacity);
+    TORCH_CHECK(clear_status == dnnl_success &&
+                    restore_status == dnnl_success,
+                "Could not flush and restore linked oneDNN primitive cache");
+    return entries;
+}
+#endif
+
 torch::Tensor mm_int8(
     torch::Tensor a,
     torch::Tensor b

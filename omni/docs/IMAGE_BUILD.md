@@ -25,9 +25,9 @@ The supported environment overrides are:
 |---|---|---|
 | `XPU_TARGET` | Native GPU build target | `bmg` |
 | `OMNI_IMAGE_REPOSITORY` | Local image repository | `intel/llm-scaler-omni` |
-| `OMNI_BASE_IMAGE` | OMIX development base | `intel/omix:0.3.0-devel-ubuntu24.04` at the digest pinned in `build.sh` |
-| `OMNI_TORCH_VERSION` | PyTorch XPU wheel | `2.13.0+xpu` |
-| `OMNI_TORCHVISION_VERSION` | torchvision XPU wheel | `0.28.0+xpu` |
+| `OMNI_BASE_IMAGE` | OMIX development base | `intel/omix:0.4.0-devel-ubuntu24.04` at the digest pinned in `build.sh` |
+| `OMNI_TORCH_VERSION` | PyTorch XPU wheel | `2.14.0+xpu` |
+| `OMNI_TORCHVISION_VERSION` | torchvision XPU wheel | `0.29.0+xpu` |
 | `OMNI_TORCHAUDIO_VERSION` | ComfyUI audio compatibility wheel | `2.11.0+xpu` |
 | `OMNI_ONEDNN_VERSION` | Matched oneDNN runtime/development wheels | `2026.0.0` (oneDNN `3.11.2`) |
 | `OMNI_ONEDNN_SOURCE_REPOSITORY` | oneDNN source repository | official oneDNN repository pinned in `build.sh` |
@@ -48,6 +48,7 @@ The supported environment overrides are:
 | `COMFY_AIMDO_COMMIT` | AIMDO XPU provider source revision | pinned in `build.sh` |
 | `COMFY_AIMDO_VERSION` | Official AIMDO dependency version | pinned in `build.sh` |
 | `COMFY_AIMDO_PROVIDER_VERSION` | Provider distribution/source-wheel version | pinned in `build.sh` |
+| `AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC` | Build the private AIMDO native-owner sidecar, without changing ComfyUI files | `0` |
 | `COMFY_GGUF_REPOSITORY` | GGUF custom-node source repository | pinned in `build.sh` |
 | `COMFY_GGUF_COMMIT` | GGUF custom-node source revision | pinned in `build.sh` |
 | `COMFY_NUNCHAKU_REPOSITORY` | Combined Nunchaku custom-node/runtime repository | pinned in `build.sh` |
@@ -60,11 +61,27 @@ pinned provider source wheels. The provider manifests declare which official
 versions each source wheel accepts, and image validation checks both identities.
 For the ComfyUI 0.37.0 candidate, official Kitchen 0.2.35 uses the matching
 0.2.35 provider source at `xiangyuT/comfy-kitchen-xpu`
-(`20a69c1ef0cbbb73675e3115aa78c0ea70a9a2b1`). Official AIMDO 0.5.5 uses
+(`ea43fcf8e301143f1c716416a1e9ce277b1657d4`). Official AIMDO 0.5.5 uses
 the matching 0.5.5 provider source at `xiangyuT/comfy-aimdo-xpu`
-(`cc3729fc59eeab77bd4c8b28b80e49c9faa855d4`). Both provider manifests
+(`80ef0f9abdb384a47d81058b4bec87a201ff63e4`). Both provider manifests
 accept their matching official 0.2.35 and 0.5.5 versions.
 GGUF repository and commit must be updated together.
+The private sidecar build requires the Torch release supported by llm-scaler
+(currently `2.14.0+xpu`) and an explicitly selected AIMDO revision that contains
+the sidecar. `ComfyUI-OmniXPU/aimdo_release_compat.py` applies that release policy
+before building and before runtime takeover. After building and before packaging,
+the same script reads the sidecar's `aimdo_full_proxy_torch_version()` export and
+requires it to match installed Torch and the provider's declared `TORCH_VERSION`.
+It does not install the native allocator. Torch library hashes and a separate
+AIMDO ABI JSON file are not admission inputs. It does
+not require a fixed ComfyUI commit. The retired
+`OMNI_AIMDO_TORCH214_CALLER_PATCH=1` switch is rejected; no ComfyUI source patch
+is copied or applied for memory-compiler integration. At runtime,
+`AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC=1` selects the opt-in OmniXPU caller adapter.
+ComfyUI allocation boundaries and kernel cache APIs are checked before native
+takeover. Incompatible caller changes disable this diagnostic while retaining
+the independently selected base allocator route. The adapter remains private;
+public AIMDO XPU memory-compiler availability is unchanged.
 The same rule applies to the combined Nunchaku repository, commit, and
 distribution version; the current source revision is
 `9f5604445f56154dd44e8b4acfed1aef868003c5`. Sparse attention uses
@@ -82,8 +99,8 @@ top-level package.
 
 The AIMDO Unified Runtime hook is compiled against
 `/opt/venv/include/unified-runtime/ur_api.h`, which belongs to the
-Torch-matched runtime family used by the final image. OMIX 0.3 supplies the
-oneAPI 2026.1 compiler, but its compiler include tree is not used as the AIMDO
+Torch-matched runtime family used by the final image. OMIX supplies the build
+toolchain, but its compiler include tree is not used as the AIMDO
 hook ABI contract. The runtime entrypoint likewise places the venv Unified
 Runtime loader before the OMIX build-toolchain libraries. The final image also
 exports that directory as `UR_INCLUDE_DIR` so AIMDO's maintained native-hook
@@ -91,8 +108,7 @@ helper build uses the same explicit ABI contract during installed-image
 validation.
 
 This focused image is single-XPU and does not copy the legacy
-`libsycl-native-*.spv` multi-XPU blobs used by older platform images. OMIX 0.3
-and oneAPI 2026.1 do not ship those files; the card-specific BMG binaries are
+`libsycl-native-*.spv` multi-XPU blobs used by older platform images. The card-specific BMG binaries are
 embedded in the AOT kernel wheel instead.
 
 The focused image installs the version-pinned integrated `comfyui-manager` package and
@@ -118,7 +134,7 @@ torchaudio, `omni_xpu_kernel`, and the two provider distributions. Normal
 ComfyUI dependency upgrades can move the official packages, but cannot
 silently replace the Torch ABI or provider artifacts.
 
-The official XPU index does not provide a Torch-2.13-matched `torchaudio`
+The official XPU index does not provide a Torch-2.14-matched `torchaudio`
 wheel, while ComfyUI requires torchaudio and the maintained workflows include
 audio. The focused image therefore keeps the existing `2.11.0+xpu` wheel as
 an explicit compatibility exception. That XPU wheel has no exact Torch
@@ -127,7 +143,7 @@ requires its exact version and performs an XPU resample with shape and finite
 output checks. The canonical audio workflows remain the milestone-level gate.
 
 The `onednn` and `onednn-devel` wheels provide the 2026.0 runtime package
-layout and SYCL/Unified Runtime dependencies expected by Torch 2.13. The
+layout retained by the validated Torch 2.14 development setup. The
 focused build replaces only `libdnnl` with the exact official oneDNN 3.11.2
 release source plus the checked-in, SHA256-pinned two-site BF16/INT4
 dequantization compatibility patch. The patch restores the behavior removed
@@ -136,8 +152,8 @@ downgrade the rest of the Torch/oneAPI stack. The build records source,
 patch, and installed-library identities in
 `/llm/manifests/onednn-runtime.env`.
 
-OMIX 0.3 supplies the 2026.1 compiler toolchain, while Torch 2.13 pins its
-packaged SYCL and Unified Runtime libraries to 2026.0. The final image keeps
+OMIX 0.4 supplies the newer build toolchain, while Torch 2.14 pins its
+packaged SYCL and Unified Runtime libraries to 2026.1. The final image keeps
 OMIX initialization for compiler and tool discovery, then restores
 `/opt/venv/lib` and the discovered Torch library directory to the front of
 `LD_LIBRARY_PATH` through `entrypoints/omix_torch_runtime.sh`. This prevents a process

@@ -41,7 +41,7 @@ The package and `intel/llm-scaler-omni` image versions share the source in
 derives its native identity from the active Torch installation and
 `OMNI_XPU_DEVICE`.
 
-The packaging layer recognizes Torch XPU minors 2.10, 2.11, 2.12, and 2.13. Each
+The packaging layer recognizes Torch XPU minors 2.10, 2.11, 2.12, 2.13, and 2.14. Each
 Torch/GPU pair still requires its own build and runtime validation; recognizing
 a version is not a validation claim. The generated wheel uses a PEP 440 local
 version such as:
@@ -53,6 +53,8 @@ omni_xpu_kernel-0.2.0b2+torch213.ptlh
 
 Build and install a different wheel for every Torch/GPU pair. The wheel
 metadata pins the exact public Torch version used at build time.
+Linux builds select C++20 for Torch 2.14 headers; older supported Torch minors
+retain C++17. Torch 2.13 remains the current validated complete image build.
 
 After installation, these values come from the wheel's own metadata:
 
@@ -501,6 +503,17 @@ XPU operation. Check `kitchen.supports_rms_norm_quantize_int8()` before using
 it with `int8.int8_linear_prequantized`.
 For BF16/FP16 ConvRot inputs, `kitchen.rms_norm_convrot_quantize_int8` also
 performs the supported 64- or 256-channel rotation in that operation.
+
+### ConvRot cache ownership
+
+The native ConvRot route caches one Hadamard matrix per XPU device, dtype and
+group size. Callers with a temporary allocation scope can set
+`int8.set_allocation_context_factory(factory)` so the matrix is prepared under
+the caller's persistent-allocation context before ConvRot outputs are routed.
+The eager INT8 wrappers do this automatically. A compiled caller should call
+`int8.prepare_convrot_hadamard(example, group_size)` before entering its
+compiled region. Reset the factory to `contextlib.nullcontext` when the caller
+integration ends.
 
 ### Comfy Kitchen AWQ W4A16
 

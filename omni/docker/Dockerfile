@@ -8,10 +8,10 @@
 # and the disabled media/3D node bundle. Raylight's xDiT-based multi-XPU
 # ComfyUI integration is not part of this image; this image targets one XPU.
 
-ARG BASE_IMAGE=intel/omix:0.3.0-devel-ubuntu24.04@sha256:53e2c4503beeea4aff906dea180933be672449bcf04eb38df3d89622a1cd0967
+ARG BASE_IMAGE=intel/omix:0.4.0-devel-ubuntu24.04@sha256:ee48e296161b7da989ffbfbbb3390b428e842590eda6258e1f86def3970ef0b3
 ARG PYTHON_VERSION=3.12
-ARG TORCH_VERSION=2.13.0+xpu
-ARG TORCHVISION_VERSION=0.28.0+xpu
+ARG TORCH_VERSION=2.14.0+xpu
+ARG TORCHVISION_VERSION=0.29.0+xpu
 ARG TORCHAUDIO_VERSION=2.11.0+xpu
 ARG ONEDNN_VERSION=2026.0.0
 ARG ONEDNN_SOURCE_REPOSITORY=https://github.com/uxlfoundation/oneDNN.git
@@ -30,11 +30,11 @@ ARG COMFYUI_FRONTEND_VERSION=1.52.7
 ARG COMFYUI_WORKFLOW_TEMPLATES_VERSION=0.11.66
 ARG COMFYUI_MANAGER_VERSION=4.2.2
 ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
-ARG COMFY_KITCHEN_COMMIT=20a69c1ef0cbbb73675e3115aa78c0ea70a9a2b1
+ARG COMFY_KITCHEN_COMMIT=ea43fcf8e301143f1c716416a1e9ce277b1657d4
 ARG COMFY_KITCHEN_VERSION=0.2.35
 ARG COMFY_KITCHEN_PROVIDER_VERSION=0.2.35
 ARG COMFY_AIMDO_REPOSITORY=https://github.com/xiangyuT/comfy-aimdo-xpu.git
-ARG COMFY_AIMDO_COMMIT=cc3729fc59eeab77bd4c8b28b80e49c9faa855d4
+ARG COMFY_AIMDO_COMMIT=80ef0f9abdb384a47d81058b4bec87a201ff63e4
 ARG COMFY_AIMDO_VERSION=0.5.5
 ARG COMFY_AIMDO_PROVIDER_VERSION=0.5.5
 ARG COMFY_GGUF_REPOSITORY=https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git
@@ -350,6 +350,8 @@ ARG COMFY_AIMDO_COMMIT
 ARG COMFY_AIMDO_PROVIDER_VERSION
 ARG TORCH_VERSION
 ARG XPU_TARGET
+ARG AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC=0
+COPY ComfyUI-OmniXPU/aimdo_release_compat.py /tmp/check_aimdo_torch_release.py
 
 RUN cd /llm && \
     git clone --filter=blob:none --no-checkout \
@@ -360,9 +362,19 @@ RUN cd /llm && \
     pip install setuptools-scm==10.2.1 && \
     source /opt/intel/oneapi/setvars.sh --force && \
     cd /llm/comfy-aimdo-xpu && \
+    if [ "${AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC}" = "1" ]; then \
+        python /tmp/check_aimdo_torch_release.py; \
+    fi && \
     test -f /opt/venv/include/unified-runtime/ur_api.h && \
     UR_INCLUDE_DIR=/opt/venv/include/unified-runtime \
+    AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC="${AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC}" \
+    AIMDO_TORCH_PYTHON=/opt/venv/bin/python \
         ./scripts/build-linux-xpu.sh && \
+    if [ "${AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC}" = "1" ]; then \
+        /opt/venv/bin/python /tmp/check_aimdo_torch_release.py \
+            --torch-version "${TORCH_VERSION}" \
+            --native-owner comfy_aimdo/aimdo_xpu_native_owner.so; \
+    fi && \
     mkdir -p /wheels/aimdo-source /wheels/aimdo-provider && \
     SETUPTOOLS_SCM_PRETEND_VERSION="${COMFY_AIMDO_PROVIDER_VERSION}" \
         pip wheel . --wheel-dir /wheels/aimdo-source \
@@ -408,7 +420,11 @@ ARG IMAGE_TAG
 ARG XPU_TARGET
 ARG MAX_JOBS
 ARG COMFY_KITCHEN_PROVIDER_VERSION
+ARG COMFY_KITCHEN_COMMIT
 ARG COMFY_AIMDO_PROVIDER_VERSION
+ARG TORCH_VERSION
+ARG COMFYUI_COMMIT
+ARG COMFY_AIMDO_COMMIT
 
 ENV TORCH_XPU_ARCH_LIST=${XPU_TARGET} \
     OMNI_XPU_DEVICE=${XPU_TARGET} \

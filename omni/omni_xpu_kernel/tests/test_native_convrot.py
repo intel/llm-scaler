@@ -28,3 +28,15 @@ def test_native_convrot_weight_roundtrip():
     assert q.dtype == torch.int8
     assert scale.shape == (32, 1)
     assert (restored - weight.float()).abs().mean().item() < 0.02
+
+
+def test_native_convrot_cache_release_and_rebuild():
+    if not torch.xpu.is_available():
+        pytest.skip("XPU is unavailable")
+    x = torch.randn(5, 512, device="xpu:0", dtype=torch.bfloat16)
+    before = int8.rotate_convrot(x, 256)
+    assert int8.clear_convrot_hadamard_cache(0) >= 1
+    assert int8.clear_convrot_hadamard_cache(0) == 0
+    after = int8.rotate_convrot(x, 256)
+    torch.testing.assert_close(after, before, rtol=0, atol=0)
+    assert int8.clear_convrot_hadamard_cache(0) >= 1

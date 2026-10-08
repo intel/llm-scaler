@@ -3,6 +3,7 @@
 #include <map>
 #include <mutex>
 #include <tuple>
+#include <vector>
 
 namespace omni_xpu {
 namespace int8_ops {
@@ -75,6 +76,37 @@ torch::Tensor get_hadamard(
 }
 
 }  // namespace
+
+void prepare_convrot_hadamard(torch::Tensor exemplar, int64_t group_size,
+                              bool fp32) {
+    TORCH_CHECK(exemplar.device().is_xpu(), "exemplar must be on XPU");
+    TORCH_CHECK(fp32 || exemplar.is_floating_point(),
+                "exemplar must be floating point unless fp32 is selected");
+    validate_group_size(group_size);
+    (void)get_hadamard(group_size,
+                       fp32 ? torch::kFloat32 : exemplar.scalar_type(),
+                       exemplar.device());
+}
+
+int64_t clear_convrot_hadamard_cache(int64_t device_index) {
+    TORCH_CHECK(device_index >= 0, "ConvRot cache device index must be nonnegative");
+    std::vector<torch::Tensor> released;
+    {
+        std::lock_guard<std::mutex> lock(hadamard_mutex());
+        auto& cache = hadamard_cache();
+        for (auto it = cache.begin(); it != cache.end();) {
+            if (std::get<0>(it->first) == device_index) {
+                released.emplace_back(std::move(it->second));
+                it = cache.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    // Drop allocator owners after releasing the cache mutex. Active callers
+    // retain their own Tensor handle until their operation has been submitted.
+    return static_cast<int64_t>(released.size());
+}
 
 torch::Tensor rotate_convrot(torch::Tensor input, int64_t group_size) {
     TORCH_CHECK(input.device().is_xpu(), "input must be on XPU");
