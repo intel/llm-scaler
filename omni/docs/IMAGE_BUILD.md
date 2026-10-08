@@ -48,6 +48,7 @@ The supported environment overrides are:
 | `COMFY_AIMDO_COMMIT` | AIMDO XPU provider source revision | pinned in `build.sh` |
 | `COMFY_AIMDO_VERSION` | Official AIMDO dependency version | pinned in `build.sh` |
 | `COMFY_AIMDO_PROVIDER_VERSION` | Provider distribution/source-wheel version | pinned in `build.sh` |
+| `AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC` | Build the private AIMDO native-owner sidecar, without changing ComfyUI files | `0` |
 | `COMFY_GGUF_REPOSITORY` | GGUF custom-node source repository | pinned in `build.sh` |
 | `COMFY_GGUF_COMMIT` | GGUF custom-node source revision | pinned in `build.sh` |
 | `COMFY_NUNCHAKU_REPOSITORY` | Combined Nunchaku custom-node/runtime repository | pinned in `build.sh` |
@@ -65,6 +66,16 @@ the matching 0.5.5 provider source at `xiangyuT/comfy-aimdo-xpu`
 (`cc3729fc59eeab77bd4c8b28b80e49c9faa855d4`). Both provider manifests
 accept their matching official 0.2.35 and 0.5.5 versions.
 GGUF repository and commit must be updated together.
+The private sidecar build requires its currently supported Torch 2.14 XPU ABI
+and an explicitly selected AIMDO revision that contains the sidecar. It does
+not require a fixed ComfyUI commit. The retired
+`OMNI_AIMDO_TORCH214_CALLER_PATCH=1` switch is rejected; no ComfyUI source patch
+is copied or applied for memory-compiler integration. At runtime,
+`AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC=1` selects the opt-in OmniXPU caller adapter.
+ComfyUI allocation boundaries and kernel cache APIs are checked before native
+takeover. Incompatible caller changes disable this diagnostic while retaining
+the independently selected base allocator route. The adapter remains private;
+public AIMDO XPU memory-compiler availability is unchanged.
 The same rule applies to the combined Nunchaku repository, commit, and
 distribution version; the current source revision is
 `9f5604445f56154dd44e8b4acfed1aef868003c5`. Sparse attention uses

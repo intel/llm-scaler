@@ -66,6 +66,7 @@ def test_dynamic_vram_trim_runs_inside_lora_budget_wrapper(monkeypatch):
 def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     for name in (
         "OMNIXPU_ENABLE",
+        "AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC",
         "OMNIXPU_ATTENTION",
         "OMNIXPU_ROTARY",
         "OMNIXPU_NORM",
@@ -100,6 +101,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     assert config.large_video_preprocess
     assert not config.interpolate_fix
     assert not config.median_fix
+    assert not config.aimdo_memory_compiler
     assert not hasattr(config, "rope")
     assert not hasattr(config, "int8")
     assert not hasattr(config, "fp8_neg_zero_fix")
@@ -108,6 +110,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
 def test_disabled_components_are_reported_without_importing_modules(monkeypatch):
     patches = _load_registry(monkeypatch)
     cfg = types.SimpleNamespace(
+        aimdo_memory_compiler=False,
         attention=False,
         sparse_attention=False,
         rotary=False,

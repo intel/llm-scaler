@@ -64,20 +64,21 @@ AIMDO_REPOSITORY="${COMFY_AIMDO_REPOSITORY:-https://github.com/xiangyuT/comfy-ai
 AIMDO_COMMIT="${COMFY_AIMDO_COMMIT:-cc3729fc59eeab77bd4c8b28b80e49c9faa855d4}"
 AIMDO_VERSION="${COMFY_AIMDO_VERSION:-0.5.5}"
 AIMDO_PROVIDER_VERSION="${COMFY_AIMDO_PROVIDER_VERSION:-0.5.5}"
-AIMDO_CALLER_PATCH="${OMNI_AIMDO_TORCH214_CALLER_PATCH:-0}"
-case "${AIMDO_CALLER_PATCH}" in
+AIMDO_NATIVE_OWNER_DIAGNOSTIC="${AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC:-0}"
+if [ "${OMNI_AIMDO_TORCH214_CALLER_PATCH:-0}" != "0" ]; then
+    echo "The ComfyUI source patch is retired; use AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC for the sidecar build and AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC at runtime" >&2
+    exit 1
+fi
+case "${AIMDO_NATIVE_OWNER_DIAGNOSTIC}" in
     0) ;;
     1)
-        if [ "${TORCH_VERSION}" != "2.14.0+xpu" ] || \
-           [ "${COMFYUI_COMMIT}" != "73c9bad4d21e7addbe1d13bc92eee0f1431b017d" ] || \
-           [ "${AIMDO_COMMIT}" != "50f1fdda083e975e790fd709d6a9becfbbd0667c" ] || \
-           [ "${KITCHEN_COMMIT}" != "ea43fcf8e301143f1c716416a1e9ce277b1657d4" ]; then
-            echo "AIMDO caller patch requires Torch 2.14 and selected ComfyUI, AIMDO and Kitchen revisions" >&2
+        if [ "${TORCH_VERSION}" != "2.14.0+xpu" ]; then
+            echo "AIMDO native-owner sidecar currently requires the Torch 2.14 XPU ABI" >&2
             exit 1
         fi
         ;;
     *)
-        echo "OMNI_AIMDO_TORCH214_CALLER_PATCH must be 0 or 1" >&2
+        echo "AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC must be 0 or 1" >&2
         exit 1
         ;;
 esac
@@ -130,7 +131,7 @@ DOCKER_ARGS=(
     --build-arg "COMFY_AIMDO_COMMIT=${AIMDO_COMMIT}"
     --build-arg "COMFY_AIMDO_VERSION=${AIMDO_VERSION}"
     --build-arg "COMFY_AIMDO_PROVIDER_VERSION=${AIMDO_PROVIDER_VERSION}"
-    --build-arg "AIMDO_XPU_CALLER_PATCH=${AIMDO_CALLER_PATCH}"
+    --build-arg "AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC=${AIMDO_NATIVE_OWNER_DIAGNOSTIC}"
     --build-arg "COMFY_GGUF_REPOSITORY=${GGUF_REPOSITORY}"
     --build-arg "COMFY_GGUF_COMMIT=${GGUF_COMMIT}"
     --build-arg "COMFY_NUNCHAKU_REPOSITORY=${NUNCHAKU_REPOSITORY}"

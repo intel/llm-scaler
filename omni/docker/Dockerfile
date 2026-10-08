@@ -350,7 +350,7 @@ ARG COMFY_AIMDO_COMMIT
 ARG COMFY_AIMDO_PROVIDER_VERSION
 ARG TORCH_VERSION
 ARG XPU_TARGET
-ARG AIMDO_XPU_CALLER_PATCH=0
+ARG AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC=0
 
 RUN cd /llm && \
     git clone --filter=blob:none --no-checkout \
@@ -363,9 +363,13 @@ RUN cd /llm && \
     cd /llm/comfy-aimdo-xpu && \
     test -f /opt/venv/include/unified-runtime/ur_api.h && \
     UR_INCLUDE_DIR=/opt/venv/include/unified-runtime \
-    AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC="${AIMDO_XPU_CALLER_PATCH}" \
+    AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC="${AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC}" \
     AIMDO_TORCH_PYTHON=/opt/venv/bin/python \
         ./scripts/build-linux-xpu.sh && \
+    if [ "${AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC}" = "1" ]; then \
+        test -f comfy_aimdo/aimdo_xpu_native_owner.so && \
+        test -f comfy_aimdo/aimdo_xpu_native_owner_abi.json; \
+    fi && \
     mkdir -p /wheels/aimdo-source /wheels/aimdo-provider && \
     SETUPTOOLS_SCM_PRETEND_VERSION="${COMFY_AIMDO_PROVIDER_VERSION}" \
         pip wheel . --wheel-dir /wheels/aimdo-source \
@@ -416,7 +420,6 @@ ARG COMFY_AIMDO_PROVIDER_VERSION
 ARG TORCH_VERSION
 ARG COMFYUI_COMMIT
 ARG COMFY_AIMDO_COMMIT
-ARG AIMDO_XPU_CALLER_PATCH=0
 
 ENV TORCH_XPU_ARCH_LIST=${XPU_TARGET} \
     OMNI_XPU_DEVICE=${XPU_TARGET} \
@@ -473,17 +476,6 @@ RUN mkdir -p /llm/manifests && \
 # intentionally relies on ComfyUI's Template Browser instead of bundled
 # workflow/input snapshots.
 COPY ./patches /llm/patches
-RUN if [ "${AIMDO_XPU_CALLER_PATCH}" = "1" ]; then \
-        test "${TORCH_VERSION}" = "2.14.0+xpu" && \
-        test "${COMFYUI_COMMIT}" = "73c9bad4d21e7addbe1d13bc92eee0f1431b017d" && \
-        test "${COMFY_AIMDO_COMMIT}" = "50f1fdda083e975e790fd709d6a9becfbbd0667c" && \
-        test "${COMFY_KITCHEN_COMMIT}" = "ea43fcf8e301143f1c716416a1e9ce277b1657d4" && \
-        python -c 'import omni_xpu_kernel as omni; from omni_xpu_kernel import int8; assert callable(int8.set_allocation_context_factory) and hasattr(omni._load_extension().int8, "prepare_convrot_hadamard")' && \
-        git -C /llm/ComfyUI apply --check \
-            /llm/patches/comfyui-aimdo-torch214-memory-compiler.patch && \
-        git -C /llm/ComfyUI apply \
-            /llm/patches/comfyui-aimdo-torch214-memory-compiler.patch; \
-    fi
 COPY ./tools /llm/tools
 RUN mkdir -p /models/host /data/input /data/output /data/user
 COPY ./configs/comfyui_host_models.yaml /llm/configs/comfyui_host_models.yaml

@@ -10,6 +10,9 @@ class Config:
 
     def __init__(self):
         master = os.environ.get("OMNIXPU_ENABLE", "1") != "0"
+        self.aimdo_memory_compiler = (
+            master and os.environ.get("AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC", "0") == "1"
+        )
         self.attention = master and os.environ.get("OMNIXPU_ATTENTION", "1") != "0"
         self.sparse_attention = master and os.environ.get("OMNIXPU_SPARSE_ATTENTION", "1") != "0"
         self.rotary = master and os.environ.get("OMNIXPU_ROTARY", "1") != "0"

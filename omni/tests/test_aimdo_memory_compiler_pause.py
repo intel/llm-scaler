@@ -1,26 +1,21 @@
 """Caller pause ownership when Kitchen reuses an allocation context."""
-import ast
-from contextlib import contextmanager
-from pathlib import Path
+from contextlib import contextmanager, nullcontext
 import threading
 from types import SimpleNamespace
 
 import pytest
+from test_aimdo_memory_compiler_adapter import load_adapter
 
 
-def pause_class():
-    patch = Path(__file__).parents[1] / "patches/comfyui-aimdo-torch214-memory-compiler.patch"
-    lines = patch.read_text().splitlines()
-    start = lines.index(" class _PauseMallocGraph:")
-    source = []
-    for line in lines[start:]:
-        if line.startswith("@@"):
-            break
-        if line.startswith((" ", "+")):
-            source.append(line[1:])
-    tree = ast.parse("\n".join(source))
-    assert len(tree.body) == 1 and isinstance(tree.body[0], ast.ClassDef)
-    graphs, events = {}, []
+def pause_class(monkeypatch):
+    adapter = load_adapter(monkeypatch)
+    events = []
+    class Graphs(dict):
+        def __setitem__(self, key, value):
+            graph = adapter._Graph(runtime, value, None)
+            graph._comfy_active = value._comfy_active
+            super().__setitem__(key, graph)
+    graphs = Graphs()
 
     @contextmanager
     def paused(graph, *, sync):
@@ -32,15 +27,14 @@ def pause_class():
             assert graph.owner is threading.current_thread(), "pause resumed by another thread"
             events.append((graph.name, "exit", sync))
 
-    namespace = {"threading": threading, "MALLOC_GRAPHS": graphs,
-                 "native_owner": SimpleNamespace(paused_graph_scope=paused)}
-    exec(compile(tree, str(patch), "exec"), namespace)
-    return namespace["_PauseMallocGraph"], graphs, events
+    runtime = SimpleNamespace(owner=SimpleNamespace(paused_graph_scope=paused),
+        graph=lambda: graphs.get(threading.get_ident()), original_pause=lambda sync: nullcontext())
+    return lambda sync=False: adapter._Pause(runtime, sync), graphs, events
 
 
 @pytest.mark.parametrize("second_active", (True, False))
-def test_shared_kitchen_context_keeps_each_threads_pause(second_active):
-    cls, graphs, events = pause_class()
+def test_shared_kitchen_context_keeps_each_threads_pause(second_active, monkeypatch):
+    cls, graphs, events = pause_class(monkeypatch)
     shared = cls(sync=True)
     entered_a, entered_b, exited_a = (threading.Event() for _ in range(3))
     errors = []
@@ -78,8 +72,8 @@ def test_shared_kitchen_context_keeps_each_threads_pause(second_active):
     assert events == expected
 
 
-def test_shared_context_retains_nested_and_exceptional_unwind():
-    cls, graphs, events = pause_class()
+def test_shared_context_retains_nested_and_exceptional_unwind(monkeypatch):
+    cls, graphs, events = pause_class(monkeypatch)
     graphs[threading.get_ident()] = SimpleNamespace(
         _comfy_active=True, _comfy_xpu_diagnostic=True,
         owner=threading.current_thread(), name="owner")

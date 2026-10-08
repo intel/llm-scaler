@@ -529,6 +529,26 @@ def _activate_aimdo(
         raise
 
 
+def _compiler_preflight():
+    """Reject incompatible caller flow before control.init installs the sidecar."""
+    if os.environ.get("AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC", "0") != "1":
+        return {"status": "disabled"}
+    path = Path(__file__).with_name("compiler_compat.py")
+    spec = importlib.util.spec_from_file_location("_omnixpu_compiler_compat", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("compiler compatibility module unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        root = module.preflight()
+        module.preflight_dependencies()
+    except module.CompatibilityError as exc:
+        os.environ["AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC"] = "0"
+        _LOG.warning("[OmniXPU] private memory compiler disabled before native takeover: %s", exc)
+        return {"status": "incompatible", "reason": str(exc)}
+    return {"status": "admitted", "comfyui_root": root}
+
+
 def bootstrap(
     *,
     dynamic_vram_override: bool | None = None,
@@ -538,7 +558,8 @@ def bootstrap(
 
     mode = _mode()
     explicit_native = os.environ.get("AIMDO_XPU_ALLOCATOR_MODE", "").strip() == "native_hook"
-    _STATE.update({"status": "running", "mode": mode, "providers": {}, "errors": []})
+    _STATE.update({"status": "running", "mode": mode, "providers": {}, "errors": [],
+                   "memory_compiler": {"status": "disabled"}})
     if mode == "off":
         if explicit_native:
             raise SystemExit("[OmniXPU] explicit native_hook requires provider bootstrap")
@@ -585,6 +606,7 @@ def bootstrap(
         selected_native = explicit_native
         try:
             selected_native = _select_aimdo_allocator_mode(aimdo) == "native_hook"
+            _STATE["memory_compiler"] = _compiler_preflight()
             _activate_aimdo(
                 aimdo,
                 simple_vram_headroom=headroom,

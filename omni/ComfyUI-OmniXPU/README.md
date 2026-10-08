@@ -48,6 +48,24 @@ If an Intel XPU is unavailable, initialization is skipped.
 
 ## Official packages and XPU providers
 
+The private AIMDO memory compiler uses an opt-in runtime adapter and leaves
+ComfyUI's tracked files unchanged. Build a sidecar-capable AIMDO revision with
+`AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC=1`, then start with
+`AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC=1`. The current sidecar requires the exact
+Torch 2.14 XPU ABI it was built against. Public XPU memory-compiler availability
+remains disabled.
+
+The adapter owns the XPU graph lifecycle and wraps cast, prefetch and explicit
+free-memory boundaries. It calls the original ComfyUI functions for copying,
+prefetch queue processing and prompt execution. ComfyUI upgrades can proceed
+normally: comments, source locations and unrelated changes are accepted;
+changes to allocation-sensitive prefetch or free-memory control flow disable
+the diagnostic before allocator takeover and report the incompatibility.
+Runtime interface changes detected after takeover stop startup and require a
+restart with the diagnostic disabled. The native allocator cannot be unloaded
+in place. This is a diagnostic interface contract, not arbitrary-revision or
+public memory-compiler qualification.
+
 The provider distributions use private top-level package names and do not own
 any `comfy_kitchen/*` or `comfy_aimdo/*` file. The official packages can
 therefore be reinstalled or upgraded without overwriting the XPU runtime.
