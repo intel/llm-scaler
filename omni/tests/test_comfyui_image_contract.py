@@ -600,7 +600,7 @@ class ComfyUIImageContractTest(unittest.TestCase):
             validator.PINNED_MINIMAX_H3_TEMPLATE_HASHES[
                 "video_minimax_h3_t2v.json"
             ],
-            "2400b01a7c8acae3fed038c0372f08bacb90d2cdf915febadbe7e3f9802506ea",
+            "8a5eb23b0dd2df9e99b6f7af9684e770f188feca820d241364b729e01dedf3b6",
         )
 
         self.assertIn(
