@@ -197,6 +197,57 @@ def test_begin_end_replay_keeps_scope_order(runtime):
     assert r.mp.MALLOC_GRAPH_ROGUES == 3
 
 
+@pytest.mark.parametrize("change", ["compatible", "optional", "renamed", "missing", "false_default", "required"])
+def test_apply_checks_live_queue_before_installing_wrappers(runtime, monkeypatch, tmp_path, change):
+    r = runtime
+    adapter = sys.modules["compiler_adapter_test.adapters.aimdo_memory_compiler"]
+    queue = r.queue_type
+    if change == "optional":
+        def flags(self, reset=True, *, debug=False):
+            return {}
+    elif change == "renamed":
+        def flags(self, consume=True):
+            return {}
+    elif change == "missing":
+        def flags(self):
+            return {}
+    elif change == "false_default":
+        def flags(self, reset=False):
+            return {}
+    elif change == "required":
+        def flags(self, reset):
+            return {}
+    else:
+        flags = queue.get_flags
+    monkeypatch.setattr(queue, "get_flags", flags)
+    worker = ModuleType("main")
+    worker.__file__, worker.gc = str(tmp_path / "main.py"), r.worker.gc
+    comfy = ModuleType("comfy")
+    comfy.model_management, comfy.model_prefetch = r.mm, r.mp
+    execution = ModuleType("execution")
+    execution.PromptQueue = queue
+    kernel = ModuleType("omni_xpu_kernel")
+    kernel.int8 = r.int8
+    sys.modules["comfy_aimdo"].native_owner = r.owner
+    for name, module in (("main", worker), ("comfy", comfy), ("comfy.model_management", r.mm),
+                         ("comfy.model_prefetch", r.mp), ("execution", execution),
+                         ("comfy_kitchen", r.ck), ("omni_xpu_kernel", kernel), ("torch", r.torch)):
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(adapter, "preflight", lambda: str(tmp_path))
+    monkeypatch.setenv("AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC", "1")
+    cast, begin, gc = r.mm.cast_to, r.mp.malloc_graph_begin, worker.gc
+    if change in ("compatible", "optional"):
+        assert adapter.apply()[0] is True
+        assert getattr(queue.get_flags, "__omnixpu_aimdo_compiler_runtime__") is adapter._RUNTIME
+        assert queue().get_flags() == {}
+    else:
+        with pytest.raises(SystemExit, match="live caller signature changed|default to consuming flags"):
+            adapter.apply()
+        assert r.mm.cast_to is cast and r.mp.malloc_graph_begin is begin
+        assert queue.get_flags is flags and worker.gc is gc
+        assert adapter._RUNTIME is None
+
+
 @pytest.mark.parametrize("failure", ["close", "abort"])
 def test_failed_cleanup_retains_graph_and_retry_counts_once(runtime, failure):
     r = runtime

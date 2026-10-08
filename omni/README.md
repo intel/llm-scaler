@@ -149,7 +149,7 @@ The focused source build selects:
   from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/ea43fcf8e301143f1c716416a1e9ce277b1657d4),
   including the managed GGUF and Nunchaku W4A16 routes;
 - official `comfy-aimdo==0.5.5` plus the co-installable XPU runtime provider
-  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/30b9320f8ed2f9351dfd2f98d7ca9d7eea8240e8),
+  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/49b9d14b564224ccc6019e67335fc655e90f922b),
   built with its Level Zero backend and native allocator hook;
 - [`ComfyUI-GGUF-XPU`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),
   with GGUF, SentencePiece, and Protobuf dependencies installed from the same

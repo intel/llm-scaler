@@ -353,6 +353,10 @@ def apply():
             for name, names in SIGNATURES[path].items():
                 function = getattr(module, name)
                 validate_live_signature(function, names)
+        flags = execution.PromptQueue.get_flags
+        validate_live_signature(flags, ("self", "reset"))
+        if inspect.signature(flags).parameters["reset"].default is not True:
+            raise RuntimeError("PromptQueue.get_flags must default to consuming flags")
         for obj, name in ((ck, "set_allocation_context"), (ck, "clear_nvfp4_lut_cache"),
                           (int8, "set_allocation_context_factory"),
                           (int8, "clear_convrot_hadamard_cache"), (int8, "release_onednn_int8_cache")):
