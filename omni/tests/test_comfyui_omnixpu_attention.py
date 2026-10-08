@@ -350,7 +350,8 @@ def _load_patch(
         ("bmg", "2.11.0+xpu", True),
         ("bmg", "2.12.0+xpu", True),
         ("bmg", "2.13.0+xpu", True),
-        ("bmg", "2.14.0+xpu", False),
+        ("bmg", "2.14.0+xpu", True),
+        ("bmg", "2.15.0+xpu", False),
         ("bmg", "3.0.0+xpu", False),
         ("unknown", "2.13.0+xpu", False),
         ("bmg", "invalid", False),
@@ -497,7 +498,7 @@ def test_esimd_is_selected_only_when_explicitly_requested(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu"]
+    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu", "2.14.0+xpu"]
 )
 def test_bmg_wan22_t2v_turbo_720p_cross_uses_cute(
     monkeypatch, torch_version
@@ -761,7 +762,7 @@ def test_animate2_cute_shape_contract(
     ],
 )
 @pytest.mark.parametrize(
-    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu"]
+    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu", "2.14.0+xpu"]
 )
 def test_bmg_attention_open_ended_domain_uses_general_bhld_cute(
     monkeypatch, q_len, kv_len, pre_shaped, route, torch_version
@@ -1225,7 +1226,7 @@ def test_bmg_masked_d128_grad_and_mask_address_limit_fall_back(monkeypatch):
     ],
 )
 @pytest.mark.parametrize(
-    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu"]
+    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu", "2.14.0+xpu"]
 )
 def test_bmg_minimax_h3_h56_uses_direct_qkv_bhld_cute(
     monkeypatch, seq, qk_stride, v_stride, torch_version
@@ -1283,7 +1284,7 @@ def test_bmg_minimax_h3_h56_rejects_unvalidated_contract(
     [
         ("ptl-h", "2.11.0+xpu", True, 3520, 3520),
         ("bmg", "2.10.0+xpu", True, 3520, 3520),
-        ("bmg", "2.14.0+xpu", True, 3520, 3520),
+        ("bmg", "2.15.0+xpu", True, 3520, 3520),
         ("bmg", "2.11.0+xpu", False, 3520, 3520),
         ("bmg", "2.11.0+xpu", True, 767, 767),
         ("bmg", "2.11.0+xpu", True, 1023, 1024),
@@ -1457,7 +1458,7 @@ def test_auto_d64_uses_torch_not_esimd(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu"]
+    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu", "2.14.0+xpu"]
 )
 @pytest.mark.parametrize("seq", [6, 12, 261, 453, 901, 1797])
 def test_bmg_minimax_h3_video_vae_d64_uses_structural_cute(

@@ -241,6 +241,10 @@ copy route while retaining the cache compatibility and pinned-memory fixes.
 ComfyUI 0.39 attention containers are consumed once on both routes, with
 the model's preferred attention selection passed through unchanged.
 
+The BMG versioned attention routes include Torch 2.14 alongside 2.11–2.13.
+This covers the existing native FP16 H3 VideoVAE D64 route for batches 1–4;
+unsupported shapes and other unqualified target/version pairs retain fallback.
+
 A ModelPatcher diffusion wrapper clears and bypasses prefix caching while
 `post_input`, `attn1_patch`, `single_block`, or block replacements are active.
 Normal caching resumes with empty slots after that path, including exceptions.

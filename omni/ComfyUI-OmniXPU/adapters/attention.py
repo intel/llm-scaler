@@ -183,7 +183,7 @@ def _torch_major_minor():
 # minor or a different device target for these workflow-specific routes.
 _VALIDATED_ROUTED_TORCH_BY_TARGET = {
     "ptl-h": frozenset({(2, 11), (2, 12)}),
-    "bmg": frozenset({(2, 11), (2, 12), (2, 13)}),
+    "bmg": frozenset({(2, 11), (2, 12), (2, 13), (2, 14)}),
 }
 
 
