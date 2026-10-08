@@ -13,7 +13,7 @@ import sys
 import threading
 import weakref
 
-from ..compiler_compat import preflight, SIGNATURES
+from ..compiler_compat import preflight, SIGNATURES, validate_live_signature
 
 _MARKER = "__omnixpu_aimdo_compiler_original__"
 _RUNTIME = None
@@ -352,8 +352,7 @@ def apply():
         for module, path in ((mm, "comfy/model_management.py"), (mp, "comfy/model_prefetch.py")):
             for name, names in SIGNATURES[path].items():
                 function = getattr(module, name)
-                if tuple(inspect.signature(function).parameters) != names:
-                    raise RuntimeError(f"live caller signature changed: {name}")
+                validate_live_signature(function, names)
         for obj, name in ((ck, "set_allocation_context"), (ck, "clear_nvfp4_lut_cache"),
                           (int8, "set_allocation_context_factory"),
                           (int8, "clear_convrot_hadamard_cache"), (int8, "release_onednn_int8_cache")):

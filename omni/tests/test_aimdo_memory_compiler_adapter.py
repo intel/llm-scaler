@@ -447,3 +447,62 @@ def test_build_separates_native_abi_from_comfyui_revision(tmp_path, mode):
     else:
         assert result.returncode != 0 and not log.exists()
         assert ('source patch is retired' if mode == 'retired' else 'Torch 2.14 XPU ABI') in result.stderr
+
+
+@pytest.mark.skipif(not SOURCE, reason='pristine ComfyUI source fixture required')
+@pytest.mark.parametrize('refactor', ['locals', 'logging', 'docstring', 'optional', 'queue_alias', 'worker_gc_guard'])
+def test_admission_allows_interface_preserving_refactors(runtime, tmp_path, refactor):
+    import shutil
+    import re
+    compat = sys.modules['compiler_adapter_test.compiler_compat']
+    for name in (*compat.SIGNATURES, 'main.py', 'execution.py'):
+        p = tmp_path / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(Path(SOURCE) / name, p)
+    p = tmp_path / 'comfy/model_prefetch.py'
+    source = p.read_text()
+    if refactor == 'locals':
+        source = re.sub(r'(?<!\.)\bmalloc_graph\b', 'allocation_graph', source)
+        # The module import is not part of the caller's local variable rename.
+        source = source.replace('import comfy_aimdo.allocation_graph', 'import comfy_aimdo.malloc_graph')
+    elif refactor == 'logging':
+        source = source.replace('    consumed = queue.pop(0)', '    logging.debug("prefetch bookkeeping")\n    consumed = queue.pop(0)')
+    elif refactor == 'docstring':
+        source = source.replace('    malloc_graph = MALLOC_GRAPHS.get(threading.get_ident())', '    """Updated API documentation."""\n    malloc_graph = MALLOC_GRAPHS.get(threading.get_ident())')
+    elif refactor == 'optional':
+        source = source.replace('generator=None, malloc_scope=None):', 'generator=None, malloc_scope=None, *, debug=False):')
+    elif refactor == 'queue_alias':
+        q = tmp_path / 'execution.py'
+        q.write_text(q.read_text().replace('ret = self.flags', 'consumed_flags = self.flags').replace('return ret\n', 'return consumed_flags\n'))
+    elif refactor == 'worker_gc_guard':
+        m = tmp_path / 'main.py'
+        m.write_text(re.sub(r'\bneed_gc\b', 'collect_required', m.read_text()))
+    p.write_text(source)
+    compat.preflight(tmp_path)
+
+
+@pytest.mark.skipif(not SOURCE, reason='pristine ComfyUI source fixture required')
+@pytest.mark.parametrize('mutation,message', [('queue_index', 'queue.pop'), ('gc_order', 'cleanup order'),
+                                             ('peek', 'consume queue flags'), ('reset_default', 'consuming flags')])
+def test_admission_rejects_protocol_changes(runtime, tmp_path, mutation, message):
+    import shutil
+    compat = sys.modules['compiler_adapter_test.compiler_compat']
+    for name in (*compat.SIGNATURES, 'main.py', 'execution.py'):
+        p = tmp_path / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(Path(SOURCE) / name, p)
+    if mutation == 'queue_index':
+        p = tmp_path / 'comfy/model_prefetch.py'
+        p.write_text(p.read_text().replace('consumed = queue.pop(0)', 'consumed = queue.pop(1)'))
+    elif mutation == 'gc_order':
+        p = tmp_path / 'main.py'
+        p.write_text(p.read_text().replace('gc.collect()\n                comfy.model_management.soft_empty_cache()',
+            'comfy.model_management.soft_empty_cache()\n                gc.collect()'))
+    elif mutation == 'peek':
+        p = tmp_path / 'main.py'
+        p.write_text(p.read_text().replace('flags = q.get_flags()', 'flags = q.get_flags(reset=False)'))
+    else:
+        p = tmp_path / 'execution.py'
+        p.write_text(p.read_text().replace('def get_flags(self, reset=True):', 'def get_flags(self, reset=False):'))
+    with pytest.raises(compat.CompatibilityError, match=message):
+        compat.preflight(tmp_path)

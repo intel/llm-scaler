@@ -59,8 +59,10 @@ The adapter owns the XPU graph lifecycle and wraps cast, prefetch and explicit
 free-memory boundaries. It calls the original ComfyUI functions for copying,
 prefetch queue processing and prompt execution. ComfyUI upgrades can proceed
 normally: comments, source locations and unrelated changes are accepted;
-changes to allocation-sensitive prefetch or free-memory control flow disable
-the diagnostic before allocator takeover and report the incompatibility.
+local renaming, logging, documentation and optional forwarding arguments are
+accepted. Interface removal or incompatible queue/iterate/core and
+flag/GC/flush ordering disables the diagnostic before allocator takeover and
+reports the specific missing contract. No source or AST hash allowlist is used.
 Runtime interface changes detected after takeover stop startup and require a
 restart with the diagnostic disabled. The native allocator cannot be unloaded
 in place. This is a diagnostic interface contract, not arbitrary-revision or
