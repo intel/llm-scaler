@@ -701,6 +701,7 @@ def test_diagnostics_reports_provider_activation_and_rejection(monkeypatch):
 @pytest.mark.skipif(not os.environ.get('COMFYUI_CALLER_TEST_ROOT'), reason='pristine ComfyUI source fixture required')
 @pytest.mark.parametrize('compatible', [True, False])
 def test_caller_admission_precedes_native_takeover(runtime, monkeypatch, tmp_path, compatible):
+    monkeypatch.setattr(runtime, '_torch_version_without_import', lambda: '2.14.0+xpu')
     import shutil
     source = Path(os.environ['COMFYUI_CALLER_TEST_ROOT'])
     root = tmp_path / 'comfyui'
@@ -727,3 +728,17 @@ def test_caller_admission_precedes_native_takeover(runtime, monkeypatch, tmp_pat
     assert observed == (['1'] if compatible else ['0'])
     assert state['providers']['comfy_aimdo.xpu']['status'] == 'active'
     assert state['memory_compiler']['status'] == ('admitted' if compatible else 'incompatible')
+
+
+def test_unsupported_diagnostic_release_is_disabled_before_native_takeover(runtime, monkeypatch, tmp_path):
+    monkeypatch.setenv('AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC', '1')
+    monkeypatch.setattr(runtime, '_torch_version_without_import', lambda: '2.13.0+xpu')
+    observed = []
+    monkeypatch.setattr(runtime, '_activate_aimdo', lambda *a, **kw:
+        observed.append(os.environ['AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC']))
+    provider = _native_provider(runtime, tmp_path)
+    state = runtime.bootstrap(dynamic_vram_override=True, providers_override={provider.provider_id: provider})
+    assert observed == ['0']
+    assert state['providers']['comfy_aimdo.xpu']['status'] == 'active'
+    assert state['memory_compiler']['status'] == 'incompatible'
+    assert 'supports Torch release 2.14.0+xpu' in state['memory_compiler']['reason']

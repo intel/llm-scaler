@@ -34,7 +34,7 @@ ARG COMFY_KITCHEN_COMMIT=ea43fcf8e301143f1c716416a1e9ce277b1657d4
 ARG COMFY_KITCHEN_VERSION=0.2.35
 ARG COMFY_KITCHEN_PROVIDER_VERSION=0.2.35
 ARG COMFY_AIMDO_REPOSITORY=https://github.com/xiangyuT/comfy-aimdo-xpu.git
-ARG COMFY_AIMDO_COMMIT=4e9171142483573a6d6e1b08e788ac84e71bb8f6
+ARG COMFY_AIMDO_COMMIT=30b9320f8ed2f9351dfd2f98d7ca9d7eea8240e8
 ARG COMFY_AIMDO_VERSION=0.5.5
 ARG COMFY_AIMDO_PROVIDER_VERSION=0.5.5
 ARG COMFY_GGUF_REPOSITORY=https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git
@@ -351,6 +351,7 @@ ARG COMFY_AIMDO_PROVIDER_VERSION
 ARG TORCH_VERSION
 ARG XPU_TARGET
 ARG AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC=0
+COPY ComfyUI-OmniXPU/aimdo_release_compat.py /tmp/check_aimdo_torch_release.py
 
 RUN cd /llm && \
     git clone --filter=blob:none --no-checkout \
@@ -361,14 +362,16 @@ RUN cd /llm && \
     pip install setuptools-scm==10.2.1 && \
     source /opt/intel/oneapi/setvars.sh --force && \
     cd /llm/comfy-aimdo-xpu && \
+    if [ "${AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC}" = "1" ]; then \
+        python /tmp/check_aimdo_torch_release.py; \
+    fi && \
     test -f /opt/venv/include/unified-runtime/ur_api.h && \
     UR_INCLUDE_DIR=/opt/venv/include/unified-runtime \
     AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC="${AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC}" \
     AIMDO_TORCH_PYTHON=/opt/venv/bin/python \
         ./scripts/build-linux-xpu.sh && \
     if [ "${AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC}" = "1" ]; then \
-        test -f comfy_aimdo/aimdo_xpu_native_owner.so && \
-        test -f comfy_aimdo/aimdo_xpu_native_owner_abi.json; \
+        test -f comfy_aimdo/aimdo_xpu_native_owner.so; \
     fi && \
     mkdir -p /wheels/aimdo-source /wheels/aimdo-provider && \
     SETUPTOOLS_SCM_PRETEND_VERSION="${COMFY_AIMDO_PROVIDER_VERSION}" \

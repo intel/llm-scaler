@@ -539,10 +539,17 @@ def _compiler_preflight():
         raise RuntimeError("compiler compatibility module unavailable")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    release_path = Path(__file__).with_name("aimdo_release_compat.py")
+    release_spec = importlib.util.spec_from_file_location("_omnixpu_aimdo_release_compat", release_path)
+    if release_spec is None or release_spec.loader is None:
+        raise RuntimeError("AIMDO release compatibility module unavailable")
+    release = importlib.util.module_from_spec(release_spec)
+    release_spec.loader.exec_module(release)
     try:
+        release.validate_torch_release(_torch_version_without_import())
         root = module.preflight()
         module.preflight_dependencies()
-    except module.CompatibilityError as exc:
+    except (module.CompatibilityError, release.UnsupportedRelease) as exc:
         os.environ["AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC"] = "0"
         _LOG.warning("[OmniXPU] private memory compiler disabled before native takeover: %s", exc)
         return {"status": "incompatible", "reason": str(exc)}

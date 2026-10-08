@@ -51,8 +51,9 @@ If an Intel XPU is unavailable, initialization is skipped.
 The private AIMDO memory compiler uses an opt-in runtime adapter and leaves
 ComfyUI's tracked files unchanged. Build a sidecar-capable AIMDO revision with
 `AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC=1`, then start with
-`AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC=1`. The current sidecar requires the exact
-Torch 2.14 XPU ABI it was built against. Public XPU memory-compiler availability
+`AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC=1`. llm-scaler checks the supported Torch
+release, currently `2.14.0+xpu`, before building or enabling this integration.
+It does not compare Torch library hashes. Public XPU memory-compiler availability
 remains disabled.
 
 The adapter owns the XPU graph lifecycle and wraps cast, prefetch and explicit

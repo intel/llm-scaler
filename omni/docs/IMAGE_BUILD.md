@@ -63,11 +63,14 @@ For the ComfyUI 0.37.0 candidate, official Kitchen 0.2.35 uses the matching
 0.2.35 provider source at `xiangyuT/comfy-kitchen-xpu`
 (`ea43fcf8e301143f1c716416a1e9ce277b1657d4`). Official AIMDO 0.5.5 uses
 the matching 0.5.5 provider source at `xiangyuT/comfy-aimdo-xpu`
-(`4e9171142483573a6d6e1b08e788ac84e71bb8f6`). Both provider manifests
+(`30b9320f8ed2f9351dfd2f98d7ca9d7eea8240e8`). Both provider manifests
 accept their matching official 0.2.35 and 0.5.5 versions.
 GGUF repository and commit must be updated together.
-The private sidecar build requires its currently supported Torch 2.14 XPU ABI
-and an explicitly selected AIMDO revision that contains the sidecar. It does
+The private sidecar build requires the Torch release supported by llm-scaler
+(currently `2.14.0+xpu`) and an explicitly selected AIMDO revision that contains
+the sidecar. `ComfyUI-OmniXPU/aimdo_release_compat.py` applies that release policy
+before building and before runtime takeover. Torch library hashes and a separate
+AIMDO ABI JSON file are not admission inputs. It does
 not require a fixed ComfyUI commit. The retired
 `OMNI_AIMDO_TORCH214_CALLER_PATCH=1` switch is rejected; no ComfyUI source patch
 is copied or applied for memory-compiler integration. At runtime,
@@ -93,8 +96,8 @@ top-level package.
 
 The AIMDO Unified Runtime hook is compiled against
 `/opt/venv/include/unified-runtime/ur_api.h`, which belongs to the
-Torch-matched runtime family used by the final image. OMIX 0.3 supplies the
-oneAPI 2026.1 compiler, but its compiler include tree is not used as the AIMDO
+Torch-matched runtime family used by the final image. OMIX supplies the build
+toolchain, but its compiler include tree is not used as the AIMDO
 hook ABI contract. The runtime entrypoint likewise places the venv Unified
 Runtime loader before the OMIX build-toolchain libraries. The final image also
 exports that directory as `UR_INCLUDE_DIR` so AIMDO's maintained native-hook
@@ -102,8 +105,7 @@ helper build uses the same explicit ABI contract during installed-image
 validation.
 
 This focused image is single-XPU and does not copy the legacy
-`libsycl-native-*.spv` multi-XPU blobs used by older platform images. OMIX 0.3
-and oneAPI 2026.1 do not ship those files; the card-specific BMG binaries are
+`libsycl-native-*.spv` multi-XPU blobs used by older platform images. The card-specific BMG binaries are
 embedded in the AOT kernel wheel instead.
 
 The focused image installs the version-pinned integrated `comfyui-manager` package and
