@@ -193,8 +193,8 @@ class _FakeMask:
 def _load_patch(
     monkeypatch,
     *,
-    target="ptl-h",
-    torch_version="2.11.0+xpu",
+    target="bmg",
+    torch_version="2.14.0+xpu",
     backend="auto",
     platform=None,
     expected_apply=True,
@@ -370,6 +370,8 @@ def test_versioned_routes_use_explicit_target_matrix(
 def test_windows_defaults_to_unpatched_torch_sdpa(monkeypatch):
     patch, attention, calls = _load_patch(
         monkeypatch,
+        target="ptl-h",
+        torch_version="2.11.0+xpu",
         backend=None,
         platform="win32",
         expected_apply=False,
@@ -390,6 +392,8 @@ def test_windows_defaults_to_unpatched_torch_sdpa(monkeypatch):
 def test_non_windows_keeps_auto_as_default(monkeypatch):
     patch, attention, calls = _load_patch(
         monkeypatch,
+        target="ptl-h",
+        torch_version="2.11.0+xpu",
         backend=None,
         platform="linux",
     )
@@ -413,7 +417,7 @@ def test_ptl_auto_validated_torch_zimage_shape_uses_torch(
     monkeypatch, torch_version, seq
 ):
     patch, attention, calls = _load_patch(
-        monkeypatch, torch_version=torch_version
+        monkeypatch, target="ptl-h", torch_version=torch_version
     )
     tensor = _FakeTensor(seq=seq)
     result = attention.optimized_attention(
@@ -430,7 +434,7 @@ def test_ptl_auto_validated_torch_krea2_shape_uses_torch(
     monkeypatch, torch_version
 ):
     patch, attention, calls = _load_patch(
-        monkeypatch, torch_version=torch_version
+        monkeypatch, target="ptl-h", torch_version=torch_version
     )
     tensor = _FakeTensor(seq=4192, heads=48)
     result = attention.optimized_attention(
@@ -443,7 +447,9 @@ def test_ptl_auto_validated_torch_krea2_shape_uses_torch(
 
 
 def test_explicit_cute_does_not_apply_auto_route(monkeypatch):
-    patch, attention, calls = _load_patch(monkeypatch, backend="cute")
+    patch, attention, calls = _load_patch(
+        monkeypatch, target="ptl-h", torch_version="2.11.0+xpu", backend="cute",
+    )
     tensor = _FakeTensor()
     result = attention.optimized_attention(
         tensor, tensor, tensor, heads=30, skip_reshape=True
@@ -455,7 +461,9 @@ def test_explicit_cute_does_not_apply_auto_route(monkeypatch):
 
 
 def test_ptl_dispatch_does_not_probe_bmg_capabilities(monkeypatch):
-    patch, attention, calls = _load_patch(monkeypatch, target="ptl-h")
+    patch, attention, calls = _load_patch(
+        monkeypatch, target="ptl-h", torch_version="2.11.0+xpu",
+    )
 
     def unexpected_bmg_probe(*args, **kwargs):
         raise AssertionError("PTL dispatch reached a BMG-only capability probe")
@@ -486,7 +494,9 @@ def test_ptl_dispatch_does_not_probe_bmg_capabilities(monkeypatch):
 
 
 def test_esimd_is_selected_only_when_explicitly_requested(monkeypatch):
-    patch, attention, calls = _load_patch(monkeypatch, backend="esimd")
+    patch, attention, calls = _load_patch(
+        monkeypatch, target="ptl-h", torch_version="2.11.0+xpu", backend="esimd",
+    )
     tensor = _FakeTensor()
     result = attention.optimized_attention(
         tensor, tensor, tensor, heads=30, skip_reshape=True
@@ -588,7 +598,9 @@ def test_bmg_wan22_diagnostic_output_scan_falls_back(monkeypatch):
 
 def test_generic_cute_skips_output_scan_by_default(monkeypatch):
     monkeypatch.delenv("OMNIXPU_VALIDATE_ATTENTION_OUTPUT", raising=False)
-    patch, attention, calls = _load_patch(monkeypatch, backend="cute")
+    patch, attention, calls = _load_patch(
+        monkeypatch, target="ptl-h", torch_version="2.11.0+xpu", backend="cute",
+    )
     tensor = _FakeTensor(dtype=torch.float16, non_finite=True)
 
     result = attention.optimized_attention(
@@ -603,7 +615,9 @@ def test_generic_cute_skips_output_scan_by_default(monkeypatch):
 
 def test_explicit_esimd_non_finite_output_still_falls_back(monkeypatch):
     monkeypatch.delenv("OMNIXPU_VALIDATE_ATTENTION_OUTPUT", raising=False)
-    patch, attention, calls = _load_patch(monkeypatch, backend="esimd")
+    patch, attention, calls = _load_patch(
+        monkeypatch, target="ptl-h", torch_version="2.11.0+xpu", backend="esimd",
+    )
     tensor = _FakeTensor(dtype=torch.float16, non_finite=True)
 
     result = attention.optimized_attention(
@@ -1737,7 +1751,9 @@ def test_unvalidated_auto_shapes_keep_cute(
     ],
 )
 def test_unvalidated_layouts_keep_cute(monkeypatch, tensor, kwargs):
-    patch, attention, calls = _load_patch(monkeypatch)
+    patch, attention, calls = _load_patch(
+        monkeypatch, target="ptl-h", torch_version="2.11.0+xpu",
+    )
     result = attention.optimized_attention(
         tensor, tensor, tensor, heads=30, **kwargs
     )
@@ -1817,7 +1833,9 @@ def test_unvalidated_boogu_d120_keeps_torch_fallback(
 
 
 def test_boogu_d120_rejects_unvalidated_tensor_contract(monkeypatch):
-    _, attention, calls = _load_patch(monkeypatch)
+    _, attention, calls = _load_patch(
+        monkeypatch, target="ptl-h", torch_version="2.11.0+xpu",
+    )
     tensor = _FakeTensor(
         seq=4096,
         heads=28,
