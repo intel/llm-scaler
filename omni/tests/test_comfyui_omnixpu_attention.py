@@ -1515,10 +1515,13 @@ def test_bmg_minimax_h3_video_vae_d64_uses_structural_cute(
     }
 
 
+@pytest.mark.parametrize("torch_version", ["2.13.0+xpu", "2.14.0+xpu"])
 @pytest.mark.parametrize("batch", [2, 3, 4])
-def test_bmg_minimax_h3_video_vae_d64_batched_packed_qkv(monkeypatch, batch):
+def test_bmg_minimax_h3_video_vae_d64_batched_packed_qkv(
+    monkeypatch, batch, torch_version
+):
     patch, attention, calls = _load_patch(
-        monkeypatch, target="bmg", torch_version="2.13.0+xpu",
+        monkeypatch, target="bmg", torch_version=torch_version,
     )
     seq = 1797
     packed_stride = (seq * 6144, 192, 6144, 1)
@@ -1772,6 +1775,7 @@ def test_unvalidated_layouts_keep_cute(monkeypatch, tensor, kwargs):
         ("bmg", "2.11.0+xpu"),
         ("bmg", "2.12.0+xpu"),
         ("bmg", "2.13.0+xpu"),
+        ("bmg", "2.14.0+xpu"),
     ],
 )
 @pytest.mark.parametrize("seq", [4096, 4205])
