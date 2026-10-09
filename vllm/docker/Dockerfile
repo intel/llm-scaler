@@ -15,8 +15,9 @@
 # runtime, and the final stage installs torch 2.12.0+xpu into an isolated venv.
 # Build outputs cross stage boundaries only as Rust artifacts, source trees, and wheels.
 #
-# Scope ("lean core"): vLLM + custom ESIMD kernels + vllm-xpu-kernels + core serving
-# deps + bigdl-core (ships vllm_int4_for_multi_arc.so used by the sym_int4 path).
+# Scope ("lean core"): vLLM + custom ESIMD kernels + vllm-xpu-kernels + LMCache
+# with the KVWeave CPU codec + core serving deps + bigdl-core (ships
+# vllm_int4_for_multi_arc.so used by the sym_int4 path).
 # Dropped vs legacy: MinerU and UCX/NIXL (PD disaggregation).
 #
 # Build context root MUST be the `vllm/` dir (so ./patches, ./custom-esimd-kernels-vllm
@@ -60,6 +61,9 @@ ARG no_proxy
 ARG VLLM_VERSION=v0.26.0
 # vllm-xpu-kernels pinned base commit (aligned with Dockerfile.dev).
 ARG VLLM_XPU_KERNELS_COMMIT=a6929869587fa6c40dbe393eedc96eeab076bfbb
+# LMCache v0.4.7 and KVWeave sources validated with vLLM v0.26.0.
+ARG LMCACHE_COMMIT=307439a1d7a4eb49fcaac1b565ad5c3b3b3f918f
+ARG KVWEAVE_COMMIT=4eacc5a8613060a066655acb4f20edbd63a40703
 
 ENV VIRTUAL_ENV=/opt/buildenv \
     PATH="/root/.local/bin:/opt/buildenv/bin:${PATH}" \
@@ -75,7 +79,8 @@ ENV VIRTUAL_ENV=/opt/buildenv \
 # both bash-only (unavailable under the default /bin/sh).
 SHELL ["bash", "-c"]
 
-COPY ./patches/vllm_for_multi_arc.patch ./patches/vllm_xpu_kernels.patch /tmp/
+COPY ./patches/vllm_for_multi_arc.patch ./patches/vllm_xpu_kernels.patch \
+     ./patches/lmcache_kvweave.patch ./patches/kvweave_torch_2_12.patch /tmp/
 COPY ./custom-esimd-kernels-vllm /src/custom-esimd-kernels-vllm
 
 # --- build tooling (the oneAPI DPC++ compiler is already in the OMIX devel base) ---
@@ -155,6 +160,49 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     pip wheel --no-build-isolation --no-deps . -w ${WHEELS} && \
     rm -rf build .deps
 
+# ---------------------------------------------------------------------------
+# 2d. KVWeave CPU codec (torch 2.12 XPU metadata patch)  ->  wheel
+# ---------------------------------------------------------------------------
+RUN set -eo pipefail && \
+    git clone --filter=blob:none --no-checkout \
+        https://github.com/open-edge-platform/edge-ai-libraries.git \
+        /src/edge-ai-libraries && \
+    cd /src/edge-ai-libraries && \
+    git sparse-checkout set libraries/kv-quant-offload && \
+    git checkout "${KVWEAVE_COMMIT}" && \
+    git apply --check /tmp/kvweave_torch_2_12.patch && \
+    git apply /tmp/kvweave_torch_2_12.patch && \
+    git diff --check
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -eo pipefail && \
+    source /opt/intel/oneapi/setvars.sh --force && \
+    cd /src/edge-ai-libraries/libraries/kv-quant-offload && \
+    MAX_JOBS=8 KVWEAVE_ISA=avx2 KVWEAVE_XPU=0 \
+        pip wheel --no-build-isolation --no-deps . -w ${WHEELS} && \
+    rm -rf build
+
+# ---------------------------------------------------------------------------
+# 2e. LMCache v0.4.7 + MP hybrid/KVWeave patch  ->  SYCL wheel
+# ---------------------------------------------------------------------------
+RUN set -eo pipefail && \
+    git clone --filter=blob:none https://github.com/LMCache/LMCache.git \
+        /src/LMCache && \
+    cd /src/LMCache && \
+    git checkout "${LMCACHE_COMMIT}" && \
+    git apply --check /tmp/lmcache_kvweave.patch && \
+    git apply /tmp/lmcache_kvweave.patch && \
+    git diff --check
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -eo pipefail && \
+    source /opt/intel/oneapi/setvars.sh --force && \
+    cd /src/LMCache && \
+    uv pip install -r requirements/build.txt && \
+    BUILD_WITH_SYCL=1 MAX_JOBS=8 \
+        pip wheel --no-build-isolation --no-deps . -w ${WHEELS} && \
+    rm -rf build
+
 # Wheel inventory (visible in the build log for sanity).
 RUN ls -la ${WHEELS}/
 
@@ -192,13 +240,14 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     pip install torch==2.12.0+xpu torchaudio torchvision \
         --index-url https://download.pytorch.org/whl/xpu
 
-# --- patched source trees (post-patch vLLM, vllm-xpu-kernels, and the ESIMD
-#     kernels) kept in the shipped image for reference / editable-install dev
-#     workflows.  These are plain COPY (not bind-mounted): unlike the wheels
+# --- patched source trees (vLLM, vllm-xpu-kernels, and the ESIMD kernels) kept
+#     in the shipped image for reference / editable-install dev workflows.
+#     These are plain COPY (not bind-mounted): unlike the wheels
 #     below, they're meant to persist in the final image. ---
 COPY --from=builder /src/vllm ./vllm
 COPY --from=builder /src/vllm-xpu-kernels ./vllm-xpu-kernels
 COPY --from=builder /src/custom-esimd-kernels-vllm ./custom-esimd-kernels-vllm
+COPY ./docker/lmcache_xpu_runtime_requirements.txt /tmp/lmcache_xpu_runtime_requirements.txt
 
 # --- thin runtime OS deps, vLLM + kernel wheels, lean-core serving deps, and the
 #     triton-xpu fix/shrink all in ONE layer: cleanup must happen in the same RUN
@@ -255,6 +304,13 @@ RUN --mount=type=bind,from=builder,source=/wheels,target=/wheels \
     ln -sf /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so && \
     ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl_openmp.so.0.1 /opt/venv/lib/libccl_openmp.so.0 && \
     ln -sf /opt/venv/lib/libccl_openmp.so.0 /opt/venv/lib/libccl_openmp.so && \
+    pip install --no-deps -r /tmp/lmcache_xpu_runtime_requirements.txt && \
+    pip install --no-deps --force-reinstall \
+        /wheels/kvweave-*.whl \
+        /wheels/lmcache-*.whl && \
+    python -c 'import lmcache.xpu_ops, kvweave.kvweave_quant; print(lmcache.xpu_ops.__file__); print(kvweave.kvweave_quant.__file__)' && \
+    python -c 'from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_mp_connector import LMCacheMPConnector; assert LMCacheMPConnector.__module__ == "lmcache.integration.vllm.lmcache_mp_connector"; print(LMCacheMPConnector)' && \
+    python -c 'import importlib.metadata as m; names={d.metadata["Name"].lower().replace("_", "-") for d in m.distributions()}; assert "oneccl" not in names and "oneccl-devel" not in names; assert m.version("torch") == "2.12.0+xpu"; assert m.version("triton-xpu") == "3.7.1"' && \
     TRITON=/opt/venv/lib/python3.12/site-packages/triton && \
     strip --strip-debug ${TRITON}/_C/libtriton.so && \
     rm -f ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git && \
