@@ -107,6 +107,13 @@ COMPONENTS = (
         "adapters/qwen_image21_cache.py",
     ),
     Component(
+        "host_kv_cache_guard",
+        "host_kv_cache",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/host_kv_cache.py",
+    ),
+    Component(
         "seedvr_ada_reshape_patch",
         "seedvr_ada_reshape",
         "compatibility_patch",
