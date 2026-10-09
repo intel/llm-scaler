@@ -29,6 +29,11 @@
 namespace omni_xpu {
 namespace svdq {
 
+// Callers validate the result before using it as a quantization group size.
+static int64_t safe_div(int64_t numerator, int64_t denominator) {
+    return denominator == 0 ? 0 : numerator / denominator;
+}
+
 // Cache key: (act_dtype_int, M, K, N, group_size)
 using CacheKey = std::tuple<int, int64_t, int64_t, int64_t, int64_t>;
 
@@ -235,7 +240,9 @@ torch::Tensor onednn_int4_gemm_preconverted(
     TORCH_CHECK(scales_f16.size(1) == N,
                 "scales_f16.size(1)=", scales_f16.size(1), " must equal N=", N);
 
-    int64_t group_size = K / num_groups;
+    int64_t group_size = safe_div(K, num_groups);
+    TORCH_CHECK(group_size > 0,
+                "group_size must be positive (K=", K, ", num_groups=", num_groups, ")");
     TORCH_CHECK(group_size * num_groups == K,
                 "K=", K, " must be divisible by num_groups=", num_groups);
 
@@ -302,7 +309,11 @@ void onednn_int4_gemm_add_to_output(
     TORCH_CHECK(dst.is_contiguous(), "dst must be contiguous");
 
     int64_t num_groups = scales_f16.size(0);
-    int64_t group_size = K / num_groups;
+    int64_t group_size = safe_div(K, num_groups);
+    TORCH_CHECK(group_size > 0,
+                "group_size must be positive (K=", K, ", num_groups=", num_groups, ")");
+    TORCH_CHECK(group_size * num_groups == K,
+                "K=", K, " must be divisible by num_groups=", num_groups);
 
     static torch::Tensor zp;
     if (!zp.defined() || zp.device() != act.device()) {
