@@ -52,6 +52,17 @@ APIS = {
 }
 API_NAMES = tuple(f"{module}.{name}" for module, names in APIS.items() for name in names)
 
+# Runtime lifecycle controls execute outside captured tensor graphs. Preparation
+# mutates a persistent native cache and returns availability, not a tensor.
+# Their eager allocation/release contracts live in test_convrot_allocation_context,
+# test_native_convrot and test_int8_correctness.
+RUNTIME_CONTROLS = {
+    "int8.set_allocation_context_factory",
+    "int8.prepare_convrot_hadamard",
+    "int8.clear_convrot_hadamard_cache",
+    "int8.release_onednn_int8_cache",
+}
+
 
 def _rand(shape, dtype=torch.bfloat16):
     return torch.randn(shape, device="xpu", dtype=dtype) * 0.25
@@ -309,11 +320,18 @@ def alias_signature(outputs, inputs):
 def test_public_tensor_inventory_has_no_unclassified_api():
     root = Path(__file__).resolve().parents[1] / "omni_xpu_kernel"
     actual = set()
+    controls = set()
     for module in APIS:
         for f in ast.parse((root/module/"__init__.py").read_text()).body:
             if not isinstance(f, ast.FunctionDef) or f.name.startswith("_"):continue
             if f.name.startswith("supports_") or f.name.endswith("_supported") or f.name == "is_available" or "_cache_" in f.name:continue
-            actual.add(module + "." + f.name)
+            qualified = module + "." + f.name
+            if qualified in RUNTIME_CONTROLS:
+                controls.add(qualified)
+            else:
+                actual.add(qualified)
+    assert controls == RUNTIME_CONTROLS
+    assert not controls.intersection(API_NAMES)
     assert actual == set(API_NAMES)
     assert len(actual) == 87
 

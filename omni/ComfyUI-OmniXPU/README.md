@@ -230,12 +230,20 @@ storage; `--async-offload 2` enables ComfyUI's existing prefetch streams.
 Select `cpu` in **Qwen Image 2.1 Cache**, or let `auto` choose host storage.
 Quantization scales keep their upstream storage behavior. A pinned allocation
 OOM falls back to pageable storage; other runtime errors remain visible.
+ComfyUI 0.39's `evict_active=False` policy is retained on that fallback,
+and older cache methods without this argument remain supported.
 
 On a known BMG XPU cache hit, the guarded prefix K/V copy route is enabled
 by default. It falls back to ComfyUI's original concatenation path for unsupported
 shapes, layouts, patches, devices, or compilation. Set
 `OMNIXPU_EXPERIMENTAL_QWEN21_CACHE_COPY=0` before startup to disable only this
 copy route while retaining the cache compatibility and pinned-memory fixes.
+ComfyUI 0.39 attention containers are consumed once on both routes, with
+the model's preferred attention selection passed through unchanged.
+
+The BMG versioned attention routes include Torch 2.14 alongside 2.11–2.13.
+This covers the existing native FP16 H3 VideoVAE D64 route for batches 1–4;
+unsupported shapes and other unqualified target/version pairs retain fallback.
 
 A ModelPatcher diffusion wrapper clears and bypasses prefix caching while
 `post_input`, `attn1_patch`, `single_block`, or block replacements are active.

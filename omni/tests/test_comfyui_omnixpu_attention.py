@@ -20,7 +20,7 @@ _PATCHES = _PLUGIN / "patches"
 _ADAPTERS = _PLUGIN / "adapters"
 
 
-def _pinned_comfy_wrap_attn():
+def _pinned_comfy_attention_namespace():
     key = "OMNIXPU_TEST_COMFY_ATTENTION_SOURCE"
     if key not in os.environ:
         pytest.skip(f"set {key} to the pinned Comfy attention.py for this integration check")
@@ -28,21 +28,21 @@ def _pinned_comfy_wrap_attn():
     if not source.is_file():
         pytest.fail(f"explicit pinned Comfy source is missing: {source}")
     contents = source.read_bytes()
-    if hashlib.sha256(contents).hexdigest() != "9cafaafaf93ff53e8cbefb5e4a204014019985df2da8c1996bf40f1235fc2960":
-        pytest.fail("explicit Comfy attention.py is not pinned 73c9 source")
+    if hashlib.sha256(contents).hexdigest() != "bc0a142275a9b1ebacd42d75d674ac6ce74e1c6bbdedeb8fc52706599d4ad498":
+        pytest.fail("explicit Comfy attention.py is not pinned b0b74356 source")
     module = ast.parse(contents.decode("utf-8"), filename=str(source))
-    functions = [node for node in module.body
-                 if isinstance(node, ast.FunctionDef) and node.name == "wrap_attn"]
-    if len(functions) != 1:
-        pytest.fail("pinned Comfy source does not define exactly one wrap_attn")
-    namespace = {
-        "functools": functools,
-        # This focused fixture calls wrap_attn with plain fake tensors, so its
-        # container branch must remain false without importing Comfy runtime.
-        "AttentionTensorContainer": type("AttentionTensorContainer", (), {}),
-    }
-    exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), namespace)
-    return namespace["wrap_attn"]
+    definitions = [node for node in module.body if
+                   (isinstance(node, ast.FunctionDef) and node.name == "wrap_attn") or
+                   (isinstance(node, ast.ClassDef) and node.name == "AttentionTensorContainer")]
+    if len(definitions) != 2:
+        pytest.fail("pinned Comfy source must define wrap_attn and AttentionTensorContainer")
+    namespace = {"functools": functools, "torch": torch}
+    exec(compile(ast.Module(body=definitions, type_ignores=[]), str(source), "exec"), namespace)
+    return namespace
+
+
+def _pinned_comfy_wrap_attn():
+    return _pinned_comfy_attention_namespace()["wrap_attn"]
 
 
 def _load_module(name: str, path: Path):
@@ -193,8 +193,8 @@ class _FakeMask:
 def _load_patch(
     monkeypatch,
     *,
-    target="ptl-h",
-    torch_version="2.11.0+xpu",
+    target="bmg",
+    torch_version="2.14.0+xpu",
     backend="auto",
     platform=None,
     expected_apply=True,
@@ -350,7 +350,8 @@ def _load_patch(
         ("bmg", "2.11.0+xpu", True),
         ("bmg", "2.12.0+xpu", True),
         ("bmg", "2.13.0+xpu", True),
-        ("bmg", "2.14.0+xpu", False),
+        ("bmg", "2.14.0+xpu", True),
+        ("bmg", "2.15.0+xpu", False),
         ("bmg", "3.0.0+xpu", False),
         ("unknown", "2.13.0+xpu", False),
         ("bmg", "invalid", False),
@@ -369,6 +370,8 @@ def test_versioned_routes_use_explicit_target_matrix(
 def test_windows_defaults_to_unpatched_torch_sdpa(monkeypatch):
     patch, attention, calls = _load_patch(
         monkeypatch,
+        target="ptl-h",
+        torch_version="2.11.0+xpu",
         backend=None,
         platform="win32",
         expected_apply=False,
@@ -389,6 +392,8 @@ def test_windows_defaults_to_unpatched_torch_sdpa(monkeypatch):
 def test_non_windows_keeps_auto_as_default(monkeypatch):
     patch, attention, calls = _load_patch(
         monkeypatch,
+        target="ptl-h",
+        torch_version="2.11.0+xpu",
         backend=None,
         platform="linux",
     )
@@ -412,7 +417,7 @@ def test_ptl_auto_validated_torch_zimage_shape_uses_torch(
     monkeypatch, torch_version, seq
 ):
     patch, attention, calls = _load_patch(
-        monkeypatch, torch_version=torch_version
+        monkeypatch, target="ptl-h", torch_version=torch_version
     )
     tensor = _FakeTensor(seq=seq)
     result = attention.optimized_attention(
@@ -429,7 +434,7 @@ def test_ptl_auto_validated_torch_krea2_shape_uses_torch(
     monkeypatch, torch_version
 ):
     patch, attention, calls = _load_patch(
-        monkeypatch, torch_version=torch_version
+        monkeypatch, target="ptl-h", torch_version=torch_version
     )
     tensor = _FakeTensor(seq=4192, heads=48)
     result = attention.optimized_attention(
@@ -442,7 +447,9 @@ def test_ptl_auto_validated_torch_krea2_shape_uses_torch(
 
 
 def test_explicit_cute_does_not_apply_auto_route(monkeypatch):
-    patch, attention, calls = _load_patch(monkeypatch, backend="cute")
+    patch, attention, calls = _load_patch(
+        monkeypatch, target="ptl-h", torch_version="2.11.0+xpu", backend="cute",
+    )
     tensor = _FakeTensor()
     result = attention.optimized_attention(
         tensor, tensor, tensor, heads=30, skip_reshape=True
@@ -454,7 +461,9 @@ def test_explicit_cute_does_not_apply_auto_route(monkeypatch):
 
 
 def test_ptl_dispatch_does_not_probe_bmg_capabilities(monkeypatch):
-    patch, attention, calls = _load_patch(monkeypatch, target="ptl-h")
+    patch, attention, calls = _load_patch(
+        monkeypatch, target="ptl-h", torch_version="2.11.0+xpu",
+    )
 
     def unexpected_bmg_probe(*args, **kwargs):
         raise AssertionError("PTL dispatch reached a BMG-only capability probe")
@@ -485,7 +494,9 @@ def test_ptl_dispatch_does_not_probe_bmg_capabilities(monkeypatch):
 
 
 def test_esimd_is_selected_only_when_explicitly_requested(monkeypatch):
-    patch, attention, calls = _load_patch(monkeypatch, backend="esimd")
+    patch, attention, calls = _load_patch(
+        monkeypatch, target="ptl-h", torch_version="2.11.0+xpu", backend="esimd",
+    )
     tensor = _FakeTensor()
     result = attention.optimized_attention(
         tensor, tensor, tensor, heads=30, skip_reshape=True
@@ -497,7 +508,7 @@ def test_esimd_is_selected_only_when_explicitly_requested(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu"]
+    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu", "2.14.0+xpu"]
 )
 def test_bmg_wan22_t2v_turbo_720p_cross_uses_cute(
     monkeypatch, torch_version
@@ -587,7 +598,9 @@ def test_bmg_wan22_diagnostic_output_scan_falls_back(monkeypatch):
 
 def test_generic_cute_skips_output_scan_by_default(monkeypatch):
     monkeypatch.delenv("OMNIXPU_VALIDATE_ATTENTION_OUTPUT", raising=False)
-    patch, attention, calls = _load_patch(monkeypatch, backend="cute")
+    patch, attention, calls = _load_patch(
+        monkeypatch, target="ptl-h", torch_version="2.11.0+xpu", backend="cute",
+    )
     tensor = _FakeTensor(dtype=torch.float16, non_finite=True)
 
     result = attention.optimized_attention(
@@ -602,7 +615,9 @@ def test_generic_cute_skips_output_scan_by_default(monkeypatch):
 
 def test_explicit_esimd_non_finite_output_still_falls_back(monkeypatch):
     monkeypatch.delenv("OMNIXPU_VALIDATE_ATTENTION_OUTPUT", raising=False)
-    patch, attention, calls = _load_patch(monkeypatch, backend="esimd")
+    patch, attention, calls = _load_patch(
+        monkeypatch, target="ptl-h", torch_version="2.11.0+xpu", backend="esimd",
+    )
     tensor = _FakeTensor(dtype=torch.float16, non_finite=True)
 
     result = attention.optimized_attention(
@@ -761,7 +776,7 @@ def test_animate2_cute_shape_contract(
     ],
 )
 @pytest.mark.parametrize(
-    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu"]
+    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu", "2.14.0+xpu"]
 )
 def test_bmg_attention_open_ended_domain_uses_general_bhld_cute(
     monkeypatch, q_len, kv_len, pre_shaped, route, torch_version
@@ -1067,6 +1082,46 @@ def test_bmg_masked_d128_accepts_pinned_comfy_wrap_marker_only(monkeypatch, vari
     assert len(selected) == 1 and calls == ["torch", "torch"]
 
 
+def test_pinned_comfy_containers_are_consumed_by_omnixpu(monkeypatch):
+    namespace = _pinned_comfy_attention_namespace()
+    container = namespace["AttentionTensorContainer"]
+    patch, attention, calls = _load_patch(
+        monkeypatch, target="bmg", torch_version="2.14.0+xpu",
+        wrap_attn=namespace["wrap_attn"],
+    )
+    carriers = [container(_FakeTensor(seq=64, heads=4)) for _ in range(3)]
+    result = attention.optimized_attention(
+        *carriers, heads=4, skip_reshape=True,
+        preferred_attention=types.SimpleNamespace(function=None),
+    )
+    assert all(value.tensor is None for value in carriers)
+    assert result.shape == (1, 64, 512)
+    assert calls in (["cute"], ["cute_d128_bhld"])
+
+
+def test_pinned_comfy_preferred_attention_owns_container_consumption(monkeypatch):
+    namespace = _pinned_comfy_attention_namespace()
+    container = namespace["AttentionTensorContainer"]
+    _, attention, calls = _load_patch(
+        monkeypatch, target="bmg", torch_version="2.14.0+xpu",
+        wrap_attn=namespace["wrap_attn"],
+    )
+    preferred_calls = []
+
+    @namespace["wrap_attn"]
+    def preferred(q, k, v, heads, **kwargs):
+        preferred_calls.append((q, k, v, heads))
+        return "preferred-output"
+
+    carriers = [container(_FakeTensor(seq=64, heads=4)) for _ in range(3)]
+    result = attention.optimized_attention(
+        *carriers, heads=4, skip_reshape=True,
+        preferred_attention=types.SimpleNamespace(function=preferred),
+    )
+    assert result == "preferred-output" and len(preferred_calls) == 1
+    assert calls == [] and all(value.tensor is None for value in carriers)
+
+
 def test_bmg_masked_d128_direct_is_explicit_and_keeps_other_masks_on_torch(monkeypatch):
     monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_DSO", "/new/direct-sidecar.so")
     monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_SHA256", "b" * 64)
@@ -1185,7 +1240,7 @@ def test_bmg_masked_d128_grad_and_mask_address_limit_fall_back(monkeypatch):
     ],
 )
 @pytest.mark.parametrize(
-    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu"]
+    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu", "2.14.0+xpu"]
 )
 def test_bmg_minimax_h3_h56_uses_direct_qkv_bhld_cute(
     monkeypatch, seq, qk_stride, v_stride, torch_version
@@ -1243,7 +1298,7 @@ def test_bmg_minimax_h3_h56_rejects_unvalidated_contract(
     [
         ("ptl-h", "2.11.0+xpu", True, 3520, 3520),
         ("bmg", "2.10.0+xpu", True, 3520, 3520),
-        ("bmg", "2.14.0+xpu", True, 3520, 3520),
+        ("bmg", "2.15.0+xpu", True, 3520, 3520),
         ("bmg", "2.11.0+xpu", False, 3520, 3520),
         ("bmg", "2.11.0+xpu", True, 767, 767),
         ("bmg", "2.11.0+xpu", True, 1023, 1024),
@@ -1417,7 +1472,7 @@ def test_auto_d64_uses_torch_not_esimd(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu"]
+    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu", "2.14.0+xpu"]
 )
 @pytest.mark.parametrize("seq", [6, 12, 261, 453, 901, 1797])
 def test_bmg_minimax_h3_video_vae_d64_uses_structural_cute(
@@ -1460,10 +1515,13 @@ def test_bmg_minimax_h3_video_vae_d64_uses_structural_cute(
     }
 
 
+@pytest.mark.parametrize("torch_version", ["2.13.0+xpu", "2.14.0+xpu"])
 @pytest.mark.parametrize("batch", [2, 3, 4])
-def test_bmg_minimax_h3_video_vae_d64_batched_packed_qkv(monkeypatch, batch):
+def test_bmg_minimax_h3_video_vae_d64_batched_packed_qkv(
+    monkeypatch, batch, torch_version
+):
     patch, attention, calls = _load_patch(
-        monkeypatch, target="bmg", torch_version="2.13.0+xpu",
+        monkeypatch, target="bmg", torch_version=torch_version,
     )
     seq = 1797
     packed_stride = (seq * 6144, 192, 6144, 1)
@@ -1696,7 +1754,9 @@ def test_unvalidated_auto_shapes_keep_cute(
     ],
 )
 def test_unvalidated_layouts_keep_cute(monkeypatch, tensor, kwargs):
-    patch, attention, calls = _load_patch(monkeypatch)
+    patch, attention, calls = _load_patch(
+        monkeypatch, target="ptl-h", torch_version="2.11.0+xpu",
+    )
     result = attention.optimized_attention(
         tensor, tensor, tensor, heads=30, **kwargs
     )
@@ -1715,6 +1775,7 @@ def test_unvalidated_layouts_keep_cute(monkeypatch, tensor, kwargs):
         ("bmg", "2.11.0+xpu"),
         ("bmg", "2.12.0+xpu"),
         ("bmg", "2.13.0+xpu"),
+        ("bmg", "2.14.0+xpu"),
     ],
 )
 @pytest.mark.parametrize("seq", [4096, 4205])
@@ -1776,7 +1837,9 @@ def test_unvalidated_boogu_d120_keeps_torch_fallback(
 
 
 def test_boogu_d120_rejects_unvalidated_tensor_contract(monkeypatch):
-    _, attention, calls = _load_patch(monkeypatch)
+    _, attention, calls = _load_patch(
+        monkeypatch, target="ptl-h", torch_version="2.11.0+xpu",
+    )
     tensor = _FakeTensor(
         seq=4096,
         heads=28,

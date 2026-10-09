@@ -51,6 +51,55 @@ def test_prefix_source_contract_accepts_formatting_but_rejects_math_change():
     assert adapter._prefix_source_matches(compatible_prefix)
     assert not adapter._prefix_source_matches(changed_prefix)
 
+    def container_prefix(prefix_k, prefix_v, transformer_options={}):
+        def attn(q, k, v, heads, preferred_attention=None):
+            q = AttentionTensorContainer(q.take().flatten(2))
+            k = AttentionTensorContainer(torch.cat([prefix_k, k.take()], dim=1).flatten(2))
+            v = AttentionTensorContainer(torch.cat([prefix_v, v.take()], dim=1).flatten(2))
+            return optimized_attention(q, k, v, heads, transformer_options=transformer_options,
+                                       preferred_attention=preferred_attention)
+        return attn
+    assert adapter._prefix_source_kind(container_prefix) == "container"
+
+
+@pytest.mark.parametrize("current", [False, True])
+def test_pinned_put_preserves_upstream_eviction_policy(current, monkeypatch):
+    adapter = load_adapter()
+    calls = []
+    def pin(t, **kwargs):
+        calls.append(kwargs)
+        return True
+    monkeypatch.setitem(globals(), "comfy", types.SimpleNamespace(
+        model_management=types.SimpleNamespace(pin_memory=pin)))
+
+    def put_old(self, i, t):
+        t = t.to(self.store_device, copy=True)
+        if comfy.model_management.pin_memory(t):
+            self.slot["pinned"].append(t)
+        self.slot["blocks"][i] = t
+
+    def put_current(self, i, t):
+        t = t.to( self.store_device, copy = True )
+        # Comments and formatting must not disable the adapter.
+        if comfy.model_management.pin_memory(
+                t, evict_active=False):
+            self.slot["pinned"].append(t)
+        self.slot["blocks"][i] = t
+
+    cache = types.SimpleNamespace(store_device=torch.device("cpu"),
+                                 slot={"pinned": [], "blocks": {}})
+    # A pageable fallback still reaches upstream pin_memory with its exact
+    # eviction policy; Torch-owned pinned memory skips external registration.
+    for pinned in (False, True):
+        host = types.SimpleNamespace(is_pinned=lambda: pinned)
+        monkeypatch.setattr(adapter, "_copy_pinned_cpu", lambda t, device: host)
+        # The prepared function retains the helper selected at preparation.
+        put = adapter._pinned_put(put_current if current else put_old)
+        put(cache, int(pinned), object())
+        assert cache.slot["blocks"][int(pinned)] is host
+    assert calls == ([{"evict_active": False}] if current else [{}])
+    assert len(cache.slot["pinned"]) == 1
+
 
 @pytest.fixture(scope="module")
 def comfy_runtime():
@@ -108,6 +157,20 @@ def activate(runtime):
     assert ok, reason
 
 
+def call_prefix(runtime, function, q, k, v, heads, preferred_attention=None):
+    container = getattr(runtime.qwen, "AttentionTensorContainer", None)
+    if container is None:
+        return function(q, k, v, heads)
+    inputs = [container(value) for value in (q, k, v)]
+    result = function(*inputs, heads, preferred_attention=preferred_attention)
+    assert all(value.tensor is None for value in inputs)
+    return result
+
+
+def take_attention(value):
+    return value if isinstance(value, torch.Tensor) else value.take()
+
+
 def test_apply_is_idempotent(runtime):
     activate(runtime)
     first = runtime.cache.select, runtime.cache.put, runtime.mp.ModelPatcher.__init__
@@ -132,8 +195,8 @@ def test_cache_copy_default_uses_real_prefix_wrapper_and_exact_join(runtime, mon
                "patches_replace": {"dit": {}, "other": {"noop": object()}},
                "block_index": 15}
     with torch.inference_mode():
-        expected = original(pk, pv, options)(q, k, v, 32)
-        actual = factory(pk, pv, options)(q, k, v, 32)
+        expected = call_prefix(runtime, original(pk, pv, options), q, k, v, 32)
+        actual = call_prefix(runtime, factory(pk, pv, options), q, k, v, 32)
         assert actual.shape == expected.shape == (1, 2048, 4096)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
@@ -141,14 +204,20 @@ def test_cache_copy_default_uses_real_prefix_wrapper_and_exact_join(runtime, mon
         joined_v = torch.cat((pv, v), dim=1).flatten(2)
         observed = []
         def optimized(fq, fk, fv, heads, **kwargs):
+            fq, fk, fv = map(take_attention, (fq, fk, fv))
             observed.append((fk, fv, heads, kwargs))
             return fq
         monkeypatch.setattr(runtime.qwen, "optimized_attention", optimized)
         def forbidden_cat(*args, **kwargs):
             raise AssertionError("copy route unexpectedly called torch.cat")
         monkeypatch.setattr(torch, "cat", forbidden_cat)
-        assert factory(pk, pv, options)(q, k, v, 32).shape == (1, 2048, 4096)
-        assert len(observed) == 1 and observed[0][2:] == (32, {"transformer_options": options})
+        preferred = object() if hasattr(runtime.qwen, "AttentionTensorContainer") else None
+        assert call_prefix(runtime, factory(pk, pv, options), q, k, v, 32,
+                           preferred).shape == (1, 2048, 4096)
+        kwargs = {"transformer_options": options}
+        if hasattr(runtime.qwen, "AttentionTensorContainer"):
+            kwargs["preferred_attention"] = preferred
+        assert len(observed) == 1 and observed[0][2:] == (32, kwargs)
         assert torch.equal(observed[0][0], joined_k)
         assert torch.equal(observed[0][1], joined_v)
         assert observed[0][0].stride()[1:] == joined_k.stride()[1:]
@@ -191,6 +260,7 @@ def test_cache_copy_unsupported_inputs_use_exact_original_closure(runtime, monke
     q, k, v, pk, pv = value(2048), value(2048), value(2048), value(31), value(31)
     calls = []
     def optimized(fq, fk, fv, heads, **kwargs):
+        fq, fk, fv = map(take_attention, (fq, fk, fv))
         calls.append((fk.shape, fv.shape, heads, kwargs))
         return "original"
     monkeypatch.setattr(runtime.qwen, "optimized_attention", optimized)
@@ -211,13 +281,18 @@ def test_cache_copy_unsupported_inputs_use_exact_original_closure(runtime, monke
          pv.expand(2, -1, -1, -1), {}),
     )
     for cq, ck, cv, cpk, cpv, options in cases:
-        assert factory(cpk, cpv, options)(cq, ck, cv, 32) == "original"
+        assert call_prefix(runtime, factory(cpk, cpv, options), cq, ck, cv, 32) == "original"
     monkeypatch.setenv("OMNI_ATTN_BACKEND", "torch")
-    assert factory(pk, pv, {})(q, k, v, 32) == "original"
+    assert call_prefix(runtime, factory(pk, pv, {}), q, k, v, 32) == "original"
     monkeypatch.setenv("OMNI_ATTN_BACKEND", "auto")
     monkeypatch.setenv(runtime.adapter._COPY_ENV, "0")
-    assert factory(pk, pv, {})(q, k, v, 32) == "original"
+    assert call_prefix(runtime, factory(pk, pv, {}), q, k, v, 32) == "original"
     assert len(calls) == len(cases) + 2
+    if hasattr(runtime.qwen, "AttentionTensorContainer"):
+        preferred = object()
+        assert call_prefix(runtime, factory(pk, pv, {}), q, k, v, 32,
+                           preferred) == "original"
+        assert calls[-1][3]["preferred_attention"] is preferred
     assert all(row[2] == 32 and row[0] == row[1] for row in calls)
 
 

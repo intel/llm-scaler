@@ -77,16 +77,16 @@ COMPONENT_PINS = {
     ),
     "COMFYUI_COMMIT": (
         "COMFYUI_COMMIT",
-        "73c9bad4d21e7addbe1d13bc92eee0f1431b017d",
+        "b0b743566f65daafc423b4fea8a2fbda94b3384a",
     ),
-    "COMFYUI_VERSION": ("COMFYUI_VERSION", "0.37.0"),
+    "COMFYUI_VERSION": ("COMFYUI_VERSION", "0.39.0"),
     "COMFYUI_FRONTEND_VERSION": (
         "COMFYUI_FRONTEND_VERSION",
-        "1.52.7",
+        "1.53.10",
     ),
     "COMFYUI_WORKFLOW_TEMPLATES_VERSION": (
         "COMFYUI_WORKFLOW_TEMPLATES_VERSION",
-        "0.11.66",
+        "0.11.76",
     ),
     "COMFYUI_MANAGER_VERSION": ("COMFYUI_MANAGER_VERSION", "4.2.2"),
     "COMFY_KITCHEN_REPOSITORY": (
@@ -95,12 +95,12 @@ COMPONENT_PINS = {
     ),
     "COMFY_KITCHEN_COMMIT": (
         "KITCHEN_COMMIT",
-        "ea43fcf8e301143f1c716416a1e9ce277b1657d4",
+        "c2b77e7229bcb1917a5bf3145dc45cbe8fc389a9",
     ),
-    "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.35"),
+    "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.37"),
     "COMFY_KITCHEN_PROVIDER_VERSION": (
         "KITCHEN_PROVIDER_VERSION",
-        "0.2.35",
+        "0.2.37",
     ),
     "COMFY_AIMDO_REPOSITORY": (
         "AIMDO_REPOSITORY",
@@ -600,7 +600,7 @@ class ComfyUIImageContractTest(unittest.TestCase):
             validator.PINNED_MINIMAX_H3_TEMPLATE_HASHES[
                 "video_minimax_h3_t2v.json"
             ],
-            "2400b01a7c8acae3fed038c0372f08bacb90d2cdf915febadbe7e3f9802506ea",
+            "8a5eb23b0dd2df9e99b6f7af9684e770f188feca820d241364b729e01dedf3b6",
         )
 
         self.assertIn(
@@ -691,9 +691,9 @@ class ComfyUIImageContractTest(unittest.TestCase):
         validator = load_validator()
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
 
-        self.assertEqual(COMPONENT_PINS["COMFY_KITCHEN_VERSION"][1], "0.2.35")
+        self.assertEqual(COMPONENT_PINS["COMFY_KITCHEN_VERSION"][1], "0.2.37")
         self.assertEqual(
-            COMPONENT_PINS["COMFY_KITCHEN_PROVIDER_VERSION"][1], "0.2.35"
+            COMPONENT_PINS["COMFY_KITCHEN_PROVIDER_VERSION"][1], "0.2.37"
         )
         self.assertEqual(COMPONENT_PINS["COMFY_AIMDO_VERSION"][1], "0.5.5")
         self.assertEqual(
@@ -721,7 +721,7 @@ class ComfyUIImageContractTest(unittest.TestCase):
                 self.assertIn(label, dockerfile)
 
         pairs = (
-            ("comfy_kitchen.xpu", "0.2.35", "0.2.35", "https://github.com/xiangyuT/comfy-kitchen-xpu.git"),
+            ("comfy_kitchen.xpu", "0.2.37", "0.2.37", "https://github.com/xiangyuT/comfy-kitchen-xpu.git"),
             ("comfy_aimdo.xpu", "0.5.5", "0.5.5", "https://github.com/xiangyuT/comfy-aimdo-xpu.git"),
         )
         for provider_id, source_version, official_version, source_repository in pairs:
@@ -763,19 +763,19 @@ class ComfyUIImageContractTest(unittest.TestCase):
         mismatched_manifest = {
             "provider_distribution": {"version": "0.2.34"},
             "source": {
-                "version": "0.2.35",
+                "version": "0.2.37",
                 "repository": "https://github.com/xiangyuT/comfy-kitchen-xpu.git",
             },
             "canonical_distribution": {
-                "compatible_versions": ["0.2.35"]
+                "compatible_versions": ["0.2.37"]
             },
         }
         with self.assertRaisesRegex(RuntimeError, "distribution version"):
             validator.require_provider_version_compatibility(
                 "comfy_kitchen.xpu",
                 mismatched_manifest,
-                official_version="0.2.35",
-                provider_version="0.2.35",
+                official_version="0.2.37",
+                provider_version="0.2.37",
                 source_repository="https://github.com/xiangyuT/comfy-kitchen-xpu.git",
             )
         validator.require_provider_package_is_disjoint(

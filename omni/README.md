@@ -142,11 +142,11 @@ see [ComfyUI usage](docs/COMFYUI.md).
 
 The focused source build selects:
 
-- upstream [ComfyUI v0.37.0](https://github.com/Comfy-Org/ComfyUI/tree/v0.37.0),
-  pinned to `73c9bad4d21e7addbe1d13bc92eee0f1431b017d`;
+- upstream [ComfyUI v0.39.0](https://github.com/Comfy-Org/ComfyUI/tree/v0.39.0),
+  pinned to `b0b743566f65daafc423b4fea8a2fbda94b3384a`;
 - `omni_xpu_kernel`, built for the selected Torch minor and XPU target;
-- official `comfy-kitchen==0.2.35` plus the matching co-installable XPU runtime provider
-  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/ea43fcf8e301143f1c716416a1e9ce277b1657d4),
+- official `comfy-kitchen==0.2.37` plus the matching co-installable XPU runtime provider
+  from [`comfy-kitchen-xpu` merged revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/c2b77e7229bcb1917a5bf3145dc45cbe8fc389a9),
   including the managed GGUF and Nunchaku W4A16 routes;
 - official `comfy-aimdo==0.5.5` plus the co-installable XPU runtime provider
   from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/80ef0f9abdb384a47d81058b4bec87a201ff63e4),
@@ -160,7 +160,7 @@ The focused source build selects:
   Kitchen and the packaged `omni_xpu_kernel` XPU operators; see
   [usage and legacy-node migration](docs/SPARSE_ATTENTION.md);
 - [ComfyUI-OmniXPU](ComfyUI-OmniXPU/README.md);
-- ComfyUI v0.37.0 integrated Node Manager plus pinned VideoHelperSuite,
+- ComfyUI v0.39.0 integrated Node Manager plus pinned VideoHelperSuite,
   Easy-Use, KJNodes, CacheDiT, and ControlNet auxiliary nodes;
 - an exact installed Python dependency snapshot at
   `/llm/manifests/comfyui-python-freeze.txt`.

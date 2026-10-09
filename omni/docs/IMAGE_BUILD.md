@@ -59,12 +59,15 @@ ComfyUI repository, commit, and version must be updated together. Kitchen and
 AIMDO official dependency versions are separate from the versions of their
 pinned provider source wheels. The provider manifests declare which official
 versions each source wheel accepts, and image validation checks both identities.
-For the ComfyUI 0.37.0 candidate, official Kitchen 0.2.35 uses the matching
-0.2.35 provider source at `xiangyuT/comfy-kitchen-xpu`
-(`ea43fcf8e301143f1c716416a1e9ce277b1657d4`). Official AIMDO 0.5.5 uses
+For the ComfyUI 0.39.0 candidate, official Kitchen 0.2.37 uses the matching
+0.2.37 provider source at `xiangyuT/comfy-kitchen-xpu`
+(`c2b77e7229bcb1917a5bf3145dc45cbe8fc389a9`, merged by
+[PR #12](https://github.com/xiangyuT/comfy-kitchen-xpu/pull/12)). Official AIMDO 0.5.5 uses
 the matching 0.5.5 provider source at `xiangyuT/comfy-aimdo-xpu`
 (`80ef0f9abdb384a47d81058b4bec87a201ff63e4`). Both provider manifests
-accept their matching official 0.2.35 and 0.5.5 versions.
+accept their matching official 0.2.37 and 0.5.5 versions. The ComfyUI release
+requirements also pin embedded docs to 0.5.13; frontend and workflow templates
+are selected as 1.53.10 and 0.11.76 by the build inputs.
 GGUF repository and commit must be updated together.
 The private sidecar build requires the Torch release supported by llm-scaler
 (currently `2.14.0+xpu`) and an explicitly selected AIMDO revision that contains

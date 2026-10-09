@@ -22,9 +22,9 @@ _COPY_MIN_QUERY = 2048  # The existing BMG D128 prefix CUTE admission floor.
 _MAX_ELEMENTS = (1 << 31) - 1
 
 
-def _prefix_source_matches(function):
+def _prefix_source_kind(function):
     """Accept the original attention math regardless of comments or formatting."""
-    expected = ast.parse("""\
+    legacy = ast.parse("""\
 def prefix_cached_attention(prefix_k, prefix_v, transformer_options={}):
     def attn(q, k, v, heads):
         return optimized_attention(
@@ -35,14 +35,29 @@ def prefix_cached_attention(prefix_k, prefix_v, transformer_options={}):
         )
     return attn
 """)
+    containers = ast.parse("""\
+def prefix_cached_attention(prefix_k, prefix_v, transformer_options={}):
+    def attn(q, k, v, heads, preferred_attention=None):
+        q = AttentionTensorContainer(q.take().flatten(2))
+        k = AttentionTensorContainer(torch.cat([prefix_k, k.take()], dim=1).flatten(2))
+        v = AttentionTensorContainer(torch.cat([prefix_v, v.take()], dim=1).flatten(2))
+        return optimized_attention(q, k, v, heads, transformer_options=transformer_options, preferred_attention=preferred_attention)
+    return attn
+""")
     actual = ast.parse(textwrap.dedent(inspect.getsource(function)))
     if len(actual.body) != 1 or not isinstance(actual.body[0], ast.FunctionDef):
-        return False
+        return None
     # The exported binding name is checked by the caller; the local name is
     # irrelevant to the attention math.
     actual.body[0].name = "prefix_cached_attention"
-    return ast.dump(actual, include_attributes=False) == ast.dump(
-        expected, include_attributes=False)
+    for kind, expected in (("tensor", legacy), ("container", containers)):
+        if ast.dump(actual, include_attributes=False) == ast.dump(expected, include_attributes=False):
+            return kind
+    return None
+
+
+def _prefix_source_matches(function):
+    return _prefix_source_kind(function) is not None
 
 
 def _copy_prefix_inputs(q, k, v, prefix_k, prefix_v, heads, options):
@@ -97,17 +112,28 @@ def _copy_prefix_factory(qwen):
     if tuple(inspect.signature(original).parameters) != (
             "prefix_k", "prefix_v", "transformer_options"):
         return None, "unsupported prefix_cached_attention signature"
-    if not _prefix_source_matches(original):
+    kind = _prefix_source_kind(original)
+    if kind is None:
         return None, "unsupported prefix_cached_attention source contract"
 
     @functools.wraps(original)
     def factory(prefix_k, prefix_v, transformer_options={}):
         fallback = original(prefix_k, prefix_v, transformer_options)
 
-        def attention(q, k, v, heads):
-            if not _copy_prefix_inputs(q, k, v, prefix_k, prefix_v,
-                                       heads, transformer_options):
+        def attention(q, k, v, heads, preferred_attention=None):
+            if kind == "container":
+                inputs = (q.peek(), k.peek(), v.peek())
+            else:
+                inputs = (q, k, v)
+            admitted = _copy_prefix_inputs(*inputs, prefix_k, prefix_v,
+                                          heads, transformer_options)
+            del inputs
+            if not admitted:
+                if kind == "container":
+                    return fallback(q, k, v, heads, preferred_attention=preferred_attention)
                 return fallback(q, k, v, heads)
+            if kind == "container":
+                q, k, v = q.take(), k.take(), v.take()
             length = prefix_k.shape[1]
             shape = (1, length + k.shape[1], 32, 128)
             joined_k = torch.empty(shape, dtype=k.dtype, device=k.device)
@@ -116,9 +142,15 @@ def _copy_prefix_factory(qwen):
             joined_k[:, length:].copy_(k)
             joined_v[:, :length].copy_(prefix_v)
             joined_v[:, length:].copy_(v)
-            return qwen.optimized_attention(
-                q.flatten(2), joined_k.flatten(2), joined_v.flatten(2), heads,
-                transformer_options=transformer_options)
+            del k, v
+            q, joined_k, joined_v = q.flatten(2), joined_k.flatten(2), joined_v.flatten(2)
+            if kind == "container":
+                container = qwen.AttentionTensorContainer
+                return qwen.optimized_attention(container(q), container(joined_k),
+                    container(joined_v), heads, transformer_options=transformer_options,
+                    preferred_attention=preferred_attention)
+            return qwen.optimized_attention(q, joined_k, joined_v, heads,
+                                           transformer_options=transformer_options)
 
         return attention
 
@@ -154,6 +186,38 @@ def _copy_pinned_cpu(tensor, device):
     # the upstream stream waits and staging buffers; Torch owns host lifetime.
     host.copy_(tensor, non_blocking=False)
     return host
+
+
+def _pinned_put(function):
+    """Change host storage while preserving upstream pin/eviction arguments."""
+    if function.__closure__:
+        raise ValueError("cache method unexpectedly captures closure state")
+    source = textwrap.dedent(inspect.getsource(function))
+    if not source.startswith(f"def {function.__name__}("):
+        raise ValueError("unsupported decorated cache method")
+    tree = ast.parse(source)
+    expected_copy = ast.parse("t = t.to(self.store_device, copy=True)").body[0]
+    pin_calls = [ast.parse(expression, mode="eval").body for expression in (
+        "comfy.model_management.pin_memory(t)",
+        "comfy.model_management.pin_memory(t, evict_active=False)",
+    )]
+    copies, pins = [], []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(expected_copy):
+            copies.append(node)
+        if isinstance(node, ast.If) and any(ast.dump(node.test) == ast.dump(call)
+                                            for call in pin_calls):
+            pins.append(node)
+    if len(copies) != 1 or len(pins) != 1:
+        raise ValueError("unsupported put cache contract")
+    copies[0].value = ast.parse("_omnixpu_copy_pinned_cpu(t, self.store_device)",
+                               mode="eval").body
+    pins[0].test = ast.BoolOp(op=ast.And(), values=[
+        ast.parse("not t.is_pinned()", mode="eval").body, pins[0].test])
+    ast.fix_missing_locations(tree)
+    namespace = {**function.__globals__, "_omnixpu_copy_pinned_cpu": _copy_pinned_cpu}
+    exec(compile(tree, inspect.getfile(function), "exec"), namespace)
+    return functools.update_wrapper(namespace[function.__name__], function)
 
 
 def _guard_prefix_cache(executor, x, timesteps, context, ref_latents=None,
@@ -240,12 +304,7 @@ def apply():
             ("for s in self.slots:", "for index, s in enumerate(self.slots):"),
             ("self.slots.remove(s)", "self.slots.pop(index)"),
         ))
-        put_xpu = _rewrite(original_put, (
-            ("t = t.to(self.store_device, copy=True)",
-             "t = _omnixpu_copy_pinned_cpu(t, self.store_device)"),
-            ("if comfy.model_management.pin_memory(t):",
-             "if not t.is_pinned() and comfy.model_management.pin_memory(t):"),
-        ), {"_omnixpu_copy_pinned_cpu": _copy_pinned_cpu})
+        put_xpu = _pinned_put(original_put)
         copy_factory, copy_error = _copy_prefix_factory(qwen)
         if copy_error is not None:
             raise ValueError(copy_error)
