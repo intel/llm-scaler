@@ -1,0 +1,68 @@
+{
+  "base_image": {
+    "release": "v0.31.0",
+    "reference": "vllm/vllm-openai-xpu@sha256:95ac815038c4b3537b173798bfe3b89bdf525a52bd653cd14d4deb01f1062be7"
+  },
+  "sources": [
+    {
+      "name": "vllm",
+      "repository": "https://github.com/vllm-project/vllm.git",
+      "base_commit": "95307ac6d4cd8be2c1e38f236e9104c569af9025",
+      "patched_tree": "9b5c469f570063a7e9500c850848cf5b9c099974",
+      "patches": [
+        {
+          "file": "0001-vllm-minicpmv47-xpu.patch",
+          "sha256": "8bdd3045fc02e4220250b534ecaab59b7cfce85d1ca63cc892523d7896ae93f9"
+        }
+      ],
+      "provenance": [
+        {
+          "url": "https://github.com/wyc55069407/vllm/pull/6",
+          "description": "MiniCPM-V 4.7 model and parser integration"
+        },
+        {
+          "url": "https://github.com/vllm-project/vllm/pull/60539",
+          "head_commit": "8f3e461beebc37d665a2cc2ba805adea1617dc34",
+          "description": "XPU compiler fusions, extended locally for BF16 activations"
+        },
+        {
+          "url": "https://github.com/vllm-project/vllm/pull/58674",
+          "description": "Qwen DSpark already present in the pinned upstream base"
+        }
+      ],
+      "local_changes": [
+        "BF16 eligibility for XPU compiler fusions",
+        "QKV op registration",
+        "Speculative dummy warmup and hybrid-state bounds"
+      ]
+    },
+    {
+      "name": "vllm-xpu-kernels",
+      "repository": "https://github.com/vllm-project/vllm-xpu-kernels.git",
+      "base_commit": "bdf9ac02f55293b6217a1a47e0a497d580474e23",
+      "patched_tree": "9b4368458637fd747057ffcbcad15b1be4fa1bf7",
+      "patches": [
+        {
+          "file": "0002-kernels-pr622.patch",
+          "sha256": "20a2cc90dd2ebfeaa8e9600da13e7d315e4f612c98ff15a08770b9aa84adada5"
+        },
+        {
+          "file": "0003-kernels-bf16.patch",
+          "sha256": "34115ec89eae9ceab2f7f0fd87ae493f483e8f94277dbbf498494ce3a4771f8b"
+        }
+      ],
+      "provenance": [
+        {
+          "url": "https://github.com/vllm-project/vllm-xpu-kernels/pull/622",
+          "head_commit": "bee39d9299538ce6e82a947443790450aa570f3c",
+          "description": "Xe2 fused MoE, FP8 GEMV, router, norm and QKV kernels"
+        }
+      ],
+      "local_changes": [
+        "BF16 activation dispatch, accumulation and stores",
+        "BF16 shared-expert wrapper and tests",
+        "Router supports up to 16 rows; K7 compilation keeps its default 8-row limit"
+      ]
+    }
+  ]
+}

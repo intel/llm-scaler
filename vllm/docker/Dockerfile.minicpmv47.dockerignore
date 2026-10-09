@@ -1,0 +1,10 @@
+**
+!docker/
+!docker/Dockerfile.minicpmv47
+!minicpmv47/
+!minicpmv47/**
+!patches/
+!patches/minicpmv47/
+!patches/minicpmv47/**
+**/__pycache__/
+**/*.pyc
