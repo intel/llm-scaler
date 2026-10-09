@@ -1,10 +1,10 @@
-# MiniCPM-V 4.7 DSpark on Intel XPU
+# MiniCPM-V 4.7 on Intel XPU
 
 This focused development recipe extends
 [Intel llm-scaler](https://github.com/intel/llm-scaler) using the upstream
 `vllm/vllm-openai-xpu` v0.31.0 runtime. It packages the MiniCPM-V 4.7 model,
-XPU compiler fusions with BF16 activation support, and the DSpark noncausal
-attention specialization. The default serving configuration uses seven
+XPU compiler fusions with FP16/BF16 activation support, optional TP2 custom
+all-reduce, and specialized decode/draft attention. The K7 launcher uses seven
 speculative tokens, online FP8 target weights, BF16 target activations, and a
 BF16 DSpark draft. Draft Markov/vocabulary FP8 conversion is not enabled.
 
@@ -20,7 +20,7 @@ The Dockerfile pins the upstream v0.31.0 image by digest, adds the oneAPI
 2026.1.1 compiler, prepares exact source revisions, and compiles the additional
 native operators. It preserves the upstream GPU runtime, Torch ABI, kernel
 wheel and Rust binaries. Patched Python sources are selected with `PYTHONPATH`;
-native overlays supply the additional fusion operators and attention route.
+native overlays supply the additional fusion, communication and attention ops.
 This is a development source/native overlay, not a new vLLM package release.
 
 Sources are retained under `/opt/minicpmv47/src/`; the recipe and build outputs
@@ -53,6 +53,8 @@ The checksummed source manifest is
 | `0001-vllm-minicpmv47-xpu.patch` | vLLM main `95307ac6d4cd8be2c1e38f236e9104c569af9025`; MiniCPM-V 4.7, XPU compiler fusions, BF16 eligibility, QKV registration, speculative warmup and hybrid-state bounds. |
 | `0002-kernels-pr622.patch` | kernels main `bdf9ac02f55293b6217a1a47e0a497d580474e23`; PR #622 through `bee39d9299538ce6e82a947443790450aa570f3c`. |
 | `0003-kernels-bf16.patch` | PR #622 head; BF16 activation dispatch, accumulation, stores and wrappers. |
+| `0004-vllm-custom-allreduce.patch` | Opt-in TP2 custom all-reduce integration, preserving the current batch-invariant path and XCCL fallback. |
+| `0005-kernels-custom-allreduce.patch` | Native IPC collective, Python wrapper, graph-capture context and multiprocess tests. |
 
 Upstream contributions are
 [MiniCPM-V 4.7 PR #6](https://github.com/wyc55069407/vllm/pull/6),
@@ -62,6 +64,50 @@ Upstream contributions are
 Qwen DSpark is already in the pinned vLLM main revision and does not require a
 second patch. The manifest pins this recipe's source; moving PR heads are not
 fetched during the build.
+
+The optional collective comes from
+[vLLM PR #4](https://github.com/wyc55069407/vllm/pull/4) and
+[kernels PR #4](https://github.com/wyc55069407/vllm-xpu-kernels/pull/4), with a
+local adapter for vLLM's graph-capture context. These are experimental fork
+contributions, not upstream-accepted implementations. The source-built paged
+decode retains PR #622's split-K head-dimension tiling. Its SYCL kernels use a
+separate namespace to prevent collisions with the stock attention binaries.
+
+## Serve without speculative decoding
+
+Mount only the target model read-only; a draft model is not required:
+
+```bash
+docker run --rm --device /dev/dri --shm-size 32g --network host \
+  --mount type=bind,source="${TARGET_MODEL_DIR}",target=/models/target,readonly \
+  --env ZE_AFFINITY_MASK="${XPU_AFFINITY}" \
+  "${IMAGE_ID}" /opt/venv/bin/python /opt/minicpmv47/recipe/serve_nonspec.py \
+  --model /models/target
+```
+
+The launcher defaults to FP16 activations, online FP8 weights, TP=2, one
+concurrent sequence, maximum model length 33280, and a 2 GiB KV cache budget per
+rank. It enables all six XPU passes, uses `splitting_ops=[]`, and captures one
+decode token with `FULL_DECODE_ONLY`. Keeping the GDN allocation and op in the
+same compiled graph allows the zero-fill removal pass to match. Override
+`--dtype bfloat16` to use BF16 activations.
+
+The main-model attention override is enabled by this launcher only for the
+global-window paged `[1,8,256]` query with matching FP16/BF16 cache tensors.
+The native q1 API dispatches `causal=false`, since all logical cached keys are
+current or past positions. Other attention configurations and target prefill
+retain the stock path. The `64` config selects the kernel's KV tile size; it
+does not force the runtime hybrid cache page size to 64.
+
+To opt into custom all-reduce, add `--cap-add SYS_PTRACE` to `docker run` and
+`--custom-all-reduce` to the launcher. It requires TP=2 and a compatible local
+Intel GPU P2P/IPC setup. This path depends on driver IPC behavior and cross-card
+memory ordering tested on B70; it remains experimental. Unsupported tensor
+sizes or dtypes, and unavailable IPC setup, keep XCCL. The default is XCCL.
+
+`serve_nonspec.py --dry-run` prints the command without starting inference. No
+speculative configuration is added, and no draft model is loaded. Generation
+length and EOS handling remain per-request settings.
 
 ## Serve K7
 
@@ -94,7 +140,7 @@ only as needed for the deployment. Images/video inputs are disabled by this
 text-only launcher. Runtime startup fails if a required overlay cannot load;
 unmatched attention shapes retain the stock dispatch path.
 
-This recipe requires a clean image build and GPU validation before use as a
-validated deployment. It does not resolve or claim validation of long-context
+This updated recipe requires a clean image build and GPU validation before use
+as a validated deployment. It does not resolve or claim validation of long-context
 DSpark draft behavior. Model weights are not downloaded or included in the
 build context.

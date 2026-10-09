@@ -35,7 +35,7 @@ RUN /opt/venv/bin/python /opt/minicpmv47/recipe/prepare_sources.py \
       --source /opt/minicpmv47/src/vllm
 
 # Compile only the additional native operators; retain the stock kernel wheel.
-# The attention configuration covers DSpark's noncausal head_dim=256 branch.
+# Attention covers DSpark's noncausal branch and the main-model q1 decode path.
 RUN source /opt/intel/oneapi/setvars.sh --force >/dev/null \
     && /opt/venv/bin/python /opt/minicpmv47/recipe/build_native.py \
       --source /opt/minicpmv47/src/vllm-xpu-kernels \

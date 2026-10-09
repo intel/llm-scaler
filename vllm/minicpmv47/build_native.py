@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Rebuild the BF16 fusion and DSpark attention overlays against the base ABI."""
+"""Rebuild fusion, TP2 collective, and attention overlays against the base ABI."""
 
 import argparse
 import json
@@ -54,6 +54,9 @@ def configure(source: Path, build: Path, attention: bool):
         f"-DVLLM_CHUNK_PREFILL_CONFIG={recipe / 'chunk-prefill.conf'}",
         f"-DVLLM_PAGED_DECODE_CONFIG={recipe / 'paged-decode.conf'}",
     ]
+    if attention:
+        # Give the rebuilt SYCL kernels distinct IDs from the stock binaries.
+        command.append("-DCMAKE_CXX_FLAGS=-Dvllm_xpu_xe2=minicpmv47_xe2")
     command += [
         f"-D{name}={'ON' if enabled else 'OFF'}" for name, enabled in switches.items()
     ]
@@ -80,6 +83,8 @@ def compile_object(row, source: Path, output: Path, build: Path, extra=()):
 def fusion_bindings(source: Path) -> str:
     bindings = (source / "csrc/xpu/torch_bindings.cpp").read_text()
     pieces = []
+    start = bindings.index("  // One-shot P2P custom all-reduce")
+    pieces.append(bindings[start : bindings.index("\n#ifdef", start)])
     for name in ("fp8_gemm_w8a16_pair", "moe_shared_fused_decode_interface"):
         start = bindings.index(f'  xpu_ops.def(\n      "{name}')
         pieces.append(bindings[start : bindings.index("\n#endif", start)])
@@ -125,6 +130,7 @@ def build_fusions(source: Path, build: Path, output: Path):
     objects = []
     selected = [
         "csrc/moe/moe_router_decode.cpp",
+        "csrc/xpu/custom_ar/custom_ar.cpp",
         "csrc/xpu/gemv/xe_2/fp8_gemv_xe2.cpp",
         "csrc/xpu/gemv/xe_2/norm_fp8_gemv_xe2.cpp",
         "csrc/xpu/grouped_gemm/xe_2/moe_shared_fused_decode_xe2.cpp",
