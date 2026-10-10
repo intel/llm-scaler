@@ -1500,6 +1500,10 @@ tool-call parser and reasoning parser shown in the previous section, and set
 the assistant path to the matching Muse Glimmer assistant model. Compare
 DFlash ON and OFF with otherwise identical server and benchmark parameters.
 
+For MiniCPM-V 4.7 with a DSpark K7 draft or without speculative decoding, see the
+[upstream v0.31.0 XPU development recipe](minicpmv47/README.md). It includes
+pinned source patches, FP16/BF16 activation support, and a dedicated Dockerfile.
+
 ### 3.9 Rust Frontend
 
 The Rust frontend can be enabled without changing the serving CLI:

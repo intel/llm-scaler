@@ -1,0 +1,58 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+# Build context: vllm/. Retains the upstream v0.31.0 XPU runtime and binaries.
+FROM vllm/vllm-openai-xpu@sha256:95ac815038c4b3537b173798bfe3b89bdf525a52bd653cd14d4deb01f1062be7
+
+USER root
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN curl --fail --silent --show-error --location --retry 3 \
+      https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+      | gpg --dearmor --output /usr/share/keyrings/minicpm-oneapi.gpg \
+    && printf '%s\n' \
+      'deb [signed-by=/usr/share/keyrings/minicpm-oneapi.gpg] https://apt.repos.intel.com/oneapi all main' \
+      > /etc/apt/sources.list.d/minicpm-oneapi.list \
+    && apt-get update \
+    && apt-get install --yes --no-install-recommends git \
+      intel-oneapi-compiler-dpcpp-cpp-2026.1=2026.1.1-325 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV SYCL_HOME=/opt/intel/oneapi/compiler/2026.1 \
+    CC=/opt/intel/oneapi/compiler/2026.1/bin/icx \
+    CXX=/opt/intel/oneapi/compiler/2026.1/bin/icpx \
+    PATH=/opt/intel/oneapi/compiler/2026.1/bin:${PATH}
+
+COPY patches/minicpmv47/ /opt/minicpmv47/patches/
+COPY minicpmv47/ /opt/minicpmv47/recipe/
+
+RUN /opt/venv/bin/python /opt/minicpmv47/recipe/prepare_sources.py \
+      --manifest /opt/minicpmv47/patches/sources.json \
+      --root /opt/minicpmv47/src \
+    && uv pip install --python /opt/venv/bin/python --no-deps \
+      --constraint /opt/minicpmv47/recipe/constraints.txt \
+      --requirement /opt/minicpmv47/src/vllm/requirements/xpu.txt \
+    && /opt/venv/bin/python /opt/minicpmv47/recipe/check_environment.py \
+      --source /opt/minicpmv47/src/vllm
+
+# Compile only the additional native operators; retain the stock kernel wheel.
+# Attention covers DSpark's noncausal branch and the main-model q1 decode path.
+RUN source /opt/intel/oneapi/setvars.sh --force >/dev/null \
+    && /opt/venv/bin/python /opt/minicpmv47/recipe/build_native.py \
+      --source /opt/minicpmv47/src/vllm-xpu-kernels \
+      --build /opt/minicpmv47/build \
+      --output /opt/minicpmv47/native \
+      --jobs 4
+
+ENV PYTHONPATH=/opt/minicpmv47/recipe/runtime:/opt/minicpmv47/src/vllm \
+    MINICPMV47_RUNTIME=1 \
+    VLLM_USE_V2_MODEL_RUNNER=1
+
+LABEL org.opencontainers.image.source="https://github.com/intel/llm-scaler" \
+      minicpmv47.base-release="v0.31.0" \
+      minicpmv47.vllm-base="95307ac6d4cd8be2c1e38f236e9104c569af9025" \
+      minicpmv47.kernels-base="bdf9ac02f55293b6217a1a47e0a497d580474e23" \
+      minicpmv47.install-kind="source-and-native-overlay"
+
+WORKDIR /opt/minicpmv47/src/vllm
+ENTRYPOINT ["/opt/minicpmv47/recipe/entrypoint.sh"]
+CMD ["vllm", "serve", "--help"]

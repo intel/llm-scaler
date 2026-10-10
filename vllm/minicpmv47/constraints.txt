@@ -1,0 +1,7 @@
+# Preserve the upstream runtime ABI; satisfy the pinned source requirements.
+torch==2.14.0+xpu
+triton==3.8.0+xpu
+vllm==0.31.0+xpu
+vllm-xpu-kernels==0.1.15.4
+transformers==5.17.0
+tokenizers==0.23.2
