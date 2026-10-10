@@ -79,6 +79,7 @@ Mount only the target model read-only; a draft model is not required:
 
 ```bash
 docker run --rm --device /dev/dri --shm-size 32g --network host \
+  --mount type=bind,source=/dev/dri/by-path,target=/dev/dri/by-path,readonly \
   --mount type=bind,source="${TARGET_MODEL_DIR}",target=/models/target,readonly \
   --env ZE_AFFINITY_MASK="${XPU_AFFINITY}" \
   "${IMAGE_ID}" /opt/venv/bin/python /opt/minicpmv47/recipe/serve_nonspec.py \
@@ -99,6 +100,9 @@ current or past positions. Other attention configurations and target prefill
 retain the stock path. The `64` config selects the kernel's KV tile size; it
 does not force the runtime hybrid cache page size to 64.
 
+The `/dev/dri/by-path` mount allows XCCL to exchange DRM file descriptors when
+the host/container setup does not permit `pidfd` access.
+
 To opt into custom all-reduce, add `--cap-add SYS_PTRACE` to `docker run` and
 `--custom-all-reduce` to the launcher. It requires TP=2 and a compatible local
 Intel GPU P2P/IPC setup. This path depends on driver IPC behavior and cross-card
@@ -118,6 +122,7 @@ mapping; the example assumes a verified two-device selection.
 
 ```bash
 docker run --rm --device /dev/dri --shm-size 32g --network host \
+  --mount type=bind,source=/dev/dri/by-path,target=/dev/dri/by-path,readonly \
   --mount type=bind,source="${TARGET_MODEL_DIR}",target=/models/target,readonly \
   --mount type=bind,source="${DRAFT_MODEL_DIR}",target=/models/draft,readonly \
   --env ZE_AFFINITY_MASK="${XPU_AFFINITY}" \
