@@ -1,0 +1,51 @@
+{
+  "release": "v0.31.0",
+  "kernel_wheel": {
+    "version": "0.1.15.4",
+    "sha256": "4ec262f7afdd07c62defc8286dc9f357569627b996c09b410f7972b653696fe7",
+    "source_provenance": "Exact wheel build commit is not attested; downstream source interfaces match."
+  },
+  "sources": [
+    {
+      "name": "vllm",
+      "repository": "https://github.com/vllm-project/vllm.git",
+      "base_commit": "db9527a46873454610df6dbedf79a36d6bf1a7f6",
+      "patched_tree": "92b365c00c93d5183506bf9494b3e699451755a1",
+      "patches": [
+        {
+          "file": "0001-vllm-qwen38.patch",
+          "sha256": "7a530c8d3fa4ce70fb1e3847f5aaed91e44d07af6b0a036f7b54561acdadb1e0"
+        },
+        {
+          "file": "0003-vllm-minicpmv47.patch",
+          "sha256": "4229fb3afdc99ca1592a02acacabdab1301859e552b566839704eb6c7caa9c75"
+        },
+        {
+          "file": "0005-vllm-runtime-compat.patch",
+          "sha256": "8714b089dc5ee596e43c08c34444d89621df4e999319cf53ba9bdad2d1a2722e"
+        },
+        {
+          "file": "0008-vllm-gdn-compile.patch",
+          "sha256": "e7d3528684275f28ef6a705dcc34da636d9ce316cd5a1b87e8916527552b548b"
+        }
+      ]
+    },
+    {
+      "name": "vllm-xpu-kernels",
+      "repository": "https://github.com/vllm-project/vllm-xpu-kernels.git",
+      "base_commit": "ddf336d86e3c8602888572a3502f951abd51df12",
+      "patched_tree": "1ce13e70894b11165f66a357d512517bf81c7bf6",
+      "patches": [
+        {
+          "file": "0002-kernels-qwen38.patch",
+          "sha256": "8c6ad12f4b81d636a242bc18c3ae4b1e02dc4765f8d0232cb00e99d5e64398f5"
+        },
+        {
+          "file": "0004-kernels-minicpmv47.patch",
+          "sha256": "665c3fd722eb05b339efefeb925e666d79b71fc4acf8bad35e233a1b6bb94043"
+        }
+      ]
+    }
+  ],
+  "patch_scope": "Runtime and build source only; tests, benchmarks, docs and CI changes excluded."
+}
