@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1.7
+# Context: vllm/, plus prepared vllm-source and kernels-source contexts.
+ARG XPU_BASE=vllm/vllm-openai-xpu@sha256:95ac815038c4b3537b173798bfe3b89bdf525a52bd653cd14d4deb01f1062be7
+FROM ${XPU_BASE} AS native-builder
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV SYCL_HOME=/opt/intel/oneapi/compiler/2026.1 \
+    CMPLR_ROOT=/opt/intel/oneapi/compiler/2026.1 \
+    UV_NATIVE_TLS=true \
+    CC=/opt/intel/oneapi/compiler/2026.1/bin/icx \
+    CXX=/opt/intel/oneapi/compiler/2026.1/bin/icpx \
+    PATH=/opt/intel/oneapi/compiler/2026.1/bin:/opt/venv/bin:${PATH}
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+WORKDIR /llm/
+RUN --mount=type=secret,id=corporate-ca \
+    if [ -f /run/secrets/corporate-ca ]; then \
+      cp /run/secrets/corporate-ca /usr/local/share/ca-certificates/corporate-ca.crt; \
+      update-ca-certificates; \
+    fi \
+    && curl -fsSL --retry 3 https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+      | gpg --dearmor -o /usr/share/keyrings/llmscaler-oneapi.gpg \
+    && printf '%s\n' 'deb [signed-by=/usr/share/keyrings/llmscaler-oneapi.gpg] https://apt.repos.intel.com/oneapi all main' \
+      > /etc/apt/sources.list.d/llmscaler-oneapi.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+      intel-oneapi-compiler-dpcpp-cpp-2026.1=2026.1.1-325 \
+    && rm -rf /var/lib/apt/lists/* \
+    && uv pip install --python /opt/venv/bin/python --no-deps \
+      'setuptools==79.0.1' 'setuptools-scm>=8' build pyproject-hooks ninja cmake psutil
+
+FROM native-builder AS wheels
+ARG MAX_JOBS=16
+COPY --from=kernels-source . /src/vllm-xpu-kernels/
+COPY --from=vllm-source . /src/vllm/
+COPY docker/v0.31.0/build_wheels.sh /opt/build_wheels.sh
+RUN --mount=type=tmpfs,target=/build \
+    MAX_JOBS=${MAX_JOBS} bash /opt/build_wheels.sh
+
+FROM scratch AS wheel-export
+COPY --from=wheels /opt/wheels/ /
+
+FROM ${XPU_BASE} AS runtime
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV UV_NATIVE_TLS=true \
+    VLLM_WORKER_MULTIPROC_METHOD=spawn
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+WORKDIR /llm/
+COPY --from=wheels /opt/wheels/ /opt/wheels/
+COPY docker/v0.31.0/llmscaler_transformers_compat.py docker/v0.31.0/llmscaler_transformers_compat.pth /opt/venv/lib/python3.12/site-packages/
+RUN --mount=type=secret,id=corporate-ca \
+    if [ -f /run/secrets/corporate-ca ]; then \
+      cp /run/secrets/corporate-ca /usr/local/share/ca-certificates/corporate-ca.crt; \
+      update-ca-certificates; \
+    fi \
+    && (cd /opt/wheels && sha256sum -c SHA256SUMS) \
+    && uv pip install --python /opt/venv/bin/python --no-deps \
+      'transformers==5.18.0' 'tokenizers==0.23.2' \
+      'huggingface-hub==1.31.0' 'safetensors==0.8.0' \
+    && uv pip install --python /opt/venv/bin/python --no-deps /opt/wheels/*.whl
+ENTRYPOINT ["vllm", "serve"]

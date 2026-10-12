@@ -12,7 +12,8 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    1.3 [Pulling and Running the vllm Docker Container](#13-pulling-and-running-the-vllm-docker-container)  
    1.4 [Launching the Serving Service](#14-launching-the-serving-service)  
    1.5 [Benchmarking the Service](#15-benchmarking-the-service)  
-   1.6 [(Optional) Monitoring the Service with Prometheus and Grafana](#16-optional-monitoring-the-service-with-prometheus-and-grafana)
+   1.6 [(Optional) Monitoring the Service with Prometheus and Grafana](#16-optional-monitoring-the-service-with-prometheus-and-grafana)<br>
+   1.7 [Build the v0.31.0 XPU Image](#17-build-the-v0310-xpu-image)
 2. [Advanced Features](#2-advanced-features)  
    2.1 [CCL Support (both P2P & USM)](#21-ccl-support-both-p2p--usm)  
    2.2 [INT4 and FP8 Quantized Online Serving](#22-int4-and-fp8-quantized-online-serving)  
@@ -315,6 +316,106 @@ vllm bench serve \
 ### 1.6 (Optional) Monitoring the Service with Prometheus and Grafana
 
 Refer to [here](monitor/README.md) for details.
+
+### 1.7 Build the v0.31.0 XPU Image
+
+This build adds Qwen3.8 and MiniCPM-V 4.7 support to vLLM v0.31.0. It is a
+separate build recipe; existing published llm-scaler image tags and the default
+Dockerfile are unchanged.
+
+| Component | Pinned input |
+| --- | --- |
+| vLLM | `v0.31.0`, commit `db9527a46873454610df6dbedf79a36d6bf1a7f6` |
+| vllm-xpu-kernels | Version `0.1.15.4` used by upstream `docker/Dockerfile.xpu`; source base `ddf336d86e3c8602888572a3502f951abd51df12` |
+| Runtime base | `vllm/vllm-openai-xpu@sha256:95ac815038c4b3537b173798bfe3b89bdf525a52bd653cd14d4deb01f1062be7` |
+| Native compiler | `intel-oneapi-compiler-dpcpp-cpp-2026.1=2026.1.1-325` |
+| Python runtime packages | Transformers `5.18.0`, tokenizers `0.23.2`, huggingface-hub `1.31.0`, safetensors `0.8.0` |
+
+The exact source commit that produced the upstream kernels wheel is not attested;
+the source base above is the downstream build input, not a claim of exact upstream
+wheel provenance. Source revisions, patch checksums and final Git tree hashes are
+recorded in [sources.json](patches/v0.31.0/sources.json).
+The patch series contains runtime/build changes only, excluding tests, benchmarks,
+docs and CI changes. No validation reports, model launchers, wheels or local
+certificates are committed.
+
+Run the following commands from the repository root. Docker Buildx/BuildKit,
+Git, Python 3.12 via `uv`, internet access, and sufficient RAM/disk are required.
+The native build uses a memory-backed `/build`; lower `MAX_JOBS` on smaller hosts.
+GPU access is not needed to build the image.
+
+#### Prepare the pinned, patched sources
+
+```bash
+uv venv --python 3.12 .venv-build-v031
+BUILD_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/llm-scaler-v031.XXXXXX")
+.venv-build-v031/bin/python vllm/docker/v0.31.0/prepare_sources.py \
+  --manifest vllm/patches/v0.31.0/sources.json \
+  --root "$BUILD_ROOT/sources"
+```
+
+The helper fetches exact commits, verifies each patch checksum, applies patches
+to the Git index, and checks the final tree hashes. It refuses to overwrite an
+existing checkout that does not match the recipe.
+
+#### Option A: Build from source directly to a runtime image
+
+```bash
+docker buildx build --load \
+  -f vllm/docker/Dockerfile.v031 \
+  --build-context vllm-source="$BUILD_ROOT/sources/vllm" \
+  --build-context kernels-source="$BUILD_ROOT/sources/vllm-xpu-kernels" \
+  --build-arg MAX_JOBS=16 \
+  -t intel/llm-scaler-vllm:0.31.0-local vllm
+```
+
+The `native-builder` stage adds the compiler and build tools. The `wheels` stage
+compiles the patched kernels and vLLM native extensions and packages both sources.
+Unmodified vLLM Rust artifacts are reused from the immutable release base rather
+than rebuilt. Kernel targets enable Xe2 and the default family, disable Xe3P, and
+enable `QWEN38_KERNELS_ENABLED`.
+
+The final `runtime` stage starts again from the immutable release base, without
+the builder's added compiler, patched source checkouts or build tools. It verifies wheel checksums
+and installs the custom wheels and pinned Python packages using `--no-deps` to
+preserve the base image's PyTorch XPU/runtime stack.
+
+#### Option B: Export wheels, then assemble runtime separately
+
+```bash
+docker buildx build \
+  -f vllm/docker/Dockerfile.v031 \
+  --build-context vllm-source="$BUILD_ROOT/sources/vllm" \
+  --build-context kernels-source="$BUILD_ROOT/sources/vllm-xpu-kernels" \
+  --build-arg MAX_JOBS=16 --target wheel-export \
+  --output "type=local,dest=$BUILD_ROOT/wheels" vllm
+
+docker buildx build --load \
+  -f vllm/docker/Dockerfile.v031.runtime \
+  --build-context wheels="$BUILD_ROOT/wheels" \
+  -t intel/llm-scaler-vllm:0.31.0-local vllm
+```
+
+The exported directory contains the two `.whl` files and `SHA256SUMS`.
+Keep it outside the repository; the runtime Dockerfile receives it through the
+named `wheels` context. Runtime assembly does not compile either project and is
+normally much faster than the native build. Use wheels built with this recipe
+and base image; an arbitrary pair of wheels is not interchangeable.
+
+Both image paths put wheels only in `/opt/wheels/`, use `/llm/` as the working
+directory, and set `ENTRYPOINT ["vllm", "serve"]` with multiprocessing `spawn`.
+The small Transformers compatibility module restores a removed video-processor
+docstring constant required by MiniCPM-V checkpoint remote code; it is not a
+launcher or a validation script. Start models directly with `vllm serve` (or pass
+model arguments to the image entrypoint), with your GPU and model mounts.
+
+For a proxy, add `--build-arg http_proxy --build-arg https_proxy --build-arg no_proxy`
+after exporting those variables. If its CA is needed, add
+`--secret id=corporate-ca,src=/path/to/corporate-ca.crt` to each build command.
+The CA is optional and supplied locally, not stored in this repository; when
+provided, it is installed into the image trust store. Source fetching on the
+host also requires working Git network/proxy/CA configuration. Changing the
+`XPU_BASE` argument requires rechecking ABI and runtime compatibility.
 
 ## 2. Advanced Features
 

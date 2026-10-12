@@ -1,0 +1,5 @@
+**
+!docker/
+!docker/v0.31.0/
+!docker/v0.31.0/llmscaler_transformers_compat.py
+!docker/v0.31.0/llmscaler_transformers_compat.pth
