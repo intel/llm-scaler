@@ -409,11 +409,13 @@ launcher or a validation script. Start models directly with `vllm serve` (or pas
 model arguments to the image entrypoint), with your GPU and model mounts.
 
 For a proxy, add `--build-arg http_proxy --build-arg https_proxy --build-arg no_proxy`
-after exporting those variables. If its CA is needed, add
-`--secret id=corporate-ca,src=/path/to/corporate-ca.crt` to each build command.
-The CA is optional and supplied locally, not stored in this repository; when
-provided, it is installed into the image trust store. Source fetching on the
-host also requires working Git network/proxy/CA configuration. Changing the
+after exporting those variables. The Dockerfiles retain explicit proxy ARGs;
+values supplied at build time can appear in image history. For public images,
+check the build history for internal endpoints before publishing.
+The images do not install corporate CA certificates. Use a network path trusted
+by the base image for package downloads; a TLS-inspecting proxy requiring a
+corporate CA will fail certificate verification. Source fetching on the host
+also requires working Git network/proxy/CA configuration. Changing the
 `XPU_BASE` argument requires rechecking ABI and runtime compatibility.
 
 ## 2. Advanced Features
