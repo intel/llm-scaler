@@ -11,12 +11,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 WORKDIR /llm/
 COPY --from=wheels . /opt/wheels/
 COPY docker/v0.31.0/llmscaler_transformers_compat.py docker/v0.31.0/llmscaler_transformers_compat.pth /opt/venv/lib/python3.12/site-packages/
-RUN --mount=type=secret,id=corporate-ca \
-    if [ -f /run/secrets/corporate-ca ]; then \
-      cp /run/secrets/corporate-ca /usr/local/share/ca-certificates/corporate-ca.crt; \
-      update-ca-certificates; \
-    fi \
-    && (cd /opt/wheels && sha256sum -c SHA256SUMS) \
+RUN (cd /opt/wheels && sha256sum -c SHA256SUMS) \
     && uv pip install --python /opt/venv/bin/python --no-deps \
       'transformers==5.18.0' 'tokenizers==0.23.2' \
       'huggingface-hub==1.31.0' 'safetensors==0.8.0' \

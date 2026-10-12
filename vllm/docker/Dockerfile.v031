@@ -13,12 +13,7 @@ ENV SYCL_HOME=/opt/intel/oneapi/compiler/2026.1 \
     PATH=/opt/intel/oneapi/compiler/2026.1/bin:/opt/venv/bin:${PATH}
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 WORKDIR /llm/
-RUN --mount=type=secret,id=corporate-ca \
-    if [ -f /run/secrets/corporate-ca ]; then \
-      cp /run/secrets/corporate-ca /usr/local/share/ca-certificates/corporate-ca.crt; \
-      update-ca-certificates; \
-    fi \
-    && curl -fsSL --retry 3 https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+RUN curl -fsSL --retry 3 https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
       | gpg --dearmor -o /usr/share/keyrings/llmscaler-oneapi.gpg \
     && printf '%s\n' 'deb [signed-by=/usr/share/keyrings/llmscaler-oneapi.gpg] https://apt.repos.intel.com/oneapi all main' \
       > /etc/apt/sources.list.d/llmscaler-oneapi.list \
@@ -50,12 +45,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 WORKDIR /llm/
 COPY --from=wheels /opt/wheels/ /opt/wheels/
 COPY docker/v0.31.0/llmscaler_transformers_compat.py docker/v0.31.0/llmscaler_transformers_compat.pth /opt/venv/lib/python3.12/site-packages/
-RUN --mount=type=secret,id=corporate-ca \
-    if [ -f /run/secrets/corporate-ca ]; then \
-      cp /run/secrets/corporate-ca /usr/local/share/ca-certificates/corporate-ca.crt; \
-      update-ca-certificates; \
-    fi \
-    && (cd /opt/wheels && sha256sum -c SHA256SUMS) \
+RUN (cd /opt/wheels && sha256sum -c SHA256SUMS) \
     && uv pip install --python /opt/venv/bin/python --no-deps \
       'transformers==5.18.0' 'tokenizers==0.23.2' \
       'huggingface-hub==1.31.0' 'safetensors==0.8.0' \
