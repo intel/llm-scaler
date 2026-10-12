@@ -43,6 +43,11 @@ The retained v0.31.0 wheel metadata still declares XGrammar `0.2.7`, so a
 distribution-wide `pip check` reports that metadata mismatch. The patched
 source requires `0.2.8`; `check_environment.py` checks that source contract.
 
+Some checkpoint bundles include an older video processor that imports
+`BASE_VIDEO_PROCESSOR_DOCSTRING`, which Transformers 5.17 removed. The runtime
+restores this documentation string when absent so those processors can load.
+It preserves an existing definition and does not change preprocessing.
+
 ## Patch sources
 
 The checksummed source manifest is
@@ -55,6 +60,7 @@ The checksummed source manifest is
 | `0003-kernels-bf16.patch` | PR #622 head; BF16 activation dispatch, accumulation, stores and wrappers. |
 | `0004-vllm-custom-allreduce.patch` | Opt-in TP2 custom all-reduce integration, preserving the current batch-invariant path and XCCL fallback. |
 | `0005-kernels-custom-allreduce.patch` | Native IPC collective, Python wrapper, graph-capture context and multiprocess tests. |
+| `0006-vllm-minicpmv47-mm-compat.patch` | Align MiniCPM image/video parameter lookup with the pinned main's `supported_mm_processor_kwargs` API, preserving shared settings and per-modality overrides. |
 
 Upstream contributions are
 [MiniCPM-V 4.7 PR #6](https://github.com/wyc55069407/vllm/pull/6),
@@ -112,6 +118,30 @@ sizes or dtypes, and unavailable IPC setup, keep XCCL. The default is XCCL.
 `serve_nonspec.py --dry-run` prints the command without starting inference. No
 speculative configuration is added, and no draft model is loaded. Generation
 length and EOS handling remain per-request settings.
+
+## Serve a dense 1B checkpoint on one XPU
+
+For a MiniCPM-V 4.7 1B checkpoint, use the vLLM CLI to enable image inputs and
+load BF16 weights without quantization:
+
+```bash
+docker run --rm --device /dev/dri --shm-size 8g --network host \
+  --mount type=bind,source=/dev/dri/by-path,target=/dev/dri/by-path,readonly \
+  --mount type=bind,source="${TARGET_MODEL_DIR}",target=/models/target,readonly \
+  --env ZE_AFFINITY_MASK="${XPU_AFFINITY}" \
+  "${IMAGE_ID}" vllm serve /models/target \
+  --served-model-name MiniCPM-V-4.7-1B --trust-remote-code \
+  --tensor-parallel-size 1 --dtype bfloat16 --enforce-eager \
+  --max-model-len 8192 --max-num-batched-tokens 4096 --max-num-seqs 1 \
+  --kv-cache-memory-bytes 1073741824 --no-enable-prefix-caching \
+  --limit-mm-per-prompt '{"image":1,"video":0}'
+```
+
+Select one XPU with `XPU_AFFINITY`. This configuration enables text and single
+image requests, uses eager execution, and does not load a draft model. Set
+`chat_template_kwargs={"enable_thinking": false}` in chat requests to disable
+thinking. The text-only accelerated launcher above keeps its FP8 and TP2
+defaults; this CLI example supplies the single-card BF16 settings explicitly.
 
 ## Serve K7
 

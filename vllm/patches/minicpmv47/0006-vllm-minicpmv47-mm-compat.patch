@@ -1,0 +1,109 @@
+diff --git a/tests/model_executor/test_minicpmv4_7.py b/tests/model_executor/test_minicpmv4_7.py
+index 9a3eccf4..c09bf32b 100644
+--- a/tests/model_executor/test_minicpmv4_7.py
++++ b/tests/model_executor/test_minicpmv4_7.py
+@@ -21,6 +21,49 @@ from vllm.model_executor.models.minicpmv4_7 import (
+ pytestmark = pytest.mark.skip_global_cleanup
+ 
+ 
++@pytest.mark.parametrize(
++    ("request_kwargs", "expected_image", "expected_video"),
++    [
++        ({}, ("16x", 1), ("4x", 9)),
++        ({"downsample_mode": "4x", "max_slice_nums": 3}, ("4x", 3), ("4x", 3)),
++        ({"images_kwargs": {"max_slice_nums": 2}}, ("16x", 2), ("4x", 9)),
++    ],
++)
++def test_vision_kwargs_use_current_context_api(
++    request_kwargs, expected_image, expected_video
++):
++    """Image overrides must preserve shared video settings on pinned main."""
++    from types import SimpleNamespace
++
++    from vllm.config.multimodal import MultiModalConfig
++    from vllm.multimodal.processing.context import InputProcessingContext
++
++    config = MultiModalConfig(
++        mm_processor_kwargs={
++            "downsample_mode": "4x",
++            "max_slice_nums": 9,
++            "images_kwargs": {"downsample_mode": "16x", "max_slice_nums": 1},
++        }
++    )
++    ctx = InputProcessingContext(
++        model_config=SimpleNamespace(get_multimodal_config=lambda: config),
++        tokenizer=None,
++    )
++    info = MiniCPMV4_7ProcessingInfo(ctx)
++    processor = MiniCPMV4_7MultiModalProcessor.__new__(MiniCPMV4_7MultiModalProcessor)
++    processor.info = info
++
++    for modality, expected in (("image", expected_image), ("video", expected_video)):
++        assert (
++            processor._resolve_downsample_mode(request_kwargs, modality) == expected[0]
++        )
++        assert (
++            processor._resolve_max_slice_nums(request_kwargs, modality) == expected[1]
++        )
++    assert info._configured_max_slice_nums() == 1
++    assert info._mm_max_slice_nums(**request_kwargs) == expected_image[1]
++
++
+ def test_4_7_is_separate_from_4_6():
+     assert MiniCPMV4_7ForConditionalGeneration is not (
+         MiniCPMV4_6ForConditionalGeneration
+diff --git a/vllm/model_executor/models/minicpmv4_6.py b/vllm/model_executor/models/minicpmv4_6.py
+index c9712f10..01784271 100644
+--- a/vllm/model_executor/models/minicpmv4_6.py
++++ b/vllm/model_executor/models/minicpmv4_6.py
+@@ -191,7 +191,7 @@ class MiniCPMV4_6MultiModalProcessor(MiniCPMVMultiModalProcessor):
+         # MiniCPMV4_6Processor.
+         info = self.info
+         assert isinstance(info, MiniCPMV4_6ProcessingInfo)
+-        merged = info.ctx.get_merged_mm_kwargs(mm_kwargs, modality=modality)
++        merged = info._get_vision_mm_kwargs(mm_kwargs, modality)
+         downsample_mode = merged.get("downsample_mode")
+         if downsample_mode is not None:
+             return str(downsample_mode)
+@@ -211,7 +211,7 @@ class MiniCPMV4_6MultiModalProcessor(MiniCPMVMultiModalProcessor):
+         # values.
+         info = self.info
+         assert isinstance(info, MiniCPMV4_6ProcessingInfo)
+-        merged = info.ctx.get_merged_mm_kwargs(mm_kwargs, modality=modality)
++        merged = info._get_vision_mm_kwargs(mm_kwargs, modality)
+         max_slice = merged.get("max_slice_nums")
+         if max_slice is None:
+             return None
+@@ -626,6 +626,19 @@ class MiniCPMV4_6ProcessingInfo(MiniCPMVProcessingInfo):
+     image_pattern = "<|image_pad|>"
+     video_pattern = "<|video_pad|>"
+ 
++    def _get_vision_mm_kwargs(
++        self, kwargs: Mapping[str, object], modality: str
++    ) -> Mapping[str, object]:
++        supported = {"downsample_mode", "max_slice_nums"}
++        merged = self.ctx.get_merged_mm_kwargs(
++            kwargs,
++            supported_mm_processor_kwargs={
++                "images_kwargs": supported,
++                "videos_kwargs": supported,
++            },
++        )
++        return merged.get(f"{modality}s_kwargs", {})
++
+     def get_hf_config(self):
+         return self.ctx.get_hf_config()
+ 
+diff --git a/vllm/model_executor/models/minicpmv4_7.py b/vllm/model_executor/models/minicpmv4_7.py
+index 85c02626..e51124bc 100644
+--- a/vllm/model_executor/models/minicpmv4_7.py
++++ b/vllm/model_executor/models/minicpmv4_7.py
+@@ -27,7 +27,7 @@ logger = init_logger(__name__)
+ 
+ class MiniCPMV4_7ProcessingInfo(MiniCPMV4_6ProcessingInfo):
+     def _mm_max_slice_nums(self, **kwargs: object) -> int | None:
+-        merged = self.ctx.get_merged_mm_kwargs(kwargs, modality="image")
++        merged = self._get_vision_mm_kwargs(kwargs, "image")
+         max_slice = merged.get("max_slice_nums")
+         if max_slice is None:
+             return None

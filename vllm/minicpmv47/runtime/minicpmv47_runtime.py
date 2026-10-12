@@ -15,6 +15,9 @@ def install() -> None:
     global _installed
     if _installed:
         return
+    from hf_processor_compat import install as install_hf_processor_compat
+
+    install_hf_processor_compat()
     root = Path(os.environ.get("MINICPMV47_ROOT", "/opt/minicpmv47"))
     import vllm
 
