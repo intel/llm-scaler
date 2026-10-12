@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1.7
+# Context: vllm/, plus wheels containing the two custom wheels and SHA256SUMS.
+ARG XPU_BASE=vllm/vllm-openai-xpu@sha256:95ac815038c4b3537b173798bfe3b89bdf525a52bd653cd14d4deb01f1062be7
+FROM ${XPU_BASE} AS runtime
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV UV_NATIVE_TLS=true \
+    VLLM_WORKER_MULTIPROC_METHOD=spawn
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+WORKDIR /llm/
+COPY --from=wheels . /opt/wheels/
+COPY docker/v0.31.0/llmscaler_transformers_compat.py docker/v0.31.0/llmscaler_transformers_compat.pth /opt/venv/lib/python3.12/site-packages/
+RUN --mount=type=secret,id=corporate-ca \
+    if [ -f /run/secrets/corporate-ca ]; then \
+      cp /run/secrets/corporate-ca /usr/local/share/ca-certificates/corporate-ca.crt; \
+      update-ca-certificates; \
+    fi \
+    && (cd /opt/wheels && sha256sum -c SHA256SUMS) \
+    && uv pip install --python /opt/venv/bin/python --no-deps \
+      'transformers==5.18.0' 'tokenizers==0.23.2' \
+      'huggingface-hub==1.31.0' 'safetensors==0.8.0' \
+    && uv pip install --python /opt/venv/bin/python --no-deps /opt/wheels/*.whl
+ENTRYPOINT ["vllm", "serve"]
