@@ -2905,7 +2905,7 @@ index 7d5ff8d..7993dd4 100644
 +        return
 +    logger.info(
 +        "Enable L1 4bit quant, hybrid attention quant: %s",
-+        _env_flag(_ENV_KVWEAVE_LINEAR_QUANT_ENABLED, default=True),
++        _env_flag(_ENV_KVWEAVE_LINEAR_QUANT_ENABLED, default=False),
 +    )
 +
  
@@ -3765,7 +3765,7 @@ index 1d90fc5..d14c452 100644
 +    def __init__(
 +        self,
 +        *,
-+        enable_l1_kvweave_quant: bool = True,
++        enable_l1_kvweave_quant: bool = False,
 +        kvweave_num_kv_heads: int = 4,
 +        kvweave_head_dim: int = 256,
 +        kvweave_num_kv_heads_explicit: bool = False,
@@ -3775,9 +3775,9 @@ index 1d90fc5..d14c452 100644
 +        kvweave_scaling_method: str = "per_channel",
 +        kvweave_attention_quant_enabled: bool = True,
 +        kvweave_attention_qbits: int = 4,
-+        kvweave_linear_quant_enabled: bool = True,
-+        kvweave_conv_quant_enabled: bool = True,
-+        kvweave_ssm_quant_enabled: bool = True,
++        kvweave_linear_quant_enabled: bool = False,
++        kvweave_conv_quant_enabled: bool = False,
++        kvweave_ssm_quant_enabled: bool = False,
 +        kvweave_linear_rh: bool = False,
 +        kvweave_linear_asym: bool = True,
 +        kvweave_linear_precond: bool = False,
@@ -4739,7 +4739,7 @@ index 1d90fc5..d14c452 100644
 +            "enable_l1_kvweave_quant",
 +            kwargs.get(
 +                "l1_kvweave_quant",
-+                _parse_env_flag(ENV_MP_L1_KVWEAVE_QUANT, default=True),
++                _parse_env_flag(ENV_MP_L1_KVWEAVE_QUANT, default=False),
 +            ),
 +        )
 +    )
@@ -4790,19 +4790,19 @@ index 1d90fc5..d14c452 100644
 +    kvweave_linear_quant_enabled = _parse_flag_value(
 +        kwargs.get(
 +            "kvweave_linear_quant_enabled",
-+            _parse_env_flag(ENV_MP_KVWEAVE_LINEAR_QUANT_ENABLED, default=True),
++            _parse_env_flag(ENV_MP_KVWEAVE_LINEAR_QUANT_ENABLED, default=False),
 +        )
 +    )
 +    kvweave_conv_quant_enabled = _parse_flag_value(
 +        kwargs.get(
 +            "kvweave_conv_quant_enabled",
-+            _parse_env_flag(ENV_MP_KVWEAVE_CONV_QUANT_ENABLED, default=True),
++            _parse_env_flag(ENV_MP_KVWEAVE_CONV_QUANT_ENABLED, default=False),
 +        )
 +    )
 +    kvweave_ssm_quant_enabled = _parse_flag_value(
 +        kwargs.get(
 +            "kvweave_ssm_quant_enabled",
-+            _parse_env_flag(ENV_MP_KVWEAVE_SSM_QUANT_ENABLED, default=True),
++            _parse_env_flag(ENV_MP_KVWEAVE_SSM_QUANT_ENABLED, default=False),
 +        )
 +    )
 +    kvweave_linear_rh = _parse_flag_value(
@@ -5801,7 +5801,7 @@ new file mode 100644
 index 0000000..b348b28
 --- /dev/null
 +++ b/tests/v1/multiprocess/test_worker_transfer.py
-@@ -0,0 +1,324 @@
+@@ -0,0 +1,326 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# Standard
 +from unittest.mock import MagicMock, patch
@@ -5983,7 +5983,7 @@ index 0000000..b348b28
 +    assert ctx._is_serialized_size_acceptable(100, 99, attention_group)
 +
 +
-+def test_should_attempt_group_quant_defaults_preserve_legacy_behavior():
++def test_should_attempt_group_quant_defaults_preserve_raw_hybrid_states():
 +    linear_group = EngineGroupInfo(
 +        engine_group_id=0,
 +        layer_indices=(0,),
@@ -5998,7 +5998,7 @@ index 0000000..b348b28
 +    )
 +
 +    context = DataTransferContext()
-+    assert context._should_attempt_group_quant(linear_group)
++    assert not context._should_attempt_group_quant(linear_group)
 +    assert context._should_attempt_group_quant(attention_group)
 +    assert context._should_attempt_group_quant(None)
 +
@@ -6069,6 +6069,7 @@ index 0000000..b348b28
 +def test_kvweave_codec_uses_registered_tp_local_attention_geometry():
 +    """A preceding Mamba group must not hide the local attention shard shape."""
 +    context = DataTransferContext(
++        enable_l1_kvweave_quant=True,
 +        kvweave_num_kv_heads=4,
 +        kvweave_head_dim=256,
 +    )
@@ -6105,6 +6106,7 @@ index 0000000..b348b28
 +
 +def test_kvweave_codec_rejects_inconsistent_explicit_tp_geometry():
 +    context = DataTransferContext(
++        enable_l1_kvweave_quant=True,
 +        kvweave_num_kv_heads=4,
 +        kvweave_num_kv_heads_explicit=True,
 +        kvweave_head_dim=256,
@@ -6292,3 +6294,46 @@ index 021a72c..cef4142 100644
  
  
  def test_conversion_splits_by_lmcache_layer_identity():
+diff --git a/tests/v1/multiprocess/test_kvweave_safe_defaults.py b/tests/v1/multiprocess/test_kvweave_safe_defaults.py
+new file mode 100644
+--- /dev/null
++++ b/tests/v1/multiprocess/test_kvweave_safe_defaults.py
+@@ -0,0 +1,38 @@
++# SPDX-License-Identifier: Apache-2.0
++import os
++import pytest
++import torch
++
++from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
++    DataTransferContext,
++    create_transfer_context,
++)
++
++
++@pytest.mark.parametrize("factory", [DataTransferContext, lambda: create_transfer_context(
++    {"layer0": torch.empty(1)}, mode="data"
++)])
++def test_quantization_is_opt_in(factory, monkeypatch):
++    for name in tuple(os.environ):
++        if name.startswith("LMCACHE_MP_KVWEAVE_") or name == "LMCACHE_MP_L1_KVWEAVE_QUANT":
++            monkeypatch.delenv(name)
++    ctx = factory()
++    assert not ctx._enable_l1_kvweave_quant
++    assert not ctx._kvweave_linear_quant_enabled
++    assert not ctx._kvweave_conv_quant_enabled
++    assert not ctx._kvweave_ssm_quant_enabled
++
++
++def test_attention8_opt_in_keeps_hybrid_states_raw(monkeypatch):
++    for name in tuple(os.environ):
++        if name.startswith("LMCACHE_MP_KVWEAVE_") or name == "LMCACHE_MP_L1_KVWEAVE_QUANT":
++            monkeypatch.delenv(name)
++    monkeypatch.setenv("LMCACHE_MP_L1_KVWEAVE_QUANT", "1")
++    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_ATTENTION_QBITS", "8")
++    ctx = create_transfer_context({"layer0": torch.empty(1)}, mode="data")
++    assert ctx._enable_l1_kvweave_quant
++    assert ctx._kvweave_attention_quant_enabled
++    assert ctx._kvweave_attention_qbits == 8
++    assert not ctx._kvweave_linear_quant_enabled
++    assert not ctx._kvweave_conv_quant_enabled
++    assert not ctx._kvweave_ssm_quant_enabled

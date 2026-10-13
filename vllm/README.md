@@ -34,6 +34,7 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    3.7 [How to Run Muse Glimmer 30B](#37-how-to-run-muse-glimmer-30b)<br>
    3.8 [DFlash Enable](#38-dflash-enable)<br>
    3.9 [Rust Frontend](#39-rust-frontend)<br>
+   3.10 [Qwen3.8-27B + LMCache](#310-qwen38-27b--lmcache)<br>
 4. [Troubleshooting](#4-troubleshooting)
 5. [Performance tuning](#5-performance-tuning)
 
@@ -1533,6 +1534,147 @@ The packaged frontend binary is discovered automatically. Do not set
 validation, run the same request set once without
 `VLLM_USE_RUST_FRONTEND` and once with `VLLM_USE_RUST_FRONTEND=1`, keeping all
 other parameters unchanged.
+
+### 3.10 Qwen3.8-27B + LMCache
+
+LMCache's multiprocess connector stores and restores the model's Attention,
+Conv and SSM caches using host-memory L1 and optional filesystem L2. Cache
+quantization is **disabled by default**. Enabling KVWeave quantization only
+compresses Attention by default; linear/Conv/SSM quantization remains opt-in.
+For this hybrid model, use Attention8 with Conv/SSM kept in their original
+format. FP8 **weight** quantization is independent of cache quantization.
+
+The following text-inference configuration was validated on two Intel XPU
+devices: TP2, FP16 dtype, online FP8 weights, 1024-token cache chunks and
+`mamba-cache-mode=align`. Multimodal cache recovery and MTP are not covered.
+Use local Qwen3.8-27B weights; the validated checkpoint declares the
+`Qwen3_5ForConditionalGeneration` architecture. Do not substitute a different
+architecture solely based on the model directory name.
+
+#### Build and start a container
+
+Build this checkout's image; an older released image may not include the
+LMCache integration or these safe defaults. Run the build from `vllm/`:
+
+```bash
+cd vllm
+DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile \
+  -t llm-scaler-vllm:lmcache .
+
+docker run -it --name qwen38-lmcache --network host \
+  --device /dev/dri \
+  -v /dev/dri/by-path:/dev/dri/by-path:ro \
+  --shm-size 40g \
+  -e ZE_AFFINITY_MASK=0,1 \
+  -v /path/to/Qwen3.8-27B:/llm/models/Qwen3.8-27B:ro \
+  --entrypoint bash llm-scaler-vllm:lmcache
+```
+
+Replace the model path and GPU mask with your local weights and **free**
+devices. The `/dev/dri/by-path` mount is required for oneCCL topology discovery.
+Allow at least 28 GiB of available host RAM for L1, in addition to model-loading
+and serving memory. All commands below run inside this same container.
+
+#### Start LMCache and vLLM
+
+```bash
+source /opt/intel/oneapi/setvars.sh --force
+source /opt/intel/oneapi/ccl/2021.15/env/vars.sh --force
+export CCL_ZE_IPC_EXCHANGE=pidfd
+export FI_PROVIDER=tcp
+export FI_TCP_IFACE=lo
+export LMCACHE_MP_TRANSFER_MODE=data
+unset LMCACHE_USE_UPSTREAM_MP
+
+# Start with lossless L1 cache reuse. These also override inherited settings.
+export LMCACHE_MP_L1_KVWEAVE_QUANT=0
+export LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED=0
+export LMCACHE_MP_KVWEAVE_CONV_QUANT_ENABLED=0
+export LMCACHE_MP_KVWEAVE_SSM_QUANT_ENABLED=0
+
+python -m lmcache.v1.multiprocess.http_server \
+  --host 127.0.0.1 --port 55577 \
+  --http-host 127.0.0.1 --http-port 18078 \
+  --chunk-size 1024 --l1-size-gb 28 --no-l1-use-lazy \
+  --eviction-policy LRU --eviction-trigger-watermark 0.8 --eviction-ratio 0.05 \
+  --supported-transfer-mode non_gpu \
+  --max-gpu-workers 2 --max-cpu-workers 2 \
+  > /tmp/lmcache.log 2>&1 &
+LMCACHE_PID=$!
+
+# Wait for LMCache before starting the serving process.
+for attempt in $(seq 1 120); do
+  curl -fsS http://127.0.0.1:18078/healthcheck && break
+  sleep 1
+done
+curl -fsS http://127.0.0.1:18078/healthcheck || exit 1
+
+vllm serve /llm/models/Qwen3.8-27B \
+  --served-model-name Qwen3.8-27B --host 127.0.0.1 --port 8000 \
+  --dtype float16 --quantization fp8 --tensor-parallel-size 2 \
+  --block-size 1024 --max-num-batched-tokens 1024 \
+  --max-model-len 18432 --max-num-seqs 4 --gpu-memory-utilization 0.85 \
+  --enable-prefix-caching --enforce-eager --trust-remote-code \
+  --mamba-cache-mode align \
+  --kv-transfer-config '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"tcp://127.0.0.1","lmcache.mp.port":55577,"lmcache.mp.mq_timeout":30.0,"lmcache.mp.heartbeat_interval":5.0}}'
+
+# After stopping vLLM, stop the background cache process.
+kill "$LMCACHE_PID"
+```
+
+Keep the vLLM block size, LMCache chunk size and max batched tokens at 1024
+for this validated profile. `pidfd` may fall back to `drmfd` on supported
+systems; that warning alone does not indicate a serving failure.
+
+#### Optional: Attention8 cache compression
+
+Before starting **both** LMCache and vLLM, replace the lossless settings with:
+
+```bash
+export LMCACHE_MP_L1_KVWEAVE_QUANT=1
+export LMCACHE_MP_KVWEAVE_ATTENTION_QUANT_ENABLED=1
+export LMCACHE_MP_KVWEAVE_ATTENTION_QBITS=8
+export LMCACHE_MP_KVWEAVE_PRECOND=1
+export LMCACHE_MP_KVWEAVE_SCALING_METHOD=per_channel
+export LMCACHE_MP_KVWEAVE_NUM_THREADS=8
+export LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED=0
+export LMCACHE_MP_KVWEAVE_CONV_QUANT_ENABLED=0
+export LMCACHE_MP_KVWEAVE_SSM_QUANT_ENABLED=0
+```
+
+Restart both processes after changing settings. Do not re-export the lossless
+`LMCACHE_MP_L1_KVWEAVE_QUANT=0` setting when using this profile. Attention8
+reduced the validated Attention group's storage by approximately 49%; this
+does **not** mean the whole hybrid cache is halved, since Mamba groups remain
+raw. Conv/SSM quantization is experimental for this model; enabling it can
+trigger `rh requires a power-of-2 transform length, got 3072`.
+
+#### Optional: filesystem L2 and verifying recovery
+
+Mount a writable host directory into the container, for example
+`-v /path/to/lmcache-data:/cache`, and add this option to the LMCache command:
+
+```text
+--l2-adapter '{"type":"fs","base_path":"/cache"}'
+```
+
+Use a new cache directory for independent tests. L2 stores asynchronously and
+reloads objects after L1 eviction. A validated pressure-test profile uses
+`--l1-size-gb 6`; the 28 GiB profile above is intended for normal L1 reuse.
+
+Send repeated text-completion requests with a prefix longer than 1024 tokens.
+Inspect `http://127.0.0.1:8000/metrics` for
+`vllm:external_prefix_cache_hits_total`, and LMCache's
+`http://127.0.0.1:18078/metrics` for `lmcache_mp_l1_evicted_chunks_total`,
+`lmcache_mp_l2_prefetch_hit_chunks_total` and
+`lmcache_mp_l2_prefetch_load_completed_chunks_total`. Local vLLM prefix reuse
+alone does not prove LMCache recovery; L2 verification additionally requires
+eviction and completed disk loads, with a matching restored output.
+
+For isolated validation only, starting vLLM with `VLLM_SERVER_DEV_MODE=1`
+enables `POST /reset_prefix_cache?reset_external=false` to clear its local
+prefix cache while retaining LMCache. Do not enable development endpoints on
+a production or publicly accessible server.
 
 ## 4. Troubleshooting
 

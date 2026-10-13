@@ -49,6 +49,9 @@ LLM Scaler is an GenAI solution for text generation, image generation, video gen
 
 Please follow the instructions in the [Getting Started](vllm/README.md/#1-getting-started-and-usage) to use `llm-scaler-vllm`. 
 
+For Qwen3.8-27B with host-memory cache reuse, optional Attention8 cache
+compression and filesystem offload, see [Qwen3.8-27B + LMCache](vllm/README.md#310-qwen38-27b--lmcache).
+
 ### Supported Models
 
 
