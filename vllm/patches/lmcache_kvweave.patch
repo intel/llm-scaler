@@ -786,13 +786,54 @@ index 6314537..3d19d76 100644
          self,
          kv_caches: dict[str, torch.Tensor],
 diff --git a/lmcache/v1/distributed/l1_manager.py b/lmcache/v1/distributed/l1_manager.py
-index 64ae54c..ad445fa 100644
+index 64ae54c..d70ebb6 100644
 --- a/lmcache/v1/distributed/l1_manager.py
 +++ b/lmcache/v1/distributed/l1_manager.py
-@@ -815,6 +815,10 @@ class L1Manager:
+@@ -658,6 +658,40 @@ class L1Manager:
+         )
+         return ret
+
++    @l1_mgr_synchronized
++    def abort_write(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
++        """Discard owned write reservations atomically, without write-finished events.
++
++        Only the owner of a write reservation may call this method. Unlike
++        finish_write followed by delete, removal never exposes incomplete data
++        to readers or write-finished listeners (including L2 writeback).
++        """
++        need_to_free: list[MemoryObj] = []
++        ret: dict[ObjectKey, L1Error] = {}
++        successful_keys: list[ObjectKey] = []
++        for key in keys:
++            entry = self._objects.get(key)
++            if entry is None:
++                ret[key] = L1Error.KEY_NOT_EXIST
++                continue
++            if entry.read_lock.is_locked():
++                ret[key] = L1Error.KEY_IS_LOCKED
++                continue
++            need_to_free.append(entry.memory_obj)
++            del self._objects[key]
++            ret[key] = L1Error.SUCCESS
++            successful_keys.append(key)
++        self._memory_manager.free(need_to_free)
++        for listener in self._registered_listeners:
++            listener.on_l1_keys_deleted_by_manager(successful_keys)
++        self._event_bus.publish(
++            Event(
++                event_type=EventType.L1_KEYS_EVICTED,
++                metadata={"keys": successful_keys},
++            )
++        )
++        return ret
++
+     @l1_mgr_synchronized
+     def delete(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
+         """Delete the given keys from L1 cache.
+@@ -815,6 +849,10 @@ class L1Manager:
          """Return an L1MemoryDesc describing the underlying L1 memory buffer."""
          return self._memory_manager.get_l1_memory_desc()
- 
+
 +    def is_variable_size(self) -> bool:
 +        """Return whether the active L1 memory tier supports variable-size chunks."""
 +        return self._memory_manager.is_variable_size()
@@ -1737,7 +1778,7 @@ index 8b9a922..a1151d1 100644
          # Step 4: filter to successfully reserved keys
          reserved_key_set: set[ObjectKey] = set()
 diff --git a/lmcache/v1/distributed/storage_manager.py b/lmcache/v1/distributed/storage_manager.py
-index 44873cf..314d926 100644
+index 44873cf..7230e73 100644
 --- a/lmcache/v1/distributed/storage_manager.py
 +++ b/lmcache/v1/distributed/storage_manager.py
 @@ -6,6 +6,7 @@ Distributed multi-tier storage manager for MP mode
@@ -1746,23 +1787,29 @@ index 44873cf..314d926 100644
  from typing import Iterator, Literal, Optional
 +import os
  import time
- 
+
  # First Party
-@@ -57,6 +58,13 @@ from lmcache.v1.platform import HAS_EVENTFD
- 
+@@ -57,6 +58,19 @@ from lmcache.v1.platform import HAS_EVENTFD
+
  logger = init_logger(__name__)
- 
+
 +_ENV_L1_KVWEAVE_QUANT = "LMCACHE_MP_L1_KVWEAVE_QUANT"
 +
 +
 +def _env_flag(name: str) -> bool:
 +    raw = os.environ.get(name)
-+    return raw is not None and str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
++    return raw is not None and str(raw).strip().lower() in {
++        "1",
++        "true",
++        "yes",
++        "y",
++        "on",
++    }
 +
- 
+
  class StorageManager:
      def __init__(self, config: StorageManagerConfig):
-@@ -75,10 +83,22 @@ class StorageManager:
+@@ -75,10 +89,23 @@ class StorageManager:
          # ``SerdeL2AdapterWrapper`` so controllers see a plain L2 adapter
          # and serde is transparent.
          l1_memory_desc = self._l1_manager.get_l1_memory_desc()
@@ -1779,17 +1826,18 @@ index 44873cf..314d926 100644
 +                        "wrapper so compressed L1 bytes are stored verbatim."
 +                    )
 +                logger.warning(
-+                    "L1 KVWeave quantization is enabled; bypassing L2 serde wrapper for adapter %s",
++                    "L1 KVWeave quantization is enabled; bypassing L2 serde "
++                    "wrapper for adapter %s",
 +                    type(adapter).__name__,
 +                )
 +            if ac.serde_config is not None and not self._l1_kvweave_quant_enabled:
                  adapter = SerdeL2AdapterWrapper(
                      inner=adapter,
                      serde=create_serde_processor(ac.serde_config),
-@@ -168,6 +188,10 @@ class StorageManager:
+@@ -168,6 +195,10 @@ class StorageManager:
              self.get_l2_usages,
          )
- 
+
 +    def is_l1_variable_size(self) -> bool:
 +        """Return whether the L1 tier supports variable-size allocations."""
 +        return self._l1_manager.is_variable_size()
@@ -1797,6 +1845,21 @@ index 44873cf..314d926 100644
      # External APIs for serving engine integration code to call
      @enable_tracing()
      def reserve_write(
+@@ -252,6 +283,14 @@ class StorageManager:
+
+         # TODO: global key states update
+
++    def abort_write(self, keys: list[ObjectKey]) -> bool:
++        """Discard owned, unfinished L1 writes without publishing them."""
++        results = self._l1_manager.abort_write(keys)
++        return all(
++            error in (L1Error.SUCCESS, L1Error.KEY_NOT_EXIST)
++            for error in results.values()
++        )
++
+     @contextmanager
+     def read_prefetched_results(
+         self,
 diff --git a/lmcache/v1/gpu_connector/utils.py b/lmcache/v1/gpu_connector/utils.py
 index a272993..667e575 100644
 --- a/lmcache/v1/gpu_connector/utils.py
@@ -2496,7 +2559,7 @@ index 8172ad0..11cc62b 100644
          # TODO(chunxiaozheng): when l2 is enabled, the prefetched keys from l2 are temp
          #  and will be deleted after finish_read_prefetched, when we touch all keys,
 diff --git a/lmcache/v1/multiprocess/modules/non_gpu_transfer.py b/lmcache/v1/multiprocess/modules/non_gpu_transfer.py
-index 5e17911..4b5663c 100644
+index 5e17911..3756542 100644
 --- a/lmcache/v1/multiprocess/modules/non_gpu_transfer.py
 +++ b/lmcache/v1/multiprocess/modules/non_gpu_transfer.py
 @@ -19,8 +19,11 @@ from lmcache.v1.distributed.api import (
@@ -2513,24 +2576,38 @@ index 5e17911..4b5663c 100644
      ThreadPoolType,
 @@ -53,8 +56,10 @@ class NonGPUContextEntry:
      """
- 
+
      metadata: NonGpuContextMetadata
 +    metadata_by_group: list[NonGpuContextMetadata]
      model_name: str
      world_size: int
 +    engine_group_infos: list[EngineGroupInfo]
- 
- 
+
+
  class NonGPUTransferModule:
-@@ -161,10 +166,40 @@ class NonGPUTransferModule:
+@@ -114,6 +119,11 @@ class NonGPUTransferModule:
+                 self.commit_store,
+                 ThreadPoolType.AFFINITY,
+             ),
++            HandlerSpec(
++                RequestType.ABORT_STORE,
++                self.abort_store,
++                ThreadPoolType.AFFINITY,
++            ),
+             HandlerSpec(
+                 RequestType.PREPARE_RETRIEVE,
+                 self.prepare_retrieve,
+@@ -161,10 +171,42 @@ class NonGPUTransferModule:
      ) -> tuple[int, IPCCacheEngineKey]:
          return (instance_id, key)
- 
+
 -    def _resolve_single_group_obj_keys(self, key: IPCCacheEngineKey) -> list[ObjectKey]:
 -        """Resolve object keys for the single object group used by
 -        non-GPU transfers."""
 -        return self._ctx.resolve_obj_keys(key, [0])[0]
-+    def _resolve_obj_keys(self, key: IPCCacheEngineKey, instance_id: int) -> list[ObjectKey]:
++    def _resolve_obj_keys(
++        self, key: IPCCacheEngineKey, instance_id: int
++    ) -> list[ObjectKey]:
 +        """Resolve object keys for every registered non-GPU object group."""
 +        entry = self._non_gpu_contexts.get(instance_id)
 +        object_group_ids = (
@@ -2564,13 +2641,13 @@ index 5e17911..4b5663c 100644
 +            block_size=block_size,
 +            use_mla=use_mla,
 +        )
- 
+
      def register_kv_cache_non_gpu_context(
          self,
-@@ -199,25 +234,70 @@ class NonGPUTransferModule:
+@@ -199,25 +241,71 @@ class NonGPUTransferModule:
                  "'bfloat16' for torch.bfloat16, 'float32' for torch.float32)."
              )
- 
+
 -        shape = (
 -            torch.Size(
 -                [payload.num_layers, self._ctx.chunk_size, payload.hidden_dim_size]
@@ -2611,7 +2688,8 @@ index 5e17911..4b5663c 100644
 +            for idx, encoded_layout_desc in enumerate(provided_layout_descs):
 +                if not isinstance(encoded_layout_desc, SerializedMemoryLayoutDesc):
 +                    raise ValueError(
-+                        "group_layout_descs must contain SerializedMemoryLayoutDesc entries"
++                        "group_layout_descs must contain "
++                        "SerializedMemoryLayoutDesc entries"
 +                    )
 +                layout_desc = deserialize_memory_layout_desc(encoded_layout_desc)
 +                if payload.engine_group_infos:
@@ -2649,10 +2727,10 @@ index 5e17911..4b5663c 100644
          )
          strategy: TransferStrategy = create_transfer_strategy(
              self._ctx.storage_manager,
-@@ -237,8 +317,27 @@ class NonGPUTransferModule:
+@@ -237,8 +325,27 @@ class NonGPUTransferModule:
              payload.world_size,
          )
- 
+
 +        # Always register per-group layouts (metadata_by_group), never the
 +        # single unquantized metadata.layout_desc: hybrid models (e.g.
 +        # Mamba + attention) have object groups with genuinely different
@@ -2677,8 +2755,17 @@ index 5e17911..4b5663c 100644
 +            num_object_groups=max(1, len(payload.engine_group_infos)),
          )
          return RegisterNonGpuContextResponse(shm_name=shm_name, pool_size=pool_size)
- 
-@@ -314,8 +413,8 @@ class NonGPUTransferModule:
+
+@@ -278,7 +385,7 @@ class NonGPUTransferModule:
+
+         for obj_keys in write_obj_keys:
+             if obj_keys:
+-                self._ctx.storage_manager.finish_write(obj_keys)
++                self._ctx.storage_manager.abort_write(obj_keys)
+         for obj_keys in read_obj_keys:
+             if obj_keys:
+                 self._ctx.storage_manager.finish_read_prefetched(obj_keys)
+@@ -314,13 +421,22 @@ class NonGPUTransferModule:
          response = strategy.prepare_store(
              key=key,
              instance_id=instance_id,
@@ -2689,7 +2776,21 @@ index 5e17911..4b5663c 100644
          )
          session = self._ctx.session_manager.get_or_create(key.request_id)
          session.extras["store_start_time"] = time.perf_counter()
-@@ -358,12 +457,12 @@ class NonGPUTransferModule:
+         return response
+
++    def abort_store(self, key: IPCCacheEngineKey, instance_id: int) -> bool:
++        """Rollback a prepared store; never publish unfinished SHM data."""
++        strategy = self._strategies.get(instance_id)
++        if strategy is None:
++            return True
++        session = self._ctx.session_manager.get_or_create(key.request_id)
++        session.extras.pop("store_start_time", None)
++        return strategy.abort_store(key, instance_id)
++
+     @_lmcache_nvtx_annotate
+     def commit_store(
+         self,
+@@ -358,12 +474,12 @@ class NonGPUTransferModule:
              key=key,
              instance_id=instance_id,
              cpu_data=cpu_data,
@@ -2705,7 +2806,7 @@ index 5e17911..4b5663c 100644
              )
              logger.info(
                  "Stored %d tokens in %.3f seconds",
-@@ -399,7 +498,7 @@ class NonGPUTransferModule:
+@@ -399,7 +515,7 @@ class NonGPUTransferModule:
          response = strategy.prepare_retrieve(
              key=key,
              instance_id=instance_id,
@@ -2714,7 +2815,7 @@ index 5e17911..4b5663c 100644
          )
          session = self._ctx.session_manager.get_or_create(key.request_id)
          session.extras["retrieve_start_time"] = time.perf_counter()
-@@ -430,7 +529,7 @@ class NonGPUTransferModule:
+@@ -430,7 +546,7 @@ class NonGPUTransferModule:
          result = strategy.commit_retrieve(key=key, instance_id=instance_id)
          if st is not None:
              num_tokens = (
@@ -2724,11 +2825,11 @@ index 5e17911..4b5663c 100644
              logger.info(
                  "Retrieved %d tokens in %.3f seconds",
 diff --git a/lmcache/v1/multiprocess/modules/server_transfer.py b/lmcache/v1/multiprocess/modules/server_transfer.py
-index fc967f7..57c6daa 100644
+index fc967f7..acd3d8b 100644
 --- a/lmcache/v1/multiprocess/modules/server_transfer.py
 +++ b/lmcache/v1/multiprocess/modules/server_transfer.py
 @@ -3,7 +3,7 @@
- 
+
  # Standard
  from _thread import LockType
 -from collections.abc import Callable
@@ -2736,18 +2837,18 @@ index fc967f7..57c6daa 100644
  from typing import TYPE_CHECKING, Any
  import abc
  import pickle
-@@ -28,12 +28,41 @@ if TYPE_CHECKING:
- 
+@@ -28,12 +28,45 @@ if TYPE_CHECKING:
+
  logger = init_logger(__name__)
- 
+
 +ContextMetadata = NonGpuContextMetadata | Sequence[NonGpuContextMetadata]
 +
- 
+
  def _dtype_to_name(dtype: torch.dtype) -> str:
      """Return a stable torch dtype name without module prefix."""
      return str(dtype).split(".")[-1]
- 
- 
+
+
 +def _reserve_write_by_group(
 +    storage_manager: "StorageManager",
 +    obj_keys: list[ObjectKey],
@@ -2762,23 +2863,27 @@ index fc967f7..57c6daa 100644
 +    for obj_key in obj_keys:
 +        grouped_keys.setdefault(obj_key.object_group_id, []).append(obj_key)
 +
-+    for object_group_id, group_obj_keys in grouped_keys.items():
-+        if object_group_id >= len(context):
-+            raise ValueError(
-+                f"No non-GPU context metadata for object group {object_group_id}"
++    try:
++        for object_group_id, group_obj_keys in grouped_keys.items():
++            if object_group_id >= len(context):
++                raise ValueError(
++                    f"No non-GPU context metadata for object group {object_group_id}"
++                )
++            reserved.update(
++                storage_manager.reserve_write(
++                    group_obj_keys, context[object_group_id].layout_desc, policy
++                )
 +            )
-+        reserved.update(
-+            storage_manager.reserve_write(
-+                group_obj_keys, context[object_group_id].layout_desc, policy
-+            )
-+        )
++    except Exception:
++        storage_manager.abort_write(list(reserved))
++        raise
 +    return reserved
 +
 +
  def create_transfer_strategy(
      storage_manager: "StorageManager",
      *,
-@@ -90,7 +119,7 @@ class TransferStrategy(abc.ABC):
+@@ -90,7 +123,7 @@ class TransferStrategy(abc.ABC):
          self,
          key: IPCCacheEngineKey,
          instance_id: int,
@@ -2787,7 +2892,7 @@ index fc967f7..57c6daa 100644
          resolve_obj_keys: Callable[[IPCCacheEngineKey], list[ObjectKey]],
      ) -> PrepareStoreResponse:
          """Prepare destination resources for a store request.
-@@ -111,7 +140,7 @@ class TransferStrategy(abc.ABC):
+@@ -111,7 +144,7 @@ class TransferStrategy(abc.ABC):
          key: IPCCacheEngineKey,
          instance_id: int,
          cpu_data: bytes,
@@ -2796,7 +2901,18 @@ index fc967f7..57c6daa 100644
          resolve_obj_keys: Callable[[IPCCacheEngineKey], list[ObjectKey]],
      ) -> bool:
          """Finalize a store request.
-@@ -186,7 +215,7 @@ class PickleTransferStrategy(TransferStrategy):
+@@ -145,6 +178,10 @@ class TransferStrategy(abc.ABC):
+             Transport-specific retrieve preparation response.
+         """
+
++    def abort_store(self, key: IPCCacheEngineKey, instance_id: int) -> bool:
++        """No-op for transports that do not reserve buffers during prepare."""
++        return True
++
+     @abc.abstractmethod
+     def commit_retrieve(
+         self,
+@@ -186,7 +223,7 @@ class PickleTransferStrategy(TransferStrategy):
          self,
          key: IPCCacheEngineKey,
          instance_id: int,
@@ -2805,7 +2921,7 @@ index fc967f7..57c6daa 100644
          resolve_obj_keys: Callable[[IPCCacheEngineKey], list[ObjectKey]],
      ) -> PrepareStoreResponse:
          """Return empty store context for pickle mode.
-@@ -200,7 +229,7 @@ class PickleTransferStrategy(TransferStrategy):
+@@ -200,7 +237,7 @@ class PickleTransferStrategy(TransferStrategy):
          key: IPCCacheEngineKey,
          instance_id: int,
          cpu_data: bytes,
@@ -2814,7 +2930,7 @@ index fc967f7..57c6daa 100644
          resolve_obj_keys: Callable[[IPCCacheEngineKey], list[ObjectKey]],
      ) -> bool:
          """Deserialize and write pickled chunks into reserved objects.
-@@ -210,8 +239,8 @@ class PickleTransferStrategy(TransferStrategy):
+@@ -210,8 +247,8 @@ class PickleTransferStrategy(TransferStrategy):
          """
          obj_keys = resolve_obj_keys(key)
          chunks: list[torch.Tensor] = pickle.loads(cpu_data)
@@ -2825,7 +2941,7 @@ index fc967f7..57c6daa 100644
          )
          written_keys: list[ObjectKey] = []
          try:
-@@ -313,7 +342,7 @@ class ShmTransferStrategy(TransferStrategy):
+@@ -313,7 +350,7 @@ class ShmTransferStrategy(TransferStrategy):
          self,
          key: IPCCacheEngineKey,
          instance_id: int,
@@ -2834,18 +2950,41 @@ index fc967f7..57c6daa 100644
          resolve_obj_keys: Callable[[IPCCacheEngineKey], list[ObjectKey]],
      ) -> PrepareStoreResponse:
          """Reserve SHM-backed objects and return slot descriptors.
-@@ -322,9 +351,7 @@ class ShmTransferStrategy(TransferStrategy):
+@@ -322,8 +359,8 @@ class ShmTransferStrategy(TransferStrategy):
              Context with ``slots`` and ``chunk_indices``.
          """
          obj_keys = resolve_obj_keys(key)
 -        reserved = self._storage_manager.reserve_write(
 -            obj_keys, context.layout_desc, "new"
--        )
-+        reserved = _reserve_write_by_group(self._storage_manager, obj_keys, context, "new")
++        reserved = _reserve_write_by_group(
++            self._storage_manager, obj_keys, context, "new"
+         )
          slots: list[dict[str, Any]] = []
          chunk_indices: list[int] = []
-         reserved_keys: list[ObjectKey] = []
-@@ -364,7 +391,7 @@ class ShmTransferStrategy(TransferStrategy):
+@@ -343,13 +380,15 @@ class ShmTransferStrategy(TransferStrategy):
+                 )
+                 chunk_indices.append(idx)
+                 reserved_keys.append(obj_key)
+-        finally:
+-            reserved_keys_set = set(reserved_keys)
+-            unused_keys = [
+-                obj_key for obj_key in reserved if obj_key not in reserved_keys_set
+-            ]
+-            if unused_keys:
+-                self._storage_manager.finish_write(unused_keys)
++        except Exception:
++            self._storage_manager.abort_write(list(reserved))
++            raise
++        reserved_keys_set = set(reserved_keys)
++        unused_keys = [
++            obj_key for obj_key in reserved if obj_key not in reserved_keys_set
++        ]
++        if unused_keys:
++            self._storage_manager.abort_write(unused_keys)
+         if not reserved_keys:
+             return PrepareStoreResponse(context={"slots": [], "chunk_indices": []})
+         transfer_key = self._transfer_key_factory(key, instance_id)
+@@ -364,7 +403,7 @@ class ShmTransferStrategy(TransferStrategy):
          key: IPCCacheEngineKey,
          instance_id: int,
          cpu_data: bytes,
@@ -2854,6 +2993,63 @@ index fc967f7..57c6daa 100644
          resolve_obj_keys: Callable[[IPCCacheEngineKey], list[ObjectKey]],
      ) -> bool:
          """Finalize SHM store write locks or fallback to pickle commit.
+@@ -389,6 +428,18 @@ class ShmTransferStrategy(TransferStrategy):
+             self._storage_manager.finish_write(reserved_keys)
+         return True
+
++    def abort_store(self, key: IPCCacheEngineKey, instance_id: int) -> bool:
++        """Release this transfer's reservations without committing any payload."""
++        transfer_key = self._transfer_key_factory(key, instance_id)
++        with self._pending_lock:
++            reserved_keys = self._pending_writes.get(transfer_key)
++            if reserved_keys is None:
++                return True
++            if not self._storage_manager.abort_write(reserved_keys):
++                return False
++            self._pending_writes.pop(transfer_key, None)
++        return True
++
+     def prepare_retrieve(
+         self,
+         key: IPCCacheEngineKey,
+diff --git a/lmcache/v1/multiprocess/protocols/base.py b/lmcache/v1/multiprocess/protocols/base.py
+index c48284c..e524593 100644
+--- a/lmcache/v1/multiprocess/protocols/base.py
++++ b/lmcache/v1/multiprocess/protocols/base.py
+@@ -84,6 +84,9 @@ class RequestType(enum.Enum):
+     CB_RETRIEVE_PRE_COMPUTED_V3 = enum.auto()
+     CB_UNIFIED_LOOKUP = enum.auto()
+
++    # Append to preserve the numeric IDs of existing wire requests.
++    ABORT_STORE = enum.auto()
++
+
+ @dataclass
+ class ProtocolDefinition:
+diff --git a/lmcache/v1/multiprocess/protocols/engine.py b/lmcache/v1/multiprocess/protocols/engine.py
+index b2aa603..f37ae1f 100644
+--- a/lmcache/v1/multiprocess/protocols/engine.py
++++ b/lmcache/v1/multiprocess/protocols/engine.py
+@@ -71,6 +71,7 @@ REQUEST_NAMES = [
+     "UNREGISTER_KV_CACHE_NON_GPU_CONTEXT",
+     "PREPARE_STORE",
+     "COMMIT_STORE",
++    "ABORT_STORE",
+     "PREPARE_RETRIEVE",
+     "COMMIT_RETRIEVE",
+ ]
+@@ -227,6 +228,11 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
+             response_class=bool,
+             handler_type=HandlerType.BLOCKING,
+         ),
++        "ABORT_STORE": ProtocolDefinition(
++            payload_classes=[KeyType, int],
++            response_class=bool,
++            handler_type=HandlerType.BLOCKING,
++        ),
+         "PREPARE_RETRIEVE": ProtocolDefinition(
+             payload_classes=[KeyType, int],
+             response_class=PrepareRetrieveResponse,
 diff --git a/lmcache/v1/multiprocess/server.py b/lmcache/v1/multiprocess/server.py
 index 7d5ff8d..7993dd4 100644
 --- a/lmcache/v1/multiprocess/server.py
@@ -2920,17 +3116,44 @@ index 7d5ff8d..7993dd4 100644
      if mp_config.engine_type == "blend_legacy":
          if mp_config.supported_transfer_mode == "non_gpu":
 diff --git a/lmcache/v1/multiprocess/transfer_context/base.py b/lmcache/v1/multiprocess/transfer_context/base.py
-index afdcc29..6701c17 100644
+index afdcc29..2121fab 100644
 --- a/lmcache/v1/multiprocess/transfer_context/base.py
 +++ b/lmcache/v1/multiprocess/transfer_context/base.py
-@@ -370,6 +370,9 @@ def gather_paged_kv_to_cpu(
+@@ -33,6 +33,7 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc
+ from lmcache.v1.gpu_connector.utils import LayoutHints
+ from lmcache.v1.multiprocess.custom_types import IPCCacheEngineKey
+ from lmcache.v1.multiprocess.mq import MessageQueueClient
++from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
+
+ if TYPE_CHECKING:
+     # First Party
+@@ -184,6 +185,18 @@ class NonGpuContext(ABC):
+         """Prepare retrieve. Returns chunks or shm views, or None on miss."""
+         ...
+
++    def abort_store(self, key: IPCCacheEngineKey, instance_id: int) -> bool:
++        """Discard a prepared store without publishing partially written data."""
++        future = self.mq_client.submit_request(
++            RequestType.ABORT_STORE,
++            [key, instance_id],
++            get_response_class(RequestType.ABORT_STORE),
++        )
++        try:
++            return bool(future.result(timeout=self.mq_timeout))
++        except TimeoutError:
++            return False
++
+     @abstractmethod
+     def commit_retrieve(self, key: IPCCacheEngineKey, instance_id: int) -> bool:
+         """Commit retrieve. Pickle: no-op. Shm: release read locks."""
+@@ -370,6 +383,9 @@ def gather_paged_kv_to_cpu(
          num_blocks=num_blocks,
          block_size=block_size,
      )
 +    # The descriptor is the single source of truth for the flattened
 +    # per-token layout used by the transfer kernel and the CPU chunks.
 +    hidden_dim_size = int(shape_desc.nh) * int(shape_desc.hs)
- 
+
      iter_indices = (
          list(chunk_indices) if chunk_indices is not None else list(range(num_chunks))
 diff --git a/lmcache/v1/multiprocess/transfer_context/mamba_quant.py b/lmcache/v1/multiprocess/transfer_context/mamba_quant.py
@@ -3592,8 +3815,27 @@ index 0000000..f6d949d
 +    conv_payload = blob[4 : 4 + conv_len]
 +    ssm_payload = blob[4 + conv_len :]
 +    return conv_payload, ssm_payload
+diff --git a/lmcache/v1/multiprocess/transfer_context/shm.py b/lmcache/v1/multiprocess/transfer_context/shm.py
+index 0178d27..ff278f1 100644
+--- a/lmcache/v1/multiprocess/transfer_context/shm.py
++++ b/lmcache/v1/multiprocess/transfer_context/shm.py
+@@ -164,8 +164,12 @@ class NonGpuContextShm(NonGpuContext):
+         if not slots:
+             # Server explicitly signals all chunks are already cached.
+             return [], []
+-        chunk_indices: list[int] = context["chunk_indices"]
+-        return self._build_slot_tensors(slots), chunk_indices
++        try:
++            chunk_indices: list[int] = context["chunk_indices"]
++            return self._build_slot_tensors(slots), chunk_indices
++        except Exception:
++            self.abort_store(key, instance_id)
++            raise
+
+     def commit_store(
+         self, key: IPCCacheEngineKey, instance_id: int, _chunks: list[torch.Tensor]
 diff --git a/lmcache/v1/multiprocess/transfer_context/worker_transfer.py b/lmcache/v1/multiprocess/transfer_context/worker_transfer.py
-index 1d90fc5..d14c452 100644
+index 1d90fc5..6b93633 100644
 --- a/lmcache/v1/multiprocess/transfer_context/worker_transfer.py
 +++ b/lmcache/v1/multiprocess/transfer_context/worker_transfer.py
 @@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
@@ -3602,7 +3844,7 @@ index 1d90fc5..d14c452 100644
  from typing import Any, Callable, Protocol
 +import json
  import os
- 
+
  # Third Party
 @@ -16,7 +17,10 @@ from lmcache import torch_dev
  from lmcache.utils import EngineType, init_logger
@@ -3631,9 +3873,9 @@ index 1d90fc5..d14c452 100644
 +    unpack_mamba_payloads,
 +)
  from lmcache.v1.platform import _registry as platform_registry
- 
+
  logger = init_logger(__name__)
- 
+
 +try:
 +    # Optional L1 KVWeave quantization codec.
 +    # First Party
@@ -3713,13 +3955,13 @@ index 1d90fc5..d14c452 100644
 +        _DEFAULT_KVWEAVE_HEAD_DIM,
 +    )
 +    return _DEFAULT_KVWEAVE_NUM_KV_HEADS, _DEFAULT_KVWEAVE_HEAD_DIM
- 
- 
+
+
  class MPTransferMode(str, Enum):
 @@ -57,6 +145,40 @@ class MPTransferMode(str, Enum):
      DATA = "data"
- 
- 
+
+
 +class GroupCodecMode(str, Enum):
 +    """Per-group codec mode for non-GPU worker data transfer."""
 +
@@ -3760,7 +4002,7 @@ index 1d90fc5..d14c452 100644
 @@ -305,10 +427,463 @@ class HandleTransferContext(TransferContext):
  class DataTransferContext(TransferContext):
      """Data transfer context for non-CUDA workers."""
- 
+
 -    def __init__(self) -> None:
 +    def __init__(
 +        self,
@@ -4219,13 +4461,13 @@ index 1d90fc5..d14c452 100644
 +                group_block_ids,
 +                self._blocks_per_chunk_for_group(group_info, blocks_in_chunk),
 +            )
- 
+
      def register(
          self,
 @@ -325,14 +900,10 @@ class DataTransferContext(TransferContext):
      ) -> None:
          """Register KV caches with the non-GPU context server.
- 
+
 -        ``engine_group_infos`` is accepted to satisfy the base interface but
 -        is currently a no-op: the non-GPU transfer path does not support
 -        hybrid KV cache groups and rejects multi-group transfers at store /
@@ -4260,13 +4502,13 @@ index 1d90fc5..d14c452 100644
 +            ],
 +        )
 +        self._chunk_size_tokens = blocks_in_chunk * block_size
- 
+
          use_mla_flag = is_mla(gpu_kv_format)
          shape = (
 @@ -354,6 +941,142 @@ class DataTransferContext(TransferContext):
          dtype = getattr(torch, dtype_str)
          layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
- 
+
 +        transfer_groups: list[
 +            tuple[EngineGroupInfo | None, dict[str, torch.Tensor], int]
 +        ] = []
@@ -4406,7 +4648,7 @@ index 1d90fc5..d14c452 100644
          future = send_request(
              mq_client,
              RequestType.REGISTER_KV_CACHE_NON_GPU_CONTEXT,
-@@ -367,6 +1090,16 @@ class DataTransferContext(TransferContext):
+@@ -367,6 +1090,14 @@ class DataTransferContext(TransferContext):
                      hidden_dim_size=hidden_dim_size,
                      dtype_str=dtype_str,
                      use_mla=use_mla_flag,
@@ -4416,20 +4658,40 @@ index 1d90fc5..d14c452 100644
 +                            serialize_memory_layout_desc(layout_desc)
 +                            for layout_desc in self._group_store_layout_descs
 +                        ]
-+                        if kvweave_quant_active
-+                        else None
 +                    ),
 +                    enable_l1_kvweave_quant=kvweave_quant_active,
                  )
              ],
          )
-@@ -417,26 +1150,180 @@ class DataTransferContext(TransferContext):
-         out_buffers, chunk_indices = result if result is not None else (None, None)
-         # All chunks already in cache — nothing to gather or commit.
-         if chunk_indices is not None and len(chunk_indices) == 0:
+@@ -413,30 +1144,232 @@ class DataTransferContext(TransferContext):
+             )
+
+         torch_dev.synchronize()
+-        result = self._non_gpu_context.prepare_store(key, instance_id)
+-        out_buffers, chunk_indices = result if result is not None else (None, None)
+-        # All chunks already in cache — nothing to gather or commit.
+-        if chunk_indices is not None and len(chunk_indices) == 0:
 -            future: MessagingFuture[bool] = MessagingFuture()
 -            future.set_result(True)
--            return future
++        committed = False
++        try:
++            result = self._non_gpu_context.prepare_store(key, instance_id)
++            out_buffers, chunk_indices = result if result is not None else (None, None)
++            # All chunks already in cache — nothing to gather or commit.
++            if chunk_indices is not None and len(chunk_indices) == 0:
++                committed = True
++                return self._resolved_future(True)
++            future = self._submit_prepared_store(
++                key,
++                instance_id,
++                kv_caches,
++                block_ids,
++                blocks_in_chunk,
++                out_buffers,
++                chunk_indices,
++            )
++            committed = bool(future.result())
+             return future
 -        cpu_chunks = gather_paged_kv_to_cpu(
 -            kv_caches,
 -            _single_group_block_ids(block_ids),
@@ -4439,7 +4701,35 @@ index 1d90fc5..d14c452 100644
 -            out=out_buffers,
 -            chunk_indices=chunk_indices,
 -        )
-+            return self._resolved_future(True)
+-        if out_buffers is not None:
+-            # SHM path uses async device->CPU copies; complete them before commit.
+-            torch_dev.synchronize()
++        finally:
++            if not committed:
++                # A RAW group may still be writing into SHM when a later group
++                # fails. Complete all transfers before freeing their buffers.
++                torch_dev.synchronize()
++                try:
++                    if not self._non_gpu_context.abort_store(key, instance_id):
++                        logger.error(
++                            "Failed to abort store for instance %d", instance_id
++                        )
++                except Exception:
++                    logger.exception(
++                        "Failed to abort store for instance %d", instance_id
++                    )
++
++    def _submit_prepared_store(
++        self,
++        key: Any,
++        instance_id: int,
++        kv_caches: dict[str, torch.Tensor],
++        block_ids: list[list[int]],
++        blocks_in_chunk: int,
++        out_buffers: list[torch.Tensor] | None,
++        chunk_indices: list[int] | None,
++    ) -> MessagingFuture:
++        assert self._non_gpu_context is not None
 +        cpu_chunks: list[torch.Tensor] = []
 +        group_offset = 0
 +        for group_index, (
@@ -4515,6 +4805,9 @@ index 1d90fc5..d14c452 100644
 +                        out=None,
 +                        chunk_indices=group_chunk_indices,
 +                    )
++                    # gather may return before D2H completes. CPU codecs must
++                    # never consume these tensors before the transfer finishes.
++                    torch_dev.synchronize()
 +
 +                    mamba_real_layout = (
 +                        _group_info.mamba_real_layout
@@ -4522,13 +4815,19 @@ index 1d90fc5..d14c452 100644
 +                        else None
 +                    )
 +
-+                    def _serialize_chunk(raw_chunk: torch.Tensor) -> bytes:
++                    def _serialize_chunk(
++                        raw_chunk: torch.Tensor,
++                        *,
++                        mamba_real_layout=mamba_real_layout,
++                        group_info=_group_info,
++                        scaling_method=group_scaling_method,
++                    ) -> bytes:
 +                        if mamba_real_layout is not None:
-+                            assert _group_info is not None
++                            assert group_info is not None
 +                            split = split_mamba_chunk(
 +                                raw_chunk,
 +                                mamba_real_layout,
-+                                _group_info.tokens_per_block,
++                                group_info.tokens_per_block,
 +                            )
 +                            return pack_mamba_payloads(
 +                                (
@@ -4556,7 +4855,7 @@ index 1d90fc5..d14c452 100644
 +                            )
 +                        return self._kvweave_codec.serialize_tensor(
 +                            raw_chunk,
-+                            scaling_method=group_scaling_method,
++                            scaling_method=scaling_method,
 +                        )
 +
 +                    if group_out_buffers is not None:
@@ -4607,19 +4906,18 @@ index 1d90fc5..d14c452 100644
 +                                )
 +                                return self._resolved_future(False)
 +            group_offset += num_group_chunks
-         if out_buffers is not None:
-             # SHM path uses async device->CPU copies; complete them before commit.
-             torch_dev.synchronize()
++        # Complete RAW copies before either SHM commit or CPU pickle serialization.
++        torch_dev.synchronize()
          ok = self._non_gpu_context.commit_store(key, instance_id, cpu_chunks)
- 
+
 -        future = MessagingFuture()
 -        future.set_result(ok)
 -        return future
 +        return self._resolved_future(ok)
- 
+
      def submit_retrieve(
          self,
-@@ -459,15 +1346,81 @@ class DataTransferContext(TransferContext):
+@@ -459,15 +1392,81 @@ class DataTransferContext(TransferContext):
          ok = src_buffers is not None
          if src_buffers is not None:
              try:
@@ -4710,18 +5008,18 @@ index 1d90fc5..d14c452 100644
              except (RuntimeError, ValueError, TypeError, IndexError):
                  logger.exception("Failed to scatter retrieved CPU context chunks")
                  ok = False
-@@ -476,9 +1429,7 @@ class DataTransferContext(TransferContext):
+@@ -476,9 +1475,7 @@ class DataTransferContext(TransferContext):
              torch_dev.synchronize()
          self._non_gpu_context.commit_retrieve(key, instance_id)
- 
+
 -        future: MessagingFuture[bool] = MessagingFuture()
 -        future.set_result(ok)
 -        return future
 +        return self._resolved_future(ok)
- 
+
      def close(self) -> None:
          if self._non_gpu_context is not None:
-@@ -489,7 +1440,7 @@ class DataTransferContext(TransferContext):
+@@ -489,7 +1486,7 @@ class DataTransferContext(TransferContext):
  def create_transfer_context(
      kv_caches: dict[str, torch.Tensor],
      mode: "str | MPTransferMode | None" = None,
@@ -4729,8 +5027,8 @@ index 1d90fc5..d14c452 100644
 +    **kwargs: Any,
  ) -> TransferContext:
      """Create a transfer context from KV cache device type.
- 
-@@ -528,9 +1479,203 @@ def create_transfer_context(
+
+@@ -528,9 +1525,203 @@ def create_transfer_context(
      )
      if resolved_mode is MPTransferMode.HANDLE:
          return _build_handle_context(device_type)
@@ -5110,6 +5408,49 @@ index 0000000..60e3030
 +
 +    assert setup_module._select_gpu_backend() == "cuda"
 \ No newline at end of file
+diff --git a/tests/v1/multiprocess/test_kvweave_safe_defaults.py b/tests/v1/multiprocess/test_kvweave_safe_defaults.py
+new file mode 100644
+--- /dev/null
++++ b/tests/v1/multiprocess/test_kvweave_safe_defaults.py
+@@ -0,0 +1,38 @@
++# SPDX-License-Identifier: Apache-2.0
++import os
++import pytest
++import torch
++
++from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
++    DataTransferContext,
++    create_transfer_context,
++)
++
++
++@pytest.mark.parametrize("factory", [DataTransferContext, lambda: create_transfer_context(
++    {"layer0": torch.empty(1)}, mode="data"
++)])
++def test_quantization_is_opt_in(factory, monkeypatch):
++    for name in tuple(os.environ):
++        if name.startswith("LMCACHE_MP_KVWEAVE_") or name == "LMCACHE_MP_L1_KVWEAVE_QUANT":
++            monkeypatch.delenv(name)
++    ctx = factory()
++    assert not ctx._enable_l1_kvweave_quant
++    assert not ctx._kvweave_linear_quant_enabled
++    assert not ctx._kvweave_conv_quant_enabled
++    assert not ctx._kvweave_ssm_quant_enabled
++
++
++def test_attention8_opt_in_keeps_hybrid_states_raw(monkeypatch):
++    for name in tuple(os.environ):
++        if name.startswith("LMCACHE_MP_KVWEAVE_") or name == "LMCACHE_MP_L1_KVWEAVE_QUANT":
++            monkeypatch.delenv(name)
++    monkeypatch.setenv("LMCACHE_MP_L1_KVWEAVE_QUANT", "1")
++    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_ATTENTION_QBITS", "8")
++    ctx = create_transfer_context({"layer0": torch.empty(1)}, mode="data")
++    assert ctx._enable_l1_kvweave_quant
++    assert ctx._kvweave_attention_quant_enabled
++    assert ctx._kvweave_attention_qbits == 8
++    assert not ctx._kvweave_linear_quant_enabled
++    assert not ctx._kvweave_conv_quant_enabled
++    assert not ctx._kvweave_ssm_quant_enabled
 diff --git a/tests/v1/multiprocess/test_mamba_quant.py b/tests/v1/multiprocess/test_mamba_quant.py
 new file mode 100644
 index 0000000..e14afe8
@@ -5594,13 +5935,13 @@ index 0000000..e14afe8
 +        assert restored.shape == tensor.shape
 +        assert (restored - tensor).abs().max().item() < 1.0
 diff --git a/tests/v1/multiprocess/test_non_cuda_data_transfer.py b/tests/v1/multiprocess/test_non_cuda_data_transfer.py
-index 8262d85..6ff577c 100644
+index 8262d85..bb33c0b 100644
 --- a/tests/v1/multiprocess/test_non_cuda_data_transfer.py
 +++ b/tests/v1/multiprocess/test_non_cuda_data_transfer.py
 @@ -395,6 +395,188 @@ def test_create_transfer_context_env_var_overrides_default(
      assert isinstance(context, DataTransferContext)
- 
- 
+
+
 +def test_data_transfer_context_store_accepts_multi_group_block_ids(
 +    monkeypatch: Any,
 +) -> None:
@@ -5796,6 +6137,357 @@ index 8262d85..6ff577c 100644
      with patch.dict(
          sys.modules,
          {
+@@ -866,7 +1051,8 @@ def test_server_prepare_store_releases_unused_reserved_write_locks(
+     assert isinstance(prepare_response, PrepareStoreResponse)
+     assert prepare_response.context == {"slots": [], "chunk_indices": []}
+     reserved_keys = mock_storage.reserve_write.call_args[0][0]
+-    mock_storage.finish_write.assert_called_once_with(reserved_keys)
++    mock_storage.abort_write.assert_called_once_with(reserved_keys)
++    mock_storage.finish_write.assert_not_called()
+
+
+ def test_server_shm_transport_uses_engine_level_config(
+@@ -954,7 +1140,8 @@ def test_server_unregister_non_gpu_context_releases_pending_shm_locks(
+
+     module.unregister_kv_cache(4)
+
+-    mock_storage.finish_write.assert_called_once()
++    mock_storage.abort_write.assert_called_once()
++    mock_storage.finish_write.assert_not_called()
+     mock_storage.finish_read_prefetched.assert_called_once()
+
+
+diff --git a/tests/v1/multiprocess/test_store_review_regressions.py b/tests/v1/multiprocess/test_store_review_regressions.py
+new file mode 100644
+index 0000000..641034b
+--- /dev/null
++++ b/tests/v1/multiprocess/test_store_review_regressions.py
+@@ -0,0 +1,325 @@
++# SPDX-License-Identifier: Apache-2.0
++from types import SimpleNamespace as NS
++from unittest.mock import Mock, patch
++import os
++import time
++import uuid
++
++import pytest
++import torch
++
++from lmcache import torch_dev, torch_device_type
++from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
++from lmcache.v1.distributed.config import L1ManagerConfig, L1MemoryManagerConfig
++from lmcache.v1.distributed.error import L1Error
++from lmcache.v1.distributed.l1_manager import L1Manager
++from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
++    FSL2Adapter,
++    FSL2AdapterConfig,
++)
++from lmcache.v1.distributed.storage_manager import StorageManager
++from lmcache.v1.multiprocess.group_view import EngineGroupInfo
++from lmcache.v1.multiprocess.modules.non_gpu_transfer import NonGPUTransferModule
++from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
++from lmcache.v1.multiprocess.transfer_context import worker_transfer as w
++from lmcache.v1.multiprocess.transfer_context.shm import NonGpuContextShm
++
++
++@pytest.mark.parametrize("shm", [False, True])
++@pytest.mark.parametrize("mamba", [False, True])
++def test_codec_waits_for_d2h(shm, mamba):
++    ctx = w.DataTransferContext()
++    dst = torch.zeros(16, dtype=torch.uint8)
++    transport = Mock()
++    transport.prepare_store.return_value = ([dst], [0]) if shm else None
++    transport.commit_store.return_value = True
++    ctx._non_gpu_context = transport
++    group = NS(mamba_real_layout=object(), tokens_per_block=1) if mamba else None
++    ctx._iter_transfer_groups = lambda *args: iter([(group, {}, [0], 1)])
++    ctx._group_codec_modes = [w.GroupCodecMode.KVWEAVE_QUANT]
++    ctx._group_quant_scaling_methods = ["per_tensor"]
++    ctx._group_store_layout_descs = [MemoryLayoutDesc([dst.shape], [dst.dtype])]
++    pending = []
++
++    def synchronize():
++        for tensor in pending:
++            tensor.fill_(7)
++        pending.clear()
++
++    def gather(*args, **kwargs):
++        raw = torch.zeros(1)
++        pending.append(raw)
++        return [raw]
++
++    def codec(raw, **kwargs):
++        assert raw.item() == 7, "codec consumed an unfinished D2H buffer"
++        return b"\x07"
++
++    ctx._kvweave_codec = NS(serialize_tensor=codec)
++
++    def split(raw, *args):
++        assert raw.item() == 7
++        return NS(conv=raw, ssm=raw)
++
++    with (
++        patch.object(w, "torch_dev", NS(synchronize=synchronize)),
++        patch.object(w, "gather_paged_kv_to_cpu", gather),
++        patch.object(
++            w,
++            "_copy_bytes_to_tensor",
++            lambda payload, tensor: tensor.__setitem__(0, payload[0]),
++        ),
++        patch.object(w, "split_mamba_chunk", split),
++        patch.object(w, "serialize_mamba_substate_raw", codec),
++        patch.object(w, "pack_mamba_payloads", lambda *args: b"\x07"),
++    ):
++        assert ctx.submit_store("r", "key", 1, {}, [[0]], None, 1).result()
++    transport.abort_store.assert_not_called()
++    stored = dst if shm else transport.commit_store.call_args.args[2][0]
++    assert stored[0].item() == 7
++
++
++@pytest.fixture
++def real_transport():
++    name = f"lmcache_l1_pool_review_{os.getpid()}_{uuid.uuid4().hex}"
++    l1 = L1Manager(
++        L1ManagerConfig(L1MemoryManagerConfig(8 << 20, False, shm_name=name))
++    )
++    storage = object.__new__(StorageManager)
++    storage._l1_manager = l1
++    storage._event_bus = Mock()
++    keys = [ObjectKey(b"a", "review", 0, i) for i in range(2)]
++    session = NS(extras={})
++    ctx = NS(
++        chunk_size=1024,
++        storage_manager=storage,
++        shm_pool_info={"shm_name": name, "pool_size": 8 << 20},
++        layout_desc_registry=Mock(),
++        session_manager=NS(get_or_create=lambda _: session),
++        resolve_obj_keys=lambda *_: [[keys[0]], [keys[1]]],
++    )
++    server = NonGPUTransferModule(ctx)
++
++    def request(req, payload, response_cls=None):
++        handler = {spec.request_type: spec.handler for spec in server.get_handlers()}[
++            req
++        ]
++        return NS(result=lambda **kwargs: handler(*payload))
++
++    mq = NS(submit_request=request)
++    worker = w.DataTransferContext()
++    yield worker, server, storage, l1, keys, mq, request
++    server.unregister_kv_cache(1)
++    if worker._non_gpu_context is not None:
++        worker._non_gpu_context.close()
++    l1.close()
++
++
++def register_worker(worker, mq, request, second_dtype=torch.float16):
++    caches = {
++        "a": torch.zeros(2, 64, 16, 1, 128, dtype=torch.float16),
++        "b": torch.zeros(2, 64, 16, 1, 256, dtype=second_dtype),
++    }
++    groups = [EngineGroupInfo(0, (0,), 16), EngineGroupInfo(1, (1,), 16)]
++    worker.register(
++        1,
++        caches,
++        "review",
++        1,
++        64,
++        mq,
++        5,
++        lambda client, req, payload: request(req, payload),
++        layout_hints={"kv_layout": "NHD"},
++        engine_group_infos=groups,
++    )
++    return caches
++
++
++@pytest.mark.parametrize("second_dtype", [torch.float16, torch.float32])
++def test_raw_heterogeneous_shm_roundtrip(real_transport, second_dtype, tmp_path):
++    worker, server, storage, l1, keys, mq, request = real_transport
++    caches = register_worker(worker, mq, request, second_dtype)
++    assert isinstance(worker._non_gpu_context, NonGpuContextShm)
++    layouts = server._non_gpu_contexts[1].metadata_by_group
++    assert layouts[0].layout_desc.shapes[0] == torch.Size([2, 1, 1024, 128])
++    assert layouts[1].layout_desc.shapes[0] == torch.Size([2, 1, 1024, 256])
++    assert layouts[1].layout_desc.dtypes == [second_dtype]
++    caches = {name: tensor.to(torch_device_type) for name, tensor in caches.items()}
++    caches["a"].fill_(3)
++    caches["b"].fill_(5)
++
++    # Pending transfer keys must be hashable.
++    class Key:
++        request_id = "raw"
++
++    ipc_key = Key()
++    assert worker.submit_store(
++        "raw", ipc_key, 1, caches, [list(range(64)), list(range(64))], None, 64
++    ).result()
++    assert not server._pending_shm_writes
++    assert l1.reserve_read(keys)[keys[1]][0] == L1Error.SUCCESS
++    destinations = {name: torch.zeros_like(tensor) for name, tensor in caches.items()}
++    assert worker.submit_retrieve(
++        "raw", ipc_key, 1, destinations, [list(range(64)), list(range(64))], None, 64
++    ).result()
++    torch_dev.synchronize()
++    for name in caches:
++        assert torch.equal(caches[name], destinations[name])
++    # Save real objects to filesystem L2, remove L1 data, then refill using
++    # precisely the group layouts registered for lookup/prefetch.
++    adapter = FSL2Adapter(FSL2AdapterConfig(str(tmp_path)))
++
++    def wait_result(query):
++        deadline = time.monotonic() + 10
++        while time.monotonic() < deadline:
++            result = query()
++            if result is not None:
++                return result
++            time.sleep(0.01)
++        pytest.fail("filesystem L2 task timed out")
++
++    try:
++        read_results = l1.reserve_read(keys)
++        objects = [read_results[k][1] for k in keys]
++        task = adapter.submit_store_task(keys, objects)
++        completion = wait_result(lambda: adapter.pop_completed_store_tasks().get(task))
++        assert completion.is_successful()
++        l1.finish_read(keys)
++        assert all(error == L1Error.SUCCESS for error in l1.delete(keys).values())
++        registered = server._ctx.layout_desc_registry.register.call_args.args[2]
++        reserved = {
++            k: l1.reserve_write([k], [False], registered[k.object_group_id], "new")[k][
++                1
++            ]
++            for k in keys
++        }
++        task = adapter.submit_load_task(keys, [reserved[k] for k in keys])
++        bitmap = wait_result(lambda: adapter.query_load_result(task))
++        assert bitmap.popcount() == len(keys)
++        l1.finish_write_and_reserve_read(keys)
++        for tensor in destinations.values():
++            tensor.zero_()
++        assert worker.submit_retrieve(
++            "l2", ipc_key, 1, destinations, [list(range(64))] * 2, None, 64
++        ).result()
++        torch_dev.synchronize()
++        for name in caches:
++            assert torch.equal(caches[name], destinations[name])
++    finally:
++        adapter.close()
++
++
++@pytest.mark.parametrize(
++    "failure", ["codec", "copy", "missing_codec", "slot_count", "gather"]
++)
++def test_failed_store_frees_real_shm_and_allows_retry(real_transport, failure):
++    worker, server, storage, l1, keys, mq, request = real_transport
++    caches = register_worker(worker, mq, request)
++    worker._group_codec_modes = [w.GroupCodecMode.KVWEAVE_QUANT] * 2
++    codec = Mock()
++    codec.serialize_tensor.return_value = b"\x07"
++    worker._kvweave_codec = codec
++
++    class Key:
++        request_id = "failure"
++
++    key = Key()
++    before = l1.get_memory_usage()[0]
++    listener = Mock()
++    l1.register_listener(listener)
++
++    def gather(*args, **kwargs):
++        if failure == "gather":
++            raise RuntimeError("injected gather error")
++        return [] if failure == "slot_count" else [torch.ones(1)]
++
++    def copy(payload, dst):
++        if failure == "copy":
++            raise ValueError("injected copy failure")
++
++    if failure == "codec":
++        codec.serialize_tensor.side_effect = ValueError("injected codec error")
++    if failure == "missing_codec":
++        worker._kvweave_codec = None
++    with (
++        patch.object(w, "gather_paged_kv_to_cpu", gather),
++        patch.object(w, "_copy_bytes_to_tensor", copy),
++    ):
++        if failure == "gather":
++            with pytest.raises(RuntimeError, match="injected gather"):
++                worker.submit_store(
++                    "failure", key, 1, caches, [list(range(64))] * 2, None, 64
++                )
++        else:
++            assert not worker.submit_store(
++                "failure", key, 1, caches, [list(range(64))] * 2, None, 64
++            ).result()
++    assert not server._pending_shm_writes
++    assert l1.get_memory_usage()[0] == before
++    assert all(l1.reserve_read(keys)[k][0] == L1Error.KEY_NOT_EXIST for k in keys)
++    listener.on_l1_keys_write_finished.assert_not_called()
++    assert server.abort_store(key, 1)  # idempotent
++    worker._group_codec_modes = [w.GroupCodecMode.RAW] * 2
++    with patch.object(
++        w, "gather_paged_kv_to_cpu", lambda *args, **kwargs: kwargs["out"]
++    ):
++        assert worker.submit_store(
++            "retry", key, 1, caches, [list(range(64))] * 2, None, 64
++        ).result()
++    assert not server._pending_shm_writes
++
++
++def test_abort_store_wire_definition():
++    assert get_response_class(RequestType.ABORT_STORE) is bool
++
++
++def test_mixed_group_failure_waits_before_releasing_shm(real_transport):
++    worker, server, storage, l1, keys, mq, request = real_transport
++    caches = register_worker(worker, mq, request)
++    worker._group_codec_modes = [w.GroupCodecMode.RAW, w.GroupCodecMode.KVWEAVE_QUANT]
++    worker._kvweave_codec = None
++    outstanding = []
++    events = []
++
++    def gather(*args, **kwargs):
++        events.append("gather")
++        outstanding.extend(kwargs["out"])
++        return kwargs["out"]
++
++    def synchronize():
++        events.append("synchronize")
++        for tensor in outstanding:
++            tensor.fill_(7)
++        outstanding.clear()
++
++    def abort(keys):
++        assert not outstanding, "freed SHM while D2H was still writing"
++        events.append("abort")
++        return StorageManager.abort_write(storage, keys)
++
++    class Key:
++        request_id = "mixed"
++
++    with (
++        patch.object(w, "torch_dev", NS(synchronize=synchronize)),
++        patch.object(w, "gather_paged_kv_to_cpu", gather),
++        patch.object(storage, "abort_write", abort),
++    ):
++        assert not worker.submit_store(
++            "mixed", Key(), 1, caches, [list(range(64))] * 2, None, 64
++        ).result()
++    assert events == ["synchronize", "gather", "synchronize", "abort"]
++    assert not server._pending_shm_writes
++    assert l1.get_memory_usage()[0] == 0
++
++
++def test_abort_preserves_read_locked_objects(real_transport):
++    worker, server, storage, l1, keys, mq, request = real_transport
++    desc = MemoryLayoutDesc([torch.Size([16])], [torch.uint8])
++    l1.reserve_write([keys[0]], [False], desc, "new")
++    l1.finish_write_and_reserve_read([keys[0]])
++    before = l1.get_memory_usage()[0]
++    assert l1.abort_write([keys[0]])[keys[0]] == L1Error.KEY_IS_LOCKED
++    assert l1.get_memory_usage()[0] == before
++    l1.finish_read([keys[0]])
 diff --git a/tests/v1/multiprocess/test_worker_transfer.py b/tests/v1/multiprocess/test_worker_transfer.py
 new file mode 100644
 index 0000000..b348b28
@@ -6294,46 +6986,3 @@ index 021a72c..cef4142 100644
  
  
  def test_conversion_splits_by_lmcache_layer_identity():
-diff --git a/tests/v1/multiprocess/test_kvweave_safe_defaults.py b/tests/v1/multiprocess/test_kvweave_safe_defaults.py
-new file mode 100644
---- /dev/null
-+++ b/tests/v1/multiprocess/test_kvweave_safe_defaults.py
-@@ -0,0 +1,38 @@
-+# SPDX-License-Identifier: Apache-2.0
-+import os
-+import pytest
-+import torch
-+
-+from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
-+    DataTransferContext,
-+    create_transfer_context,
-+)
-+
-+
-+@pytest.mark.parametrize("factory", [DataTransferContext, lambda: create_transfer_context(
-+    {"layer0": torch.empty(1)}, mode="data"
-+)])
-+def test_quantization_is_opt_in(factory, monkeypatch):
-+    for name in tuple(os.environ):
-+        if name.startswith("LMCACHE_MP_KVWEAVE_") or name == "LMCACHE_MP_L1_KVWEAVE_QUANT":
-+            monkeypatch.delenv(name)
-+    ctx = factory()
-+    assert not ctx._enable_l1_kvweave_quant
-+    assert not ctx._kvweave_linear_quant_enabled
-+    assert not ctx._kvweave_conv_quant_enabled
-+    assert not ctx._kvweave_ssm_quant_enabled
-+
-+
-+def test_attention8_opt_in_keeps_hybrid_states_raw(monkeypatch):
-+    for name in tuple(os.environ):
-+        if name.startswith("LMCACHE_MP_KVWEAVE_") or name == "LMCACHE_MP_L1_KVWEAVE_QUANT":
-+            monkeypatch.delenv(name)
-+    monkeypatch.setenv("LMCACHE_MP_L1_KVWEAVE_QUANT", "1")
-+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_ATTENTION_QBITS", "8")
-+    ctx = create_transfer_context({"layer0": torch.empty(1)}, mode="data")
-+    assert ctx._enable_l1_kvweave_quant
-+    assert ctx._kvweave_attention_quant_enabled
-+    assert ctx._kvweave_attention_qbits == 8
-+    assert not ctx._kvweave_linear_quant_enabled
-+    assert not ctx._kvweave_conv_quant_enabled
-+    assert not ctx._kvweave_ssm_quant_enabled
