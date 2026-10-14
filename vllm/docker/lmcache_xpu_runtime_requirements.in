@@ -5,7 +5,7 @@
 # Shared serving dependencies are constrained during ALL runtime installs.
 # Include transformers in this solve: its Hub/tokenizer bounds must also hold
 # when LMCache's newer huggingface-hub minimum is installed.
-transformers==5.8.0
+transformers==5.10.1
 aiofiles
 aiohttp>=3.13.3
 blake3
