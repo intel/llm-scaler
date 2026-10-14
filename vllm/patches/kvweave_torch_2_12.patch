@@ -1,0 +1,22 @@
+diff --git a/libraries/kv-quant-offload/pyproject.toml b/libraries/kv-quant-offload/pyproject.toml
+index f78f9f59..11f0c765 100644
+--- a/libraries/kv-quant-offload/pyproject.toml
++++ b/libraries/kv-quant-offload/pyproject.toml
+@@ -9,7 +9,7 @@ readme = "README.md"
+ license = "Apache-2.0"
+ requires-python = ">=3.10"
+ dependencies = [
+-    "torch==2.11.0+xpu",
++    "torch==2.12.0+xpu",
+     "numpy",
+ ]
+ 
+@@ -20,7 +20,7 @@ dependencies = [
+ lmcache = ["lmcache"]
+ 
+ [build-system]
+-requires = ["setuptools>=61", "wheel", "torch==2.11.0+xpu"]
++requires = ["setuptools>=61", "wheel", "torch==2.12.0+xpu"]
+ build-backend = "setuptools.build_meta"
+ 
+ [tool.setuptools]
