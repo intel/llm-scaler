@@ -1553,6 +1553,38 @@ architecture solely based on the model directory name.
 
 #### Build and start a container
 
+The runtime applies `docker/runtime-xpu.constraints.txt` before installing
+vLLM or LMCache. This protects torch/triton-xpu/transformers and resolves the
+shared NumPy and OpenTelemetry versions consistently. LMCache's MP,
+filesystem and observability dependencies are maintained in
+`docker/lmcache_xpu_runtime_requirements.in`; the corresponding `.txt` is a
+generated, hash-verified lock, including Transformers' shared dependency
+bounds. Do not edit transitive pins by hand. Regenerate from `vllm/` using
+uv 0.12.5:
+
+```bash
+bash docker/compile_lmcache_xpu_requirements.sh
+# Deliberately refresh compatible transitive versions:
+bash docker/compile_lmcache_xpu_requirements.sh --upgrade
+```
+
+The same lock is also passed as constraints during vLLM's dependency resolution;
+incompatible shared requirements fail rather than being overwritten later.
+The lock targets Python 3.12 / Linux x86_64 and the source revisions in the
+Dockerfile. Re-run resolution and image validation when those change. This
+locks the LMCache/Transformers profile, not every optional vLLM dependency.
+The build checks the complete installed environment and fails on new missing
+or conflicting requirements, including shared packages outside this lock.
+Only exact, documented XPU metadata gaps are exempt: system oneCCL replaces
+torch's Python oneCCL packages, triton-xpu replaces xgrammar's triton, and the
+LMCache wheel still declares unused CUDA/cloud/Redis/test backends. Decord's
+wheel platform metadata is also exempt after a native import check. These
+exceptions never permit an installed dependency's version conflict.
+The build also exports a real OTLP trace to a local receiver and checks
+gRPC/Prometheus imports. CUDA/cloud backends and package-level optional extras
+remain separate work; do not replace this profile with LMCache's unfiltered
+cross-platform requirements.
+
 Build this checkout's image; an older released image may not include the
 LMCache integration or these safe defaults. Run the build from `vllm/`:
 

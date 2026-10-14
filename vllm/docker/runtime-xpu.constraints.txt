@@ -1,0 +1,26 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+# Serving ABI and versions shared by vLLM and LMCache. Applied before vLLM
+# resolution, not only after installing it. Native patched wheels use --no-deps.
+torch==2.12.0+xpu
+torchvision==0.27.0+xpu
+torchaudio==2.11.0+xpu
+triton-xpu==3.7.1
+xgrammar==0.2.8
+transformers==5.8.0
+huggingface-hub>=1.5.0,<2.0
+# datasets 5.1.0 (vLLM XPU dependency) bounds fsspec. Preserve the validated
+# filesystem and locking stack when resolving Hub's transitive dependencies.
+fsspec==2026.7.0
+filelock==3.32.3
+numpy==2.2.6
+setuptools==78.1.0
+opentelemetry-api==1.40.0
+opentelemetry-sdk==1.40.0
+opentelemetry-exporter-otlp==1.40.0
+opentelemetry-exporter-otlp-proto-common==1.40.0
+opentelemetry-exporter-otlp-proto-grpc==1.40.0
+opentelemetry-exporter-otlp-proto-http==1.40.0
+opentelemetry-proto==1.40.0
+opentelemetry-exporter-prometheus==0.61b0
+opentelemetry-semantic-conventions==0.61b0

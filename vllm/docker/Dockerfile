@@ -228,6 +228,17 @@ ENV VIRTUAL_ENV=/opt/venv \
 
 WORKDIR /llm-scaler/vllm
 
+# Use the same shared-package constraints in every runtime installation,
+# including vLLM's initial dependency resolution. Do not force a late downgrade.
+COPY ./docker/runtime-xpu.constraints.txt /opt/runtime-xpu.constraints.txt
+COPY ./docker/lmcache_xpu_runtime_requirements.txt /opt/lmcache_xpu_runtime_requirements.txt
+# pip enables hash checking even for hashes found in a constraints file. Use
+# plain generated pins for shared resolution; verify hashes when installing
+# the complete profile itself (the other serving packages are not hash-locked).
+RUN sed -n -E 's/^([A-Za-z0-9_.-]+==[^ ]+).*/\1/p' \
+    /opt/lmcache_xpu_runtime_requirements.txt > /opt/lmcache-xpu.constraints.txt
+ENV PIP_CONSTRAINT="/opt/runtime-xpu.constraints.txt /opt/lmcache-xpu.constraints.txt"
+
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update -y && \
@@ -247,7 +258,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 COPY --from=builder /src/vllm ./vllm
 COPY --from=builder /src/vllm-xpu-kernels ./vllm-xpu-kernels
 COPY --from=builder /src/custom-esimd-kernels-vllm ./custom-esimd-kernels-vllm
-COPY ./docker/lmcache_xpu_runtime_requirements.txt /tmp/lmcache_xpu_runtime_requirements.txt
+COPY ./docker/check_runtime_dependencies.py ./docker/check_runtime_observability.py /opt/runtime-checks/
 
 # --- thin runtime OS deps, vLLM + kernel wheels, lean-core serving deps, and the
 #     triton-xpu fix/shrink all in ONE layer: cleanup must happen in the same RUN
@@ -304,13 +315,17 @@ RUN --mount=type=bind,from=builder,source=/wheels,target=/wheels \
     ln -sf /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so && \
     ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl_openmp.so.0.1 /opt/venv/lib/libccl_openmp.so.0 && \
     ln -sf /opt/venv/lib/libccl_openmp.so.0 /opt/venv/lib/libccl_openmp.so && \
-    pip install --no-deps -r /tmp/lmcache_xpu_runtime_requirements.txt && \
+    pip install --require-hashes -r /opt/lmcache_xpu_runtime_requirements.txt && \
     pip install --no-deps --force-reinstall \
         /wheels/kvweave-*.whl \
         /wheels/lmcache-*.whl && \
     python -c 'import lmcache.xpu_ops, kvweave.kvweave_quant; print(lmcache.xpu_ops.__file__); print(kvweave.kvweave_quant.__file__)' && \
     python -c 'from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_mp_connector import LMCacheMPConnector; assert LMCacheMPConnector.__module__ == "lmcache.integration.vllm.lmcache_mp_connector"; print(LMCacheMPConnector)' && \
     python -c 'import importlib.metadata as m; names={d.metadata["Name"].lower().replace("_", "-") for d in m.distributions()}; assert "oneccl" not in names and "oneccl-devel" not in names; assert m.version("torch") == "2.12.0+xpu"; assert m.version("triton-xpu") == "3.7.1"' && \
+    python /opt/runtime-checks/check_runtime_dependencies.py \
+        --constraints /opt/runtime-xpu.constraints.txt \
+        --constraints /opt/lmcache_xpu_runtime_requirements.txt && \
+    python /opt/runtime-checks/check_runtime_observability.py && \
     TRITON=/opt/venv/lib/python3.12/site-packages/triton && \
     strip --strip-debug ${TRITON}/_C/libtriton.so && \
     rm -f ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git && \
