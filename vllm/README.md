@@ -319,16 +319,22 @@ Refer to [here](monitor/README.md) for details.
 
 ### 1.7 Build the v0.31.0 XPU Image
 
-This build adds Qwen3.8 and MiniCPM-V 4.7 support to vLLM v0.31.0. It is a
-separate build recipe; existing published llm-scaler image tags and the default
-Dockerfile are unchanged.
+This build adds Qwen3.8 and MiniCPM-V 4.7 support to vLLM v0.31.0. It follows
+the standard llm-scaler split: an OMIX development image builds native wheels,
+and a fresh OMIX runtime image receives only the runtime environment and wheels.
+An Intel PyTorch Ubuntu 26.04 image is not published, so the runtime uses OMIX
+and installs the matching PyTorch XPU wheels.
 
 | Component | Pinned input |
 | --- | --- |
 | vLLM | `v0.31.0`, commit `db9527a46873454610df6dbedf79a36d6bf1a7f6` |
 | vllm-xpu-kernels | Version `0.1.15.4` used by upstream `docker/Dockerfile.xpu`; source base `ddf336d86e3c8602888572a3502f951abd51df12` |
-| Runtime base | `vllm/vllm-openai-xpu@sha256:95ac815038c4b3537b173798bfe3b89bdf525a52bd653cd14d4deb01f1062be7` |
-| Native compiler | `intel-oneapi-compiler-dpcpp-cpp-2026.1=2026.1.1-325` |
+| Builder base | `intel/omix:0.4.0-devel-ubuntu26.04@sha256:59cef13f8e87275846cc08e01d32b49082694a5c01d842d2e845552cbc8c199f` |
+| Runtime base | `intel/omix:0.4.0-runtime-ubuntu26.04@sha256:a69b77be1ecc5784edc61023ef8d91c88899939dfa9f422af5a4474151dc071c` |
+| Python tool | `ghcr.io/astral-sh/uv:0.13.0@sha256:cdc6093146eb3ff6a40107b38f008b789e050e77ad87865e381d9917da55a168` |
+| Rust builder base | `ubuntu:22.04@sha256:5ec03bb3441e8b0bf3b4f9cd4629a1ae763010dc3035bb8da3ae6cf026486401` |
+| Python / PyTorch / Triton | `3.12.15` / `2.14.0+xpu` / `3.8.0+xpu` |
+| Native compiler | oneAPI DPC++ 2026.1 from the OMIX development image |
 | Python runtime packages | Transformers `5.18.0`, tokenizers `0.23.2`, huggingface-hub `1.31.0`, safetensors `0.8.0` |
 
 The exact source commit that produced the upstream kernels wheel is not attested;
@@ -358,7 +364,7 @@ The helper fetches exact commits, verifies each patch checksum, applies patches
 to the Git index, and checks the final tree hashes. It refuses to overwrite an
 existing checkout that does not match the recipe.
 
-#### Option A: Build from source directly to a runtime image
+#### Build from source directly to a runtime image
 
 ```bash
 docker buildx build --load \
@@ -369,41 +375,22 @@ docker buildx build --load \
   -t intel/llm-scaler-vllm:0.31.0-local vllm
 ```
 
-The `native-builder` stage adds the compiler and build tools. The `wheels` stage
-compiles the patched kernels and vLLM native extensions and packages both sources.
-Unmodified vLLM Rust artifacts are reused from the immutable release base rather
-than rebuilt. Kernel targets enable Xe2 and the default family, disable Xe3P, and
-enable `QWEN38_KERNELS_ENABLED`.
+The independent `rust-build` stage rebuilds vLLM's Rust executable and extension
+from the pinned source. The OMIX `native-builder` stage creates a managed Python
+3.12 environment with PyTorch 2.14 XPU. The `wheels` stage compiles the patched
+kernels and vLLM native extensions and packages both sources. Kernel targets
+enable Xe2 and the default family, disable Xe3P, and enable
+`QWEN38_KERNELS_ENABLED`.
 
-The final `runtime` stage starts again from the immutable release base, without
-the builder's added compiler, patched source checkouts or build tools. It verifies wheel checksums
-and installs the custom wheels and pinned Python packages using `--no-deps` to
-preserve the base image's PyTorch XPU/runtime stack.
+The final `runtime` stage starts again from the pinned OMIX runtime base, without
+the compiler, patched source checkouts or build tools. It creates the same Python
+3.12 and PyTorch 2.14 XPU environment, verifies wheel checksums, installs both
+custom wheels, and pins the coordinated Intel runtime packages used by upstream
+vLLM v0.31.0. It retains the OpenCL headers required when Triton's Intel driver
+JIT-compiles its runtime support module.
 
-#### Option B: Export wheels, then assemble runtime separately
-
-```bash
-docker buildx build \
-  -f vllm/docker/Dockerfile.v031 \
-  --build-context vllm-source="$BUILD_ROOT/sources/vllm" \
-  --build-context kernels-source="$BUILD_ROOT/sources/vllm-xpu-kernels" \
-  --build-arg MAX_JOBS=16 --target wheel-export \
-  --output "type=local,dest=$BUILD_ROOT/wheels" vllm
-
-docker buildx build --load \
-  -f vllm/docker/Dockerfile.v031.runtime \
-  --build-context wheels="$BUILD_ROOT/wheels" \
-  -t intel/llm-scaler-vllm:0.31.0-local vllm
-```
-
-The exported directory contains the two `.whl` files and `SHA256SUMS`.
-Keep it outside the repository; the runtime Dockerfile receives it through the
-named `wheels` context. Runtime assembly does not compile either project and is
-normally much faster than the native build. Use wheels built with this recipe
-and base image; an arbitrary pair of wheels is not interchangeable.
-
-Both image paths put wheels only in `/opt/wheels/`, use `/llm/` as the working
-directory, and set `ENTRYPOINT ["vllm", "serve"]` with multiprocessing `spawn`.
+The image puts wheels only in `/opt/wheels/`, uses `/llm/` as the working
+directory, and sets `ENTRYPOINT ["vllm", "serve"]` with multiprocessing `spawn`.
 The small Transformers compatibility module restores a removed video-processor
 docstring constant required by MiniCPM-V checkpoint remote code; it is not a
 launcher or a validation script. Start models directly with `vllm serve` (or pass
@@ -417,7 +404,7 @@ The images do not install corporate CA certificates. Use a network path trusted
 by the base image for package downloads; a TLS-inspecting proxy requiring a
 corporate CA will fail certificate verification. Source fetching on the host
 also requires working Git network/proxy/CA configuration. Changing the
-`XPU_BASE` argument requires rechecking ABI and runtime compatibility.
+OMIX base arguments requires rechecking ABI and runtime compatibility.
 
 ## 2. Advanced Features
 

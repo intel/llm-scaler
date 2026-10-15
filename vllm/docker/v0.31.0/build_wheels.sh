@@ -16,9 +16,6 @@ cd /src/vllm
 ln -s /opt/venv .venv
 ln -s /build/vllm build
 git config --add safe.directory /src/vllm
-# These contributions do not modify Rust; reuse the exact release artifacts.
-cp /opt/venv/lib/python3.12/site-packages/vllm/vllm-rs vllm/
-cp /opt/venv/lib/python3.12/site-packages/vllm/_rust_*.so vllm/
 VLLM_TARGET_DEVICE=xpu VLLM_VERSION_OVERRIDE=0.31.0+xpu.llmscaler \
   uv run --active --no-project python -m build --wheel --no-isolation --skip-dependency-check --outdir /opt/wheels
 cd /opt/wheels
