@@ -1,0 +1,102 @@
+// Explicit fused decode companion: identical pipeline, fixed down/finalize ROWS.
+// Released native binaries and their batch-dependent tuning remain untouched.
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/library.h>
+#include "esimd_kernels/utils.h"
+#include "esimd_kernels/moe_kquant_GEMV.h"
+#include "esimd_kernels/moe_shared_q8_GEMV.h"
+#include "esimd_kernels/moe_norm_router.h"
+#include "esimd_kernels/moe_up_fused.h"
+#include "esimd_kernels/moe_down_fin_fused.h"
+
+namespace {
+struct CacheMoeWorkspace {
+  at::Tensor xn, logits, sel, tw, inter_r, inter_sh, g;
+  int64_t M = -1, H = -1, E = -1, I = -1, S = -1, T = -1;
+  c10::DeviceIndex device = -1;
+};
+
+std::vector<at::Tensor> cache_moe_norm(
+    at::Tensor h, at::Tensor residual, at::Tensor nw, double eps,
+    at::Tensor router_w,
+    at::Tensor gate_ql, at::Tensor gate_sc, at::Tensor gate_mn,
+    at::Tensor up_ql, at::Tensor up_sc, at::Tensor up_mn,
+    at::Tensor down_ql, at::Tensor down_qh, at::Tensor down_sc, at::Tensor down_mn,
+    at::Tensor gu_qs, at::Tensor gu_sc, at::Tensor d_qs, at::Tensor d_sc,
+    at::Tensor wg, int64_t E, int64_t T, int64_t I, int64_t S,
+    bool down_is_q6, bool renorm) {
+  TORCH_CHECK(h.is_xpu() && h.dim() == 2 && h.scalar_type() == at::kHalf);
+  TORCH_CHECK(!down_is_q6, "consistent fused MoE currently supports Q5_K down only");
+  const int64_t M = h.size(0), H = h.size(1);
+  TORCH_CHECK(M > 0 && (H == 1024 || H == 2048 || H == 4096));
+  TORCH_CHECK(E > 0 && E <= 512 && T > 0 && T <= E && T <= 16);
+  TORCH_CHECK(I > 0 && I % 128 == 0 && S > 0 && S % 128 == 0);
+  for (const auto& tensor : {h, residual, nw, router_w, gate_sc, gate_mn,
+         up_sc, up_mn, down_sc, down_mn, gu_sc, d_sc, wg}) {
+    TORCH_CHECK(tensor.device() == h.device() && tensor.is_contiguous()
+                && tensor.scalar_type() == at::kHalf);
+  }
+  for (const auto& tensor : {gate_ql, up_ql, down_ql, down_qh}) {
+    TORCH_CHECK(tensor.device() == h.device() && tensor.is_contiguous()
+                && tensor.scalar_type() == at::kByte);
+  }
+  for (const auto& tensor : {gu_qs, d_qs}) {
+    TORCH_CHECK(tensor.device() == h.device() && tensor.is_contiguous()
+                && tensor.scalar_type() == at::kChar);
+  }
+  TORCH_CHECK(residual.sizes() == h.sizes() && nw.numel() == H && wg.numel() == H);
+  TORCH_CHECK(router_w.sizes() == at::IntArrayRef({E, H}));
+  TORCH_CHECK(gate_ql.sizes() == at::IntArrayRef({E, I, H / 2}) && up_ql.sizes() == gate_ql.sizes());
+  TORCH_CHECK(gate_sc.sizes() == at::IntArrayRef({E, I, H / 32}) && gate_mn.sizes() == gate_sc.sizes()
+              && up_sc.sizes() == gate_sc.sizes() && up_mn.sizes() == gate_sc.sizes());
+  TORCH_CHECK(down_ql.sizes() == at::IntArrayRef({E, H, I / 2})
+              && down_qh.sizes() == at::IntArrayRef({E, H, I / 8}));
+  TORCH_CHECK(down_sc.sizes() == at::IntArrayRef({E, H, I / 32}) && down_mn.sizes() == down_sc.sizes());
+  TORCH_CHECK(gu_qs.sizes() == at::IntArrayRef({2 * S, H}) && gu_sc.sizes() == at::IntArrayRef({2 * S, H / 32}));
+  TORCH_CHECK(d_qs.sizes() == at::IntArrayRef({H, S}) && d_sc.sizes() == at::IntArrayRef({H, S / 32}));
+
+  // Preserve the pooled scratch / four-launch fused decode pipeline. Outputs
+  // escape to all-reduce/residual consumers and must not alias pooled scratch.
+  static thread_local CacheMoeWorkspace ws;
+  if (ws.M != M || ws.H != H || ws.E != E || ws.I != I || ws.S != S || ws.T != T || ws.device != h.device().index()) {
+    ws.xn = at::empty({M, H}, h.options());
+    ws.logits = at::empty({M, E}, h.options());
+    ws.sel = at::empty({M * T}, h.options().dtype(at::kInt));
+    ws.tw = at::empty({M * T}, h.options());
+    ws.inter_r = at::empty({M * T, I}, h.options());
+    ws.inter_sh = at::empty({M, S}, h.options());
+    ws.g = at::empty({M}, h.options());
+    ws.M = M; ws.H = H; ws.E = E; ws.I = I; ws.S = S; ws.T = T; ws.device = h.device().index();
+  }
+  auto output = at::empty({M, H}, h.options());
+  auto next_residual = at::empty({M, H}, h.options());
+  auto& queue = c10::xpu::getCurrentXPUStream(h.device().index()).queue();
+  auto half = [](const at::Tensor& tensor) { return reinterpret_cast<fp16*>(tensor.data_ptr()); };
+  auto byte = [](const at::Tensor& tensor) { return tensor.data_ptr<uint8_t>(); };
+  auto quant = [](const at::Tensor& tensor) { return tensor.data_ptr<int8_t>(); };
+  auto* sel = ws.sel.data_ptr<int>();
+  TORCH_CHECK(moe_norm_router_host(half(h), half(residual), half(next_residual), half(nw), half(router_w),
+      half(ws.xn), half(ws.logits), (float)eps, M, H, E, queue), "unsupported norm/router shape");
+  moe_topk_gguf_host(half(ws.logits), sel, half(ws.tw), M, E, T, renorm, queue);
+  TORCH_CHECK(moe_up_fused_host(half(ws.xn), byte(gate_ql), half(gate_sc), half(gate_mn),
+      byte(up_ql), half(up_sc), half(up_mn), sel, half(ws.inter_r),
+      quant(gu_qs), half(gu_sc), half(wg), half(ws.inter_sh), half(ws.g),
+      M, H, I, T, S, queue), "consistent MoE requires fused up stage");
+  TORCH_CHECK(moe_down_fin_q5k_host(half(ws.inter_r), byte(down_ql), byte(down_qh), half(down_sc),
+      half(down_mn), sel, half(ws.tw), half(ws.inter_sh), quant(d_qs), half(d_sc), half(ws.g),
+      half(output), M, H, I, T, S, queue, 1), "consistent MoE requires fused down/finalize stage");
+  return {output, next_residual};
+}
+} // namespace
+
+TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_sglang, m) {
+  m.def("esimd_moe_forward_full_gguf_norm_consistent(Tensor h, Tensor residual, Tensor norm_w, float eps, Tensor router_w, "
+        "Tensor gate_ql, Tensor gate_sc, Tensor gate_mn, Tensor up_ql, Tensor up_sc, Tensor up_mn, "
+        "Tensor down_ql, Tensor down_qh, Tensor down_sc, Tensor down_mn, "
+        "Tensor gu_qs, Tensor gu_sc, Tensor d_qs, Tensor d_sc, Tensor wg, "
+        "int n_experts, int top_k, int intermediate, int inter_s, bool down_is_q6, bool renorm) -> Tensor[]");
+}
+TORCH_LIBRARY_IMPL(custom_esimd_kernels_sglang, XPU, m) {
+  m.impl("esimd_moe_forward_full_gguf_norm_consistent", &cache_moe_norm);
+}

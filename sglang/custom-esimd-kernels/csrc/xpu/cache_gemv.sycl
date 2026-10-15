@@ -1,0 +1,87 @@
+// Explicit cache-consistency companion. Existing fast GEMV/DPAS APIs untouched.
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+#include "esimd_kernels/utils.h"
+#include "esimd_kernels/q8_0_GEMV.h"
+
+// Match the legacy M=1 reduction exactly: 32 lanes per quant block and the
+// same N/K-dependent K split. Batch size only changes the grid, not arithmetic.
+template<int KS>
+struct CacheQ8Gemv {
+  const fp16* input;
+  const int8_t* weight;
+  const fp16* scale;
+  fp16* output;
+  int N, K;
+
+  void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+    if constexpr (KS > 1) slm_init<KS * sizeof(float)>();
+    const int n = item.get_group(0) % N;
+    const int m = item.get_group(0) / N;
+    const int lid = item.get_local_id(0);
+    const int kp = K / KS;
+    const int kstart = lid * kp;
+    simd<float, Q8_0_GROUP> acc = 0.0f;
+    const int8_t* w_row = weight + (size_t)n * K;
+    const fp16* s_row = scale + (size_t)n * (K / Q8_0_GROUP);
+    const fp16* x_row = input + (size_t)m * K;
+    int group_idx = kstart / Q8_0_GROUP;
+    for (int k = kstart; k < kstart + kp; k += Q8_0_GROUP) {
+      simd<fp16, Q8_0_GROUP> iv = block_load<fp16, Q8_0_GROUP>(x_row + k);
+      simd<int8_t, Q8_0_GROUP> raw = block_load<int8_t, Q8_0_GROUP>(w_row + k);
+      simd<float, Q8_0_GROUP> wf = convert<float>(raw);
+      float s = static_cast<float>(s_row[group_idx]);
+      group_idx += 1;
+      acc += simd<float, Q8_0_GROUP>(iv) * (wf * s);
+    }
+    float my_sum = reduce<float>(acc, std::plus<>());
+    if constexpr (KS == 1) {
+      output[(size_t)m * N + n] = fp16(my_sum);
+    } else {
+      slm_block_store<float, 1>(lid * sizeof(float), simd<float, 1>(my_sum));
+      barrier();
+      if (lid == 0) {
+        simd<float, KS> parts = slm_block_load<float, KS>(0);
+        output[(size_t)m * N + n] = fp16(reduce<float>(parts, std::plus<>()));
+      }
+    }
+  }
+};
+
+void cache_q8_gemv(at::Tensor input, at::Tensor weight, at::Tensor scale, at::Tensor output) {
+  TORCH_CHECK(input.is_xpu() && weight.device() == input.device() && scale.device() == input.device()
+              && output.device() == input.device(), "all tensors must be on the same XPU");
+  TORCH_CHECK(input.scalar_type() == at::kHalf && weight.scalar_type() == at::kChar
+              && scale.scalar_type() == at::kHalf && output.scalar_type() == at::kHalf,
+              "expected fp16 input/scale/output and int8 quants");
+  TORCH_CHECK(input.dim() == 2 && weight.dim() == 2 && scale.dim() == 2 && output.dim() == 2);
+  TORCH_CHECK(input.is_contiguous() && weight.is_contiguous() && scale.is_contiguous() && output.is_contiguous());
+  const int M = input.size(0), K = input.size(1), N = weight.size(0);
+  TORCH_CHECK(K > 0 && K % 32 == 0 && N > 0 && weight.size(1) == K);
+  TORCH_CHECK(scale.size(0) == N && scale.size(1) == K / 32);
+  TORCH_CHECK(output.size(0) == M && output.size(1) == N);
+  if (!M) return;
+  int ks;
+  select_ks_q8_0(N, K, ks);
+  auto& queue = c10::xpu::getCurrentXPUStream(input.device().index()).queue();
+  const auto* x = reinterpret_cast<const fp16*>(input.data_ptr());
+  const auto* w = weight.data_ptr<int8_t>();
+  const auto* s = reinterpret_cast<const fp16*>(scale.data_ptr());
+  auto* y = reinterpret_cast<fp16*>(output.data_ptr());
+#define CACHE_LAUNCH(S) queue.submit([&](sycl::handler& h) { \
+  h.parallel_for(sycl::nd_range<1>((size_t)M * N * S, S), CacheQ8Gemv<S>{x, w, s, y, N, K}); })
+  if (ks == 8) { CACHE_LAUNCH(8); }
+  else if (ks == 4) { CACHE_LAUNCH(4); }
+  else if (ks == 2) { CACHE_LAUNCH(2); }
+  else { CACHE_LAUNCH(1); }
+#undef CACHE_LAUNCH
+}
+
+TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_sglang, m) {
+  m.def("esimd_gemv_q8_0_consistent(Tensor input, Tensor weight, Tensor scale, Tensor! output) -> ()");
+}
+TORCH_LIBRARY_IMPL(custom_esimd_kernels_sglang, XPU, m) {
+  m.impl("esimd_gemv_q8_0_consistent", &cache_q8_gemv);
+}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}
