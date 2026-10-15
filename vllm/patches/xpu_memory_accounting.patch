@@ -1,0 +1,22 @@
+diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
+--- a/vllm/platforms/xpu.py
++++ b/vllm/platforms/xpu.py
+@@ -91,12 +91,13 @@ def get_mem_info_wrapper(
+             f"device must be int, str, torch.device, or None, got {type(device)}"
+         )
+ 
+-    # Call the underlying C++ implementation
++    # Use the allocator's capacity consistently with get_device_properties and
++    # gpu_memory_utilization. Level Zero totalSize excludes UMD headroom, while
++    # PyTorch's total includes it. Keep the more conservative live free value,
++    # including a genuine zero, so request_memory still guards usable capacity.
+     free, total = torch.ops._C_cache_ops.getMemoryInfo(device)
+-    if free == 0:
+-        native_free, native_total = torch.xpu.mem_get_info(device)
+-        if native_free > 0:
+-            free, total = native_free, native_total
++    native_free, native_total = torch.xpu.mem_get_info(device)
++    free, total = min(free, native_free), native_total
+ 
+     return free, total
+ 
