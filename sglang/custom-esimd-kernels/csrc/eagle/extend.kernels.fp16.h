@@ -52,7 +52,8 @@ ESIMD_INLINE void chunkGatedDeltaRuleExtendFp16(
   uint32_t headDim,       // = 128
   uint32_t hChunkSize,    // token stride between successive h snapshots (0 = disabled)
   float    qScale,
-  sycl::nd_item<2>& ndi)
+  sycl::nd_item<2>& ndi,
+  uint32_t stateRoundChunkSize = 0)
 {
   // SLM budget: 16 threads * 128 floats for output reduction +
   //             128 floats for v_pred buffer.
@@ -134,6 +135,20 @@ ESIMD_INLINE void chunkGatedDeltaRuleExtendFp16(
   namespace xens = sycl::ext::intel::experimental::esimd;
   for (uint32_t tRel = 0; tRel < nTokSeq; tRel++) {
     const uint32_t t = tStart + tRel;
+
+    // A reusable FP16 checkpoint and the live recurrence must represent the
+    // same state. Round the live registers at every canonical page boundary,
+    // independently of whether this invocation emits an h snapshot. Prefix
+    // reuse is page aligned in the explicitly gated single-request mode.
+    if (stateRoundChunkSize > 0 && tRel > 0 &&
+        tRel % stateRoundChunkSize == 0) {
+      #pragma unroll
+      for (int r = 0; r < 8; r++) {
+        simd<StateT, 128> persisted =
+            fp32InS_persistent.select<128, 1>(r * 128);
+        fp32InS_persistent.select<128, 1>(r * 128) = persisted;
+      }
+    }
 
     // --- h snapshot: state *before* this token, i.e. after hSnapIdx chunks --
     if (emitH && tRel == hNextSnapTok) {

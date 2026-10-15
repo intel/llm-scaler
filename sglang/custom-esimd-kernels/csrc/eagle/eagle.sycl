@@ -5,6 +5,7 @@
 #include <random>
 #include <sstream>
 #include <fstream>
+#include <cstdlib>
 using fp16 = sycl::half;
 using namespace sycl::ext::intel::esimd;
 using namespace sycl::ext::intel::esimd::xmx;
@@ -658,6 +659,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_e
   // State dtype (mamba_ssm_dtype): fp32 or fp16. Recurrence math always fp32;
   // only the persisted state load/store uses this dtype.
   const bool stateIsHalf = (initial_state.scalar_type() == torch::kHalf);
+  const char* consistent = std::getenv("SGLANG_XPU_GGUF_KERNEL_CONSISTENCY");
+  const uint32_t stateRoundChunk =
+      stateIsHalf && consistent && std::string(consistent) == "1" ? 64 : 0;
 
   switch (q.scalar_type()) {
     case torch::kHalf:
@@ -667,7 +671,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_e
             range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
               chunkGatedDeltaRuleExtendFp16<sycl::half>(
                 qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, hPtr, cuPtr,
-                headQk, headV, headDim, hChunk, qScale, ndi);
+                headQk, headV, headDim, hChunk, qScale, ndi, stateRoundChunk);
             });
         };
       } else {
@@ -676,7 +680,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_e
             range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
               chunkGatedDeltaRuleExtendFp16<float>(
                 qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, hPtr, cuPtr,
-                headQk, headV, headDim, hChunk, qScale, ndi);
+                headQk, headV, headDim, hChunk, qScale, ndi, stateRoundChunk);
             });
         };
       }
