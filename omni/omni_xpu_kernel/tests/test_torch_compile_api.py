@@ -42,7 +42,9 @@ APIS = {
     "sdp": ("sdp",),
     "linear": ("onednn_w8a16_fp8", "try_onednn_w8a16_fp8"),
     "layout": ("cat_pad_bmg",),
-    "kitchen": ("deltanet_conv_step", "gated_delta_decode_fused",
+    "kitchen": ("decode_attention", "decode_step_merge", "int8_decode_update", "int8_decode",
+                "deltanet_conv_deferred", "gated_delta_decode_deferred",
+                "deltanet_conv_step", "gated_delta_decode_fused",
                 "gemv_awq_w4a16",
                 "group_norm_silu_pad3d", "group_norm_silu_pad3d_out",
                 "fp16_linear", "fp16_conv3d", "fp16_conv3d_out",
@@ -111,6 +113,36 @@ def case(api, *, dtype=torch.bfloat16, rows=3):
         weight = _rand((1024, 2048), torch.float32).to(torch.float8_e4m3fn)
         return function, (x, weight, torch.full((1024,), 0.125, device="xpu")), {}
     if module == "kitchen":
+        if name == "deltanet_conv_deferred":
+            return function, (_rand((1,2,16)),_rand((1,16,3)),_rand((16,4)),None,
+                              _rand((2,1,8,16)),_rand((2,1,16,8)),
+                              torch.tensor([0,0],device="xpu",dtype=torch.int32)), {}
+        if name == "gated_delta_decode_deferred":
+            x=_rand((1,2,32));weight=_rand((2,32));dt=_rand((2,),torch.float32)
+            return function, (x,weight,weight,dt,-dt.abs()-.5,_rand((1,2,128,128),torch.float32),
+                128,1,128**-.5,_rand((1,2,256)),torch.ones(128,device="xpu",dtype=x.dtype),1e-6,
+                _rand((2,1,512,8)),_rand((2,1,8,2,2),torch.float32),_rand((2,1,8,1,2),torch.float32),
+                torch.tensor([0,0],device="xpu",dtype=torch.int32)), {}
+        if name in ("int8_decode_update", "int8_decode"):
+            sk = _rand((1,1,512,256))
+            sv = torch.randn_like(sk)
+            key = torch.zeros(1,1,1,512,256,device="xpu",dtype=torch.int8)
+            value = torch.zeros(1,1,1,256,512,device="xpu",dtype=torch.int8)
+            ks = torch.ones(1,1,1,32,device="xpu")
+            vs = torch.ones(1,1,1,256,device="xpu")
+            length = torch.tensor([257],device="xpu",dtype=torch.int64)
+            if name == "int8_decode_update":
+                return function, (sk,sv,key,value,ks,vs,length,512,True), {}
+            kitchen.int8_decode_update(sk,sv,key,value,ks,vs,length,512,True)
+            return function, (_rand((1,2,1,256)),key,value,ks,vs,length,512), {}
+        if name in ("decode_attention", "decode_step_merge"):
+            q = _rand((1, 4, 2, 256))
+            k = _rand((1, 2, 7 if name == "decode_attention" else 2, 256))
+            v = torch.randn_like(k)
+            if name == "decode_attention":
+                return function, (q,k,v,torch.tensor([7], device="xpu", dtype=torch.int32)), {}
+            return function, (_rand((1,2,1024)), _rand((1,4,2),torch.float32), q,k,v,
+                              torch.empty(1,2,1024,device="xpu",dtype=torch.bfloat16)), {}
         if name == "gemv_awq_w4a16":
             x = _rand((1, 128), torch.bfloat16)
             packed = torch.randint(
@@ -333,7 +365,7 @@ def test_public_tensor_inventory_has_no_unclassified_api():
     assert controls == RUNTIME_CONTROLS
     assert not controls.intersection(API_NAMES)
     assert actual == set(API_NAMES)
-    assert len(actual) == 87
+    assert len(actual) == 93
 
 
 @pytest.mark.parametrize("api", API_NAMES)

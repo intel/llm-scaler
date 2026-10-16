@@ -61,8 +61,9 @@ pinned provider source wheels. The provider manifests declare which official
 versions each source wheel accepts, and image validation checks both identities.
 For the ComfyUI 0.39.0 candidate, official Kitchen 0.2.37 uses the matching
 0.2.37 provider source at `xiangyuT/comfy-kitchen-xpu`
-(`c2b77e7229bcb1917a5bf3145dc45cbe8fc389a9`, merged by
-[PR #12](https://github.com/xiangyuT/comfy-kitchen-xpu/pull/12)). Official AIMDO 0.5.5 uses
+(`49b0aa14aed3a60b148c95658b025a6f38fd6464`). This provider includes the native XPU LLM
+decode/cache and deferred-state adapters paired with the Omni kernels in this
+checkout. Official AIMDO 0.5.5 uses
 the matching 0.5.5 provider source at `xiangyuT/comfy-aimdo-xpu`
 (`80ef0f9abdb384a47d81058b4bec87a201ff63e4`). Both provider manifests
 accept their matching official 0.2.37 and 0.5.5 versions. The ComfyUI release
