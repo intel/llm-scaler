@@ -1206,6 +1206,7 @@ setup(
             ".libs/*.dll",
             ".libs/onednn/*",
             "policies/*.json",
+            "licenses/*.txt",
         ],
     },
     include_package_data=True,

@@ -16,6 +16,7 @@
 #include "device_utils.h"
 #include "kernel_tuning_overrides.h"
 #include "utils.h"
+#include "kitchen_decode.h"
 
 namespace omni_xpu {
 namespace kitchen {
@@ -934,6 +935,14 @@ PYBIND11_MODULE(_C, m) {
 
     auto kitchen = m.def_submodule(
         "kitchen", "Native Comfy Kitchen XPU operators");
+    kitchen.def("decode_attention", &omni_xpu::kitchen::decode_attention,
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("lengths"), py::arg("causal")=true);
+    kitchen.def("decode_step_merge", &omni_xpu::kitchen::decode_step_merge,
+        py::arg("out"), py::arg("lse"), py::arg("q"), py::arg("k"), py::arg("v"), py::arg("merged"));
+    kitchen.def("int8_decode_update", &omni_xpu::kitchen::int8_decode_update);
+    kitchen.def("int8_decode", &omni_xpu::kitchen::int8_decode);
+    kitchen.def("deltanet_conv_deferred", &omni_xpu::kitchen::deltanet_conv_deferred);
+    kitchen.def("gated_delta_decode_deferred", &omni_xpu::kitchen::gated_delta_decode_deferred);
     kitchen.def(
         "deltanet_conv_step",
         &omni_xpu::kitchen::deltanet_conv_step,
