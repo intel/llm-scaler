@@ -12,7 +12,8 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    1.3 [Pulling and Running the vllm Docker Container](#13-pulling-and-running-the-vllm-docker-container)  
    1.4 [Launching the Serving Service](#14-launching-the-serving-service)  
    1.5 [Benchmarking the Service](#15-benchmarking-the-service)  
-   1.6 [(Optional) Monitoring the Service with Prometheus and Grafana](#16-optional-monitoring-the-service-with-prometheus-and-grafana)
+   1.6 [(Optional) Monitoring the Service with Prometheus and Grafana](#16-optional-monitoring-the-service-with-prometheus-and-grafana)<br>
+   1.7 [Build the v0.31.0 XPU Image](#17-build-the-v0310-xpu-image)
 2. [Advanced Features](#2-advanced-features)  
    2.1 [CCL Support (both P2P & USM)](#21-ccl-support-both-p2p--usm)  
    2.2 [INT4 and FP8 Quantized Online Serving](#22-int4-and-fp8-quantized-online-serving)  
@@ -314,6 +315,95 @@ vllm bench serve \
 ### 1.6 (Optional) Monitoring the Service with Prometheus and Grafana
 
 Refer to [here](monitor/README.md) for details.
+
+### 1.7 Build the v0.31.0 XPU Image
+
+This build adds Qwen3.8 and MiniCPM-V 4.7 support to vLLM v0.31.0. It follows
+the standard llm-scaler split: an OMIX development image builds native wheels,
+and a fresh OMIX runtime image receives only the runtime environment and wheels.
+An Intel PyTorch Ubuntu 26.04 image is not published, so the runtime uses OMIX
+and installs the matching PyTorch XPU wheels.
+
+| Component | Pinned input |
+| --- | --- |
+| vLLM | `v0.31.0`, commit `db9527a46873454610df6dbedf79a36d6bf1a7f6` |
+| vllm-xpu-kernels | Version `0.1.15.4` used by upstream `docker/Dockerfile.xpu`; source base `ddf336d86e3c8602888572a3502f951abd51df12` |
+| Builder base | `intel/omix:0.4.0-devel-ubuntu26.04@sha256:59cef13f8e87275846cc08e01d32b49082694a5c01d842d2e845552cbc8c199f` |
+| Runtime base | `intel/omix:0.4.0-runtime-ubuntu26.04@sha256:a69b77be1ecc5784edc61023ef8d91c88899939dfa9f422af5a4474151dc071c` |
+| Python tool | `ghcr.io/astral-sh/uv:0.13.0@sha256:cdc6093146eb3ff6a40107b38f008b789e050e77ad87865e381d9917da55a168` |
+| Rust builder base | `ubuntu:22.04@sha256:5ec03bb3441e8b0bf3b4f9cd4629a1ae763010dc3035bb8da3ae6cf026486401` |
+| Python / PyTorch / Triton | `3.12.15` / `2.14.0+xpu` / `3.8.0+xpu` |
+| Native compiler | oneAPI DPC++ 2026.1 from the OMIX development image |
+| Python runtime packages | Transformers `5.18.0`, tokenizers `0.23.2`, huggingface-hub `1.31.0`, safetensors `0.8.0` |
+
+The exact source commit that produced the upstream kernels wheel is not attested;
+the source base above is the downstream build input, not a claim of exact upstream
+wheel provenance. Source revisions, patch checksums and final Git tree hashes are
+recorded in [sources.json](patches/v0.31.0/sources.json).
+The patch series contains runtime/build changes only, excluding tests, benchmarks,
+docs and CI changes. No validation reports, model launchers, wheels or local
+certificates are committed.
+
+Run the following commands from the repository root. Docker Buildx/BuildKit,
+Git, Python 3.12 via `uv`, internet access, and sufficient RAM/disk are required.
+The native build uses a memory-backed `/build`; lower `MAX_JOBS` on smaller hosts.
+GPU access is not needed to build the image.
+
+#### Prepare the pinned, patched sources
+
+```bash
+uv venv --python 3.12 .venv-build-v031
+BUILD_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/llm-scaler-v031.XXXXXX")
+.venv-build-v031/bin/python vllm/docker/v0.31.0/prepare_sources.py \
+  --manifest vllm/patches/v0.31.0/sources.json \
+  --root "$BUILD_ROOT/sources"
+```
+
+The helper fetches exact commits, verifies each patch checksum, applies patches
+to the Git index, and checks the final tree hashes. It refuses to overwrite an
+existing checkout that does not match the recipe.
+
+#### Build from source directly to a runtime image
+
+```bash
+docker buildx build --load \
+  -f vllm/docker/Dockerfile \
+  --build-context vllm-source="$BUILD_ROOT/sources/vllm" \
+  --build-context kernels-source="$BUILD_ROOT/sources/vllm-xpu-kernels" \
+  --build-arg MAX_JOBS=16 \
+  -t intel/llm-scaler-vllm:0.31.0-local vllm
+```
+
+The independent `rust-build` stage rebuilds vLLM's Rust executable and extension
+from the pinned source. The OMIX `native-builder` stage creates a managed Python
+3.12 environment with PyTorch 2.14 XPU. The `wheels` stage compiles the patched
+kernels and vLLM native extensions and packages both sources. Kernel targets
+enable Xe2 and the default family, disable Xe3P, and enable
+`QWEN38_KERNELS_ENABLED`.
+
+The final `runtime` stage starts again from the pinned OMIX runtime base, without
+the compiler, patched source checkouts or build tools. It creates the same Python
+3.12 and PyTorch 2.14 XPU environment, verifies wheel checksums, installs both
+custom wheels, and pins the coordinated Intel runtime packages used by upstream
+vLLM v0.31.0. It retains the OpenCL headers required when Triton's Intel driver
+JIT-compiles its runtime support module.
+
+The image puts wheels only in `/opt/wheels/`, uses `/llm/` as the working
+directory, and sets `ENTRYPOINT ["vllm", "serve"]` with multiprocessing `spawn`.
+The small Transformers compatibility module restores a removed video-processor
+docstring constant required by MiniCPM-V checkpoint remote code; it is not a
+launcher or a validation script. Start models directly with `vllm serve` (or pass
+model arguments to the image entrypoint), with your GPU and model mounts.
+
+For a proxy, add `--build-arg http_proxy --build-arg https_proxy --build-arg no_proxy`
+after exporting those variables. The Dockerfile retains explicit proxy ARGs;
+values supplied at build time can appear in image history. For public images,
+check the build history for internal endpoints before publishing.
+The images do not install corporate CA certificates. Use a network path trusted
+by the base image for package downloads; a TLS-inspecting proxy requiring a
+corporate CA will fail certificate verification. Source fetching on the host
+also requires working Git network/proxy/CA configuration. Changing the
+OMIX base arguments requires rechecking ABI and runtime compatibility.
 
 ## 2. Advanced Features
 
