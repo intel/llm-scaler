@@ -458,9 +458,7 @@ fastapi==0.136.3 \
 filelock==3.32.3 \
     --hash=sha256:0ffa185a3540854c95caa7fa76b76cb219d907415e2c5dc9af25fd970563487f \
     --hash=sha256:7f0ca4bcc0e181c60dbbd8aa9ab5b120ebb99e4e064e83636340056f833a1f09
-    # via
-    #   -c runtime-xpu.constraints.txt
-    #   huggingface-hub
+    # via huggingface-hub
 frozenlist==1.8.0 \
     --hash=sha256:0325024fe97f94c41c08872db482cf8ac4800d80e79222c6b0b7b162d5b13686 \
     --hash=sha256:032efa2674356903cd0261c4317a561a6850f3ac864a63fc1583147fb05a79b0 \
@@ -598,9 +596,7 @@ frozenlist==1.8.0 \
 fsspec==2026.7.0 \
     --hash=sha256:b57ddbafedfaef7018c1ecab32aa200a9d7ca26b77965f64e48b70061249d279 \
     --hash=sha256:c803c40f4cf860b49dea58ee3e1c33cb9c790520e233537e1340049f89b82a88
-    # via
-    #   -c runtime-xpu.constraints.txt
-    #   huggingface-hub
+    # via huggingface-hub
 googleapis-common-protos==1.75.3 \
     --hash=sha256:57c435ac2c68b108999b6db075d9053e4d7a936ba57b4a3d45667b1346f1738a \
     --hash=sha256:a018d2bf098ca9fb6faa08d5bb780e2a2c2f73c566f069761331386c9596d3f2
@@ -751,7 +747,6 @@ huggingface-hub==1.33.0 \
     --hash=sha256:04e434b06e100eddbce9a6e817d72693a7884b10a79bd67ab48080d5c07eb899 \
     --hash=sha256:367be21a201db9523eddf8aeac7048f2602c1b308691c97640d5e72ed188007e
     # via
-    #   -c runtime-xpu.constraints.txt
     #   -r lmcache_xpu_runtime_requirements.in
     #   tokenizers
     #   transformers
@@ -1087,7 +1082,6 @@ numpy==2.2.6 \
     --hash=sha256:fe27749d33bb772c80dcd84ae7e8df2adc920ae8297400dabec45f0dedb3f6de \
     --hash=sha256:fee4236c876c4e8369388054d02d0e9bb84821feb1a64dd59e137e6511a551f8
     # via
-    #   -c runtime-xpu.constraints.txt
     #   -r lmcache_xpu_runtime_requirements.in
     #   numba
     #   transformers
@@ -1095,7 +1089,6 @@ opentelemetry-api==1.40.0 \
     --hash=sha256:159be641c0b04d11e9ecd576906462773eb97ae1b657730f0ecf64d32071569f \
     --hash=sha256:82dd69331ae74b06f6a874704be0cfaa49a1650e1537d4a813b86ecef7d0ecf9
     # via
-    #   -c runtime-xpu.constraints.txt
     #   -r lmcache_xpu_runtime_requirements.in
     #   opentelemetry-exporter-otlp-proto-grpc
     #   opentelemetry-exporter-otlp-proto-http
@@ -1105,39 +1098,29 @@ opentelemetry-api==1.40.0 \
 opentelemetry-exporter-otlp==1.40.0 \
     --hash=sha256:48c87e539ec9afb30dc443775a1334cc5487de2f72a770a4c00b1610bf6c697d \
     --hash=sha256:7caa0870b95e2fcb59d64e16e2b639ecffb07771b6cd0000b5d12e5e4fef765a
-    # via
-    #   -c runtime-xpu.constraints.txt
-    #   -r lmcache_xpu_runtime_requirements.in
+    # via -r lmcache_xpu_runtime_requirements.in
 opentelemetry-exporter-otlp-proto-common==1.40.0 \
     --hash=sha256:1cbee86a4064790b362a86601ee7934f368b81cd4cc2f2e163902a6e7818a0fa \
     --hash=sha256:7081ff453835a82417bf38dccf122c827c3cbc94f2079b03bba02a3165f25149
     # via
-    #   -c runtime-xpu.constraints.txt
     #   opentelemetry-exporter-otlp-proto-grpc
     #   opentelemetry-exporter-otlp-proto-http
 opentelemetry-exporter-otlp-proto-grpc==1.40.0 \
     --hash=sha256:2aa0ca53483fe0cf6405087a7491472b70335bc5c7944378a0a8e72e86995c52 \
     --hash=sha256:bd4015183e40b635b3dab8da528b27161ba83bf4ef545776b196f0fb4ec47740
-    # via
-    #   -c runtime-xpu.constraints.txt
-    #   opentelemetry-exporter-otlp
+    # via opentelemetry-exporter-otlp
 opentelemetry-exporter-otlp-proto-http==1.40.0 \
     --hash=sha256:a8d1dab28f504c5d96577d6509f80a8150e44e8f45f82cdbe0e34c99ab040069 \
     --hash=sha256:db48f5e0f33217588bbc00274a31517ba830da576e59503507c839b38fa0869c
-    # via
-    #   -c runtime-xpu.constraints.txt
-    #   opentelemetry-exporter-otlp
+    # via opentelemetry-exporter-otlp
 opentelemetry-exporter-prometheus==0.61b0 \
     --hash=sha256:3013b41f4370143d48d219a2351473761423e5882fa4c213811eaefacba39cb7 \
     --hash=sha256:7c4919bd8e79abd62b610767e80f42c9c3a06c5183f4dd9141eedeb57aea284b
-    # via
-    #   -c runtime-xpu.constraints.txt
-    #   -r lmcache_xpu_runtime_requirements.in
+    # via -r lmcache_xpu_runtime_requirements.in
 opentelemetry-proto==1.40.0 \
     --hash=sha256:03f639ca129ba513f5819810f5b1f42bcb371391405d99c168fe6937c62febcd \
     --hash=sha256:266c4385d88923a23d63e353e9761af0f47a6ed0d486979777fe4de59dc9b25f
     # via
-    #   -c runtime-xpu.constraints.txt
     #   opentelemetry-exporter-otlp-proto-common
     #   opentelemetry-exporter-otlp-proto-grpc
     #   opentelemetry-exporter-otlp-proto-http
@@ -1145,7 +1128,6 @@ opentelemetry-sdk==1.40.0 \
     --hash=sha256:18e9f5ec20d859d268c7cb3c5198c8d105d073714db3de50b593b8c1345a48f2 \
     --hash=sha256:787d2154a71f4b3d81f20524a8ce061b7db667d24e46753f32a7bc48f1c1f3f1
     # via
-    #   -c runtime-xpu.constraints.txt
     #   -r lmcache_xpu_runtime_requirements.in
     #   opentelemetry-exporter-otlp-proto-grpc
     #   opentelemetry-exporter-otlp-proto-http
@@ -1153,9 +1135,7 @@ opentelemetry-sdk==1.40.0 \
 opentelemetry-semantic-conventions==0.61b0 \
     --hash=sha256:072f65473c5d7c6dc0355b27d6c9d1a679d63b6d4b4b16a9773062cb7e31192a \
     --hash=sha256:fa530a96be229795f8cef353739b618148b0fe2b4b3f005e60e262926c4d38e2
-    # via
-    #   -c runtime-xpu.constraints.txt
-    #   opentelemetry-sdk
+    # via opentelemetry-sdk
 packaging==26.3 \
     --hash=sha256:94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79 \
     --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
@@ -1793,13 +1773,6 @@ safetensors==0.8.0 \
     # via
     #   -r lmcache_xpu_runtime_requirements.in
     #   transformers
-setuptools==78.1.0 \
-    --hash=sha256:18fd474d4a82a5f83dac888df697af65afa82dec7323d09c3e37d1f14288da54 \
-    --hash=sha256:3e386e96793c8702ae83d17b853fb93d3e09ef82ec62722e61da5cd22376dcd8
-    # via
-    #   -c runtime-xpu.constraints.txt
-    #   -r lmcache_xpu_runtime_requirements.in
-    #   setuptools-scm
 setuptools-scm==10.3.4 \
     --hash=sha256:82f34c3e3084fc2b57d397200637cc13f2338004052d2fee47baa5f0e902464e \
     --hash=sha256:a69f28bfc245608781205e912faae437c2b2165773afa4e7b979d77447a69dd2
@@ -1851,9 +1824,7 @@ tqdm==4.70.1 \
 transformers==5.8.0 \
     --hash=sha256:6cc9a1f0291d16b1c1b735bad775e78ebefff7722701d4e28f98aaaa2bd6fb91 \
     --hash=sha256:e9d2cae6d195a7e1e05164c5ebf26142a7044e4dc4267274f4809204f92827e4
-    # via
-    #   -c runtime-xpu.constraints.txt
-    #   -r lmcache_xpu_runtime_requirements.in
+    # via -r lmcache_xpu_runtime_requirements.in
 typer==0.27.3 \
     --hash=sha256:d0396f770a560ab1b0a8504e13b5f254b728cedb05c61cf0359e944e50ce8901 \
     --hash=sha256:e50022f28b82a86313e54501317a1db64bf8f8d036ff8cfe5ca7e47675454aff
@@ -1862,8 +1833,6 @@ typing-extensions==4.16.0 \
     --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8 \
     --hash=sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5
     # via
-    #   aiohttp
-    #   aiosignal
     #   anyio
     #   fastapi
     #   grpcio
@@ -1875,7 +1844,6 @@ typing-extensions==4.16.0 \
     #   opentelemetry-semantic-conventions
     #   pydantic
     #   pydantic-core
-    #   starlette
     #   typing-inspection
 typing-inspection==0.4.4 \
     --hash=sha256:547274fa6b0a561ccf549cc9524b999a578e737d015d8709d021f9d0d13bea47 \
