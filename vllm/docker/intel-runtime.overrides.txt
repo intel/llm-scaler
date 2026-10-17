@@ -1,0 +1,13 @@
+# Official vLLM v0.31.0 docker/Dockerfile.xpu runtime replacements.
+# Torch 2.14.0+xpu metadata still pins the earlier 2026.1.0 / 2022.1.1
+# releases. Apply these overrides during EVERY dependency resolution.
+intel-cmplr-lib-rt==2026.1.1
+intel-cmplr-lib-ur==2026.1.1
+intel-cmplr-lic-rt==2026.1.1
+intel-sycl-rt==2026.1.1
+dpcpp-cpp-rt==2026.1.1
+intel-opencl-rt==2026.1.1
+intel-openmp==2026.1.1
+oneccl==2022.1.2
+oneccl-devel==2022.1.2
+intel-pti==1.1.0
