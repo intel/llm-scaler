@@ -70,7 +70,7 @@ inline bool moe_down_fin_q5k_host(
     const fp16* inter_sh, const int8_t* d_qs, const fp16* d_sc, const fp16* g,
     fp16* out,
     int M, int hidden, int intermediate, int top_k, int inter_s,
-    sycl::queue& q) {
+    sycl::queue& q, int rows_override = 0) {
     // Escape hatch for A/B testing the fused path against the original pair.
     static const bool disabled = getenv("SGL_ESIMD_NO_MOE_DOWN_FIN_FUSE") != nullptr;
     if (disabled) return false;
@@ -81,7 +81,8 @@ inline bool moe_down_fin_q5k_host(
         const char* s = getenv("SGL_ESIMD_MOE_DF_ROWS");
         return s ? atoi(s) : 0;
     }();
-    int rows = rows_env;
+    // Explicit consistency callers fix geometry; legacy callers retain tuning.
+    int rows = rows_override > 0 ? rows_override : rows_env;
     if (rows <= 0) {
         rows = 4;
         while (rows > 1 && (size_t)M * (hidden / rows) < MOE_DF_WI_TARGET)

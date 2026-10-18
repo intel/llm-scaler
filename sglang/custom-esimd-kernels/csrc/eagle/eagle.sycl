@@ -5,6 +5,7 @@
 #include <random>
 #include <sstream>
 #include <fstream>
+#include <cstdlib>
 using fp16 = sycl::half;
 using namespace sycl::ext::intel::esimd;
 using namespace sycl::ext::intel::esimd::xmx;
@@ -574,7 +575,7 @@ void page_attn_decode(
 //   (out, last_state)  — last_state aliases initial_state (mutated in place)
 //                       and is returned as a convenience so the caller can
 //                       scatter ssm_states[cache_indices] = last_state.
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend(
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend_impl(
     torch::Tensor& q,
     torch::Tensor& k,
     torch::Tensor& v,
@@ -583,8 +584,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_e
     torch::Tensor& initial_state,
     torch::Tensor& cu_seqlens,
     double scale,
-    int64_t h_chunk_size)
+    int64_t h_chunk_size,
+    int64_t state_round_chunk_size)
 {
+  TORCH_CHECK(state_round_chunk_size == 0 || state_round_chunk_size == 64,
+              "state_round_chunk_size must be 0 (legacy) or 64 (cache-page rounding)");
+  TORCH_CHECK(state_round_chunk_size == 0 || q.scalar_type() == torch::kHalf,
+              "cache-page rounding currently supports fp16 activations only");
+  TORCH_CHECK(state_round_chunk_size == 0 || h_chunk_size == 0 || h_chunk_size % state_round_chunk_size == 0,
+              "snapshot interval must align to state rounding pages");
   TORCH_CHECK(q.scalar_type() == torch::kHalf || q.scalar_type() == torch::kBFloat16);
   TORCH_CHECK(k.scalar_type() == q.scalar_type());
   TORCH_CHECK(v.scalar_type() == q.scalar_type());
@@ -658,6 +666,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_e
   // State dtype (mamba_ssm_dtype): fp32 or fp16. Recurrence math always fp32;
   // only the persisted state load/store uses this dtype.
   const bool stateIsHalf = (initial_state.scalar_type() == torch::kHalf);
+  const uint32_t stateRoundChunk = stateIsHalf ? static_cast<uint32_t>(state_round_chunk_size) : 0;
 
   switch (q.scalar_type()) {
     case torch::kHalf:
@@ -667,7 +676,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_e
             range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
               chunkGatedDeltaRuleExtendFp16<sycl::half>(
                 qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, hPtr, cuPtr,
-                headQk, headV, headDim, hChunk, qScale, ndi);
+                headQk, headV, headDim, hChunk, qScale, ndi, stateRoundChunk);
             });
         };
       } else {
@@ -676,7 +685,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_e
             range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
               chunkGatedDeltaRuleExtendFp16<float>(
                 qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, hPtr, cuPtr,
-                headQk, headV, headDim, hChunk, qScale, ndi);
+                headQk, headV, headDim, hChunk, qScale, ndi, stateRoundChunk);
             });
         };
       }
@@ -709,6 +718,23 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_e
   }
 
   return std::make_tuple(out, initial_state, h);
+}
+
+// Legacy entry point is intentionally unchanged and ignores process env flags.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend(
+    torch::Tensor& q, torch::Tensor& k, torch::Tensor& v, torch::Tensor& g, torch::Tensor& beta,
+    torch::Tensor& initial_state, torch::Tensor& cu_seqlens, double scale, int64_t h_chunk_size) {
+  return chunk_gated_delta_rule_extend_impl(q, k, v, g, beta, initial_state, cu_seqlens, scale, h_chunk_size, 0);
+}
+
+// Callers must start each sequence at a globally aligned cache page. Rounding
+// happens independently of whether intermediate snapshots are requested.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend_consistent(
+    torch::Tensor& q, torch::Tensor& k, torch::Tensor& v, torch::Tensor& g, torch::Tensor& beta,
+    torch::Tensor& initial_state, torch::Tensor& cu_seqlens, double scale, int64_t h_chunk_size,
+    int64_t state_round_chunk_size) {
+  return chunk_gated_delta_rule_extend_impl(
+      q, k, v, g, beta, initial_state, cu_seqlens, scale, h_chunk_size, state_round_chunk_size);
 }
 
 // ===========================================================================
@@ -2136,6 +2162,7 @@ TORCH_LIBRARY_FRAGMENT(eagle_ops, m) {
     m.def("page_attn_decode(Tensor query, Tensor key_cache, Tensor value_cache, Tensor block_table, Tensor seq_lens, Tensor! out, int max_query_len, int max_seq_len, Tensor(a!)? temp_p=None) -> ()");
     m.def("splitk_decode_attention(Tensor query, Tensor key_cache, Tensor value_cache, Tensor block_table, Tensor seq_lens, Tensor! out, Tensor! scratch, int max_seq_len, int num_splits) -> ()");
     m.def("chunk_gated_delta_rule_extend(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor! initial_state, Tensor cu_seqlens, float scale, int h_chunk_size=0) -> (Tensor, Tensor, Tensor)");
+    m.def("chunk_gated_delta_rule_extend_consistent(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor! initial_state, Tensor cu_seqlens, float scale, int h_chunk_size, int state_round_chunk_size) -> (Tensor, Tensor, Tensor)");
     m.def("mamba_state_scatter(Tensor! dst, Tensor src, Tensor dst_indices, Tensor step_indices) -> ()");
     // Contract: q/k/v/initial_state are fp16 or bf16 (all same); g and beta are fp32
     // (both emitted by fused_gdn_gating). cu_seqlens is int32.
@@ -2151,6 +2178,7 @@ TORCH_LIBRARY_IMPL(eagle_ops, XPU, m) {
     m.impl("page_attn_decode", &page_attn_decode);
     m.impl("splitk_decode_attention", &splitk_decode_attention);
     m.impl("chunk_gated_delta_rule_extend", &chunk_gated_delta_rule_extend);
+    m.impl("chunk_gated_delta_rule_extend_consistent", &chunk_gated_delta_rule_extend_consistent);
     m.impl("build_tree_kernel_efficient", &build_tree_kernel_efficient);
     m.impl("verify_tree_greedy", &verify_tree_greedy);
     m.impl("gdn_target_verify", &gdn_target_verify);
