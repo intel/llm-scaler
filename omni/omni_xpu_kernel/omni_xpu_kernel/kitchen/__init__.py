@@ -187,6 +187,13 @@ def supports_rms_norm_convrot_quantize_int8() -> bool:
         return False
 
 
+def supports_gated_quantize_int8() -> bool:
+    try:
+        return hasattr(_load_extension().kitchen, "gated_quantize_int8")
+    except (AttributeError, ImportError):
+        return False
+
+
 def supports_scaled_residual() -> bool:
     try:
         return hasattr(_load_extension().kitchen, "scaled_residual")
@@ -420,7 +427,21 @@ def scaled_residual(
     return _load_extension().kitchen.scaled_residual(*args)
 
 
+@compile_op("kitchen_gated_quantize_int8", _meta.kitchen_gated_quantize)
+def gated_quantize_int8(
+    input: torch.Tensor,
+    input_act: str,
+    group_size: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse SiTU/SwiGLU, optional ConvRot and INT8 quantization for K<=8192."""
+    args = (input.contiguous(), input_act, group_size)
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.kitchen_gated_quantize_int8(*args)
+    return _load_extension().kitchen.gated_quantize_int8(*args)
+
+
 __all__ = [
+    "gated_quantize_int8", "supports_gated_quantize_int8",
     "deltanet_conv_deferred", "gated_delta_decode_deferred", "supports_gated_delta_deferred",
     "int8_decode_update", "int8_decode", "supports_int8_decode",
     "decode_attention", "decode_step_merge", "supports_decode_attention",
