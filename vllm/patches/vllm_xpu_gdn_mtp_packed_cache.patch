@@ -1,0 +1,443 @@
+diff --git a/csrc/xpu/gdn_attn/causal_conv1d.hpp b/csrc/xpu/gdn_attn/causal_conv1d.hpp
+index 9c09b02..5ba6346 100644
+--- a/csrc/xpu/gdn_attn/causal_conv1d.hpp
++++ b/csrc/xpu/gdn_attn/causal_conv1d.hpp
+@@ -485,17 +485,16 @@ struct update_states_kernel {
+ // Grid: (num_spec_decodes, groups_per_token). Each thread owns a feature
+ // chunk of `elems_per_item` lanes and walks all num_spec_tokens tokens of
+ // one sequence in a sliding window:
+-//   - q/k/v lanes: load Width-1 prior values from
+-//     conv_states[cache_indices[batch, num_accepted_tokens[batch] - 1]],
++//   - q/k/v lanes: load Width-1 prior values from the first packed cache
++//     block at offset num_accepted_tokens[batch]-1 (or from a selected
++//     checkpoint block for compact standalone caches),
+ //     then for every t_local in [0, num_spec_tokens) shift the window left
+ //     by one, load the new input from mixed_qkvz[token_indx[...]], apply the
+ //     conv (+bias +activation) and store to local q/k/v outputs.
+ //   - z lanes: pure reorder, no conv.
+ //   - b/a lanes: pure reorder.
+-// After processing all tokens we write the trailing Width-1 input values to
+-// ONLY the last cache slot: conv_states[cache_indices[batch, num_spec]],
+-// matching the Triton fused_recurrent path which keeps a single rollback
+-// reference for the next forward.
++// Packed caches retain Width-2 carried history rows and the speculative raw
++// inputs in the first block; compact caches checkpoint each token separately.
+ // -----------------------------------------------------------------------------
+ template <typename T, int Width, bool ReorderInput>
+ struct causal_conv1d_spec_kernel {
+@@ -518,6 +517,7 @@ struct causal_conv1d_spec_kernel {
+       const T* conv_bias,
+       T* conv_states,
+       const int conv_states_stride_0,
++      const int conv_state_len,
+       const int* query_start_loc,
+       const int* token_indx,
+       const int* cache_indices,
+@@ -545,6 +545,7 @@ struct causal_conv1d_spec_kernel {
+         conv_bias(conv_bias),
+         conv_states(conv_states),
+         conv_states_stride_0(conv_states_stride_0),
++        conv_state_len(conv_state_len),
+         query_start_loc(query_start_loc),
+         token_indx(token_indx),
+         cache_indices(cache_indices),
+@@ -689,14 +690,15 @@ struct causal_conv1d_spec_kernel {
+     }
+ 
+     // -- conv1d on q/k/v lanes ----------------------------------------------
+-    // Pick the initial conv-state slot using num_accepted_tokens. The slot
+-    // at column num_accepted_tokens[batch_id] - 1 was written by the previous
+-    // step's last accepted token; we fall back to col 0 defensively when
+-    // num_accepted_tokens == 0.
++    // vLLM packs convolution history and speculative inputs in the first
++    // block. Acceptance selects an offset within that block, unlike SSM
++    // checkpoints which select a block. Preserve compact standalone caches
++    // (Width-1 rows) using the per-token checkpoint layout.
++    const bool packed_state = conv_state_len > Width - 1;
+     int init_col = num_accepted_tokens[batch_id] - 1;
+     if (init_col < 0) init_col = 0;
+-    const int init_state_id =
+-        cache_indices[batch_id * cache_indices_stride_0 + init_col];
++    const int init_state_id = cache_indices
++        [batch_id * cache_indices_stride_0 + (packed_state ? 0 : init_col)];
+ 
+     // Load weights
+     T local_weights[Width * elems_per_item];
+@@ -718,8 +720,9 @@ struct causal_conv1d_spec_kernel {
+       local_input[i] = static_cast<T>(0);
+     }
+     if (Width > 1 && init_state_id != pad_slot_id) {
+-      const T* init_state_ptr =
+-          conv_states + init_state_id * conv_states_stride_0;
++      const T* init_state_ptr = conv_states +
++                                init_state_id * conv_states_stride_0 +
++                                (packed_state ? init_col * conv_elems : 0);
+ #pragma unroll
+       for (int i = 0; i < Width - 1; ++i) {
+ #pragma unroll
+@@ -731,7 +734,8 @@ struct causal_conv1d_spec_kernel {
+     }
+ 
+     for (int token_id_local = token_start, t_local = 0;
+-         token_id_local < token_end; ++token_id_local, ++t_local) {
++         token_id_local < token_end;
++         ++token_id_local, ++t_local) {
+       const int global_t = token_indx[token_id_local];
+ 
+       // Shift window left by 1 (for t_local == 0 the trailing slot is fresh).
+@@ -806,23 +810,40 @@ struct causal_conv1d_spec_kernel {
+         }
+       }
+ 
+-      // Checkpoint the rolling conv state at every step into the cache slot
+-      // that the next decoding round will read when `num_accepted_tokens ==
+-      // t_local + 1`. Writing each column (not only the last one) keeps the
+-      // scheduler's per-acceptance rollback consistent: column `t_local`
+-      // holds the conv state right after consuming spec token `t_local`.
++      // Packed writeback contains Width-2 carried history rows followed by
++      // the raw speculative inputs. Other checkpoint blocks belong to SSM
++      // and must not be modified by the convolution kernel.
+       if (Width > 1) {
+-        const int save_state_id =
+-            cache_indices[batch_id * cache_indices_stride_0 + t_local];
++        const int save_state_id = cache_indices
++            [batch_id * cache_indices_stride_0 + (packed_state ? 0 : t_local)];
+         if (save_state_id != pad_slot_id) {
+           T* save_state_ptr =
+               conv_states + save_state_id * conv_states_stride_0;
++          if (packed_state) {
++            if (t_local == 0) {
+ #pragma unroll
+-          for (int i = 0; i < Width - 1; ++i) {
++              for (int i = 0; i < Width - 2; ++i) {
++#pragma unroll
++                for (int e = 0; e < elems_per_item; ++e) {
++                  save_state_ptr[i * conv_elems + reordered_elems_id + e] =
++                      local_input[Width * e + i + 1];
++                }
++              }
++            }
+ #pragma unroll
+             for (int e = 0; e < elems_per_item; ++e) {
+-              save_state_ptr[i * conv_elems + reordered_elems_id + e] =
+-                  local_input[Width * e + i + 1];
++              save_state_ptr
++                  [(Width - 2 + t_local) * conv_elems + reordered_elems_id +
++                   e] = local_input[Width * e + Width - 1];
++            }
++          } else {
++#pragma unroll
++            for (int i = 0; i < Width - 1; ++i) {
++#pragma unroll
++              for (int e = 0; e < elems_per_item; ++e) {
++                save_state_ptr[i * conv_elems + reordered_elems_id + e] =
++                    local_input[Width * e + i + 1];
++              }
+             }
+           }
+         }
+@@ -843,6 +864,7 @@ struct causal_conv1d_spec_kernel {
+   const T* conv_bias;
+   T* conv_states;
+   const int conv_states_stride_0;
++  const int conv_state_len;
+   const int* query_start_loc;
+   const int* token_indx;
+   const int* cache_indices;
+@@ -896,7 +918,8 @@ void kernel_launcher(
+     const int& num_prefills,
+     const int& num_decodes,
+     const int& num_spec_decodes,
+-    const int& num_spec_tokens) {
++    const int& num_spec_tokens,
++    const int conv_state_len) {
+   // Spec path: state writeback happens inside the spec kernel, so we do not
+   // run the auxiliary update_states_kernel for prefills here.
+   if (num_accepted_tokens != nullptr) {
+@@ -918,6 +941,7 @@ void kernel_launcher(
+           conv_bias,
+           conv_states,
+           conv_states_stride_0,
++          conv_state_len,
+           query_start_loc,
+           token_indx,
+           cache_indices,
+@@ -1052,6 +1076,11 @@ void causal_conv1d(
+     TORCH_CHECK(cache_indices->dim() == 2);
+     TORCH_CHECK(cache_indices->size(0) == num_spec_decodes);
+     num_spec_tokens = cache_indices->size(1);
++    TORCH_CHECK(
++        conv_states.size(1) == width - 1 ||
++            conv_states.size(1) >= width - 2 + num_spec_tokens,
++        "Speculative convolution cache needs width-1 checkpoint rows or "
++        "width-2+num_spec_tokens packed rows");
+     cache_indices_stride_0 = cache_indices->stride(0);
+     TORCH_CHECK(num_accepted_tokens->size(0) == num_spec_decodes);
+   }
+@@ -1105,7 +1134,8 @@ void causal_conv1d(
+       num_prefills,                                                           \
+       num_decodes,                                                            \
+       num_spec_decodes,                                                       \
+-      num_spec_tokens);
++      num_spec_tokens,                                                        \
++      conv_states.size(1));
+ 
+ #define WIDTH_DISPATCH(scalar_t, width, reorder_input) \
+   switch (width) {                                     \
+diff --git a/tests/gdn_attn/test_gdn_attn.py b/tests/gdn_attn/test_gdn_attn.py
+index 44b7dc1..c48fe6e 100755
+--- a/tests/gdn_attn/test_gdn_attn.py
++++ b/tests/gdn_attn/test_gdn_attn.py
+@@ -43,7 +43,7 @@ MINI_PYTEST_PARAMS = {
+     "activation": ["silu"],
+     "mode": ["prefill", "decode", "mix_mode"],
+     "reorder_input": [False],
+-    "dtype": [torch.float16], 
++    "dtype": [torch.float16],
+     "ssm_state_is_fp32": [False],
+     },
+ }
+@@ -549,9 +549,10 @@ def ref_gdn_attention_spec(
+     tp_size,
+     reorder_input,
+ ):
+-    """Spec-decode reference. Mirrors the non-spec ref but routes gather/
+-    scatter through spec_token_indx and writes per-step ssm-state + final
+-    conv-state into spec_state_indices_tensor."""
++    """Spec-decode reference with packed or per-token convolution caches.
++
++    SSM always uses per-token checkpoints, independently of the conv layout.
++    """
+     eps = 0.000001
+     scale = 1.0 / math.sqrt(head_k_dim)
+     dtype = projected_states_qkvz.dtype
+@@ -592,15 +593,26 @@ def ref_gdn_attention_spec(
+         init_col = max(naccepted - 1, 0)
+         init_slot = int(spec_state_indices_tensor[n, init_col].item())
+         # ---- conv1d on the K gathered tokens (with Width-1 history) ----
+-        conv_state_batch = conv_state[init_slot].clone()
++        packed_state = conv_state.shape[1] > width - 1
++        if packed_state:
++            conv_slot = int(spec_state_indices_tensor[n, 0].item())
++            conv_state_batch = conv_state[conv_slot, init_col:init_col +
++                                          width - 1].clone()
++        else:
++            conv_state_batch = conv_state[init_slot].clone()
+         qkv_batch = qkv[globals_]  # [seq_len, qkv_elems]
+         qkv_conv_input = torch.cat([conv_state_batch, qkv_batch], dim=0)
+         # Checkpoint the rolling state at each actual speculative token. The
+         # cache row has K rollback slots but a compact ragged row uses only its
+         # leading seq_len slots.
+-        for t in range(seq_len):
+-            slot = int(spec_state_indices_tensor[n, t].item())
+-            conv_state[slot] = qkv_conv_input[t + 1:t + width]
++        if packed_state:
++            # Drop the oldest history row, then retain the entire input
++            # sequence so acceptance can select a history window next time.
++            conv_state[conv_slot, :width - 2 + seq_len] = qkv_conv_input[1:]
++        else:
++            for t in range(seq_len):
++                slot = int(spec_state_indices_tensor[n, t].item())
++                conv_state[slot] = qkv_conv_input[t + 1:t + width]
+ 
+         qkv_conv_in = qkv_conv_input.transpose(0, 1).unsqueeze(0).to(
+             torch.float32)
+@@ -855,6 +867,132 @@ def test_gdn_attention_mtp(num_spec_decodes, num_spec_tokens, num_k_heads,
+                                        rtol=0)
+ 
+ 
++@pytest.mark.parametrize("reorder_input", [True, False])
++@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
++                         ids=format_tc)
++@pytest.mark.parametrize("ssm_state_is_fp32", [False, True])
++@pytest.mark.parametrize("ragged", [False, True])
++@torch.inference_mode()
++def test_gdn_attention_mtp_packed_cache(reorder_input, dtype,
++                                        ssm_state_is_fp32, ragged):
++    """Production TP2/MTP4 layout across rollback, reuse and block migration.
++
++    Three requests mix acceptance counts 1/3/5, then rotate them each step.
++    Convolution has seven rows in the first block, whereas SSM has five
++    distinct checkpoint blocks. Validate the entire convolution cache exactly,
++    including untouched checkpoint blocks and the ragged tail.
++    """
++    device = "xpu"
++    torch.manual_seed(709)
++    batch, K, width = 3, 5, 4
++    num_k_heads, num_v_heads, dim, tp_size = 16, 32, 128, 2
++    local_k_heads = num_k_heads // tp_size
++    local_v_heads = num_v_heads // tp_size
++    conv_dim = (2 * local_k_heads + local_v_heads) * dim
++    lens = [K, K, K - int(ragged)]
++    total = sum(lens)
++    slots = 2 * batch * K + 1
++    ssm_dtype = torch.float32 if ssm_state_is_fp32 else dtype
++
++    def randn(*shape, scale=0.1, tensor_dtype=dtype):
++        return torch.randn(*shape, dtype=tensor_dtype, device=device) * scale
++
++    conv = randn(slots, width - 2 + K, conv_dim)
++    ssm = randn(slots, local_v_heads, dim, dim, tensor_dtype=ssm_dtype)
++    ref_conv, ref_ssm = conv.clone(), ssm.clone()
++    weights = randn(conv_dim, width)
++    bias = randn(conv_dim)
++    A_log = randn(local_v_heads, tensor_dtype=torch.float32)
++    dt_bias = randn(local_v_heads)
++    indices = torch.arange(1, batch * K + 1, dtype=torch.int32,
++                           device=device).reshape(batch, K)
++    starts = torch.tensor([0] + lens, dtype=torch.int32,
++                          device=device).cumsum(0, dtype=torch.int32)
++
++    for step in range(3):
++        # Move all blocks before the third call, like a scheduler cache copy.
++        # Copy packed conv independently of SSM acceptance checkpoint selection.
++        if step == 2:
++            moved_indices = indices + batch * K
++            conv[moved_indices.long()] = conv[indices.long()].clone()
++            ref_conv[moved_indices.long()] = ref_conv[indices.long()].clone()
++            ssm[moved_indices.long()] = ssm[indices.long()].clone()
++            ref_ssm[moved_indices.long()] = ref_ssm[indices.long()].clone()
++            indices = moved_indices
++
++        # Do not accept more than the prior ragged sequence produced.
++        accepted = torch.tensor([
++            min((1, 3, 5)[(n + step) % batch], lens[n]) for n in range(batch)
++        ],
++                                dtype=torch.int32,
++                                device=device)
++        token_indices = torch.randperm(total, device=device).to(torch.int32)
++        qkvz = randn(total, conv_dim + local_v_heads * dim)
++        ba = randn(total, 2 * local_v_heads)
++        out = torch.zeros(total,
++                          local_v_heads,
++                          dim,
++                          dtype=dtype,
++                          device=device)
++        z = torch.zeros_like(out)
++        ref_out, ref_z = torch.zeros_like(out), torch.zeros_like(z)
++        initial_ssm = ssm.clone()
++
++        common = dict(conv_weights=weights,
++                      conv_bias=bias,
++                      activation="silu",
++                      A_log=A_log,
++                      dt_bias=dt_bias,
++                      num_spec_decodes=batch,
++                      spec_query_start_loc=starts,
++                      spec_token_indx=token_indices,
++                      spec_state_indices_tensor=indices,
++                      num_accepted_tokens=accepted,
++                      num_actual_tokens=total,
++                      tp_size=tp_size,
++                      reorder_input=reorder_input)
++        torch.ops._xpu_C.gdn_attention(out,
++                                       z,
++                                       qkvz,
++                                       ba,
++                                       num_k_heads,
++                                       num_v_heads,
++                                       dim,
++                                       dim,
++                                       conv_state=conv,
++                                       ssm_state=ssm,
++                                       num_prefills=0,
++                                       num_decodes=0,
++                                       has_initial_state=None,
++                                       non_spec_query_start_loc=None,
++                                       non_spec_token_indx=None,
++                                       non_spec_state_indices_tensor=None,
++                                       **common)
++        ref_gdn_attention_spec(ref_out,
++                               ref_z,
++                               qkvz,
++                               ba,
++                               num_k_heads,
++                               num_v_heads,
++                               dim,
++                               dim,
++                               conv_state=ref_conv,
++                               ssm_state=ref_ssm,
++                               **common)
++
++        torch.testing.assert_close(conv, ref_conv, atol=0, rtol=0)
++        torch.testing.assert_close(z, ref_z, atol=0, rtol=0)
++        torch.testing.assert_close(out, ref_out, atol=5e-3, rtol=5e-2)
++        torch.testing.assert_close(ssm, ref_ssm, atol=5e-3, rtol=5e-2)
++        written = torch.cat([indices[n, :lens[n]] for n in range(batch)])
++        untouched = torch.ones(slots, dtype=torch.bool, device=device)
++        untouched[written.long()] = False
++        torch.testing.assert_close(ssm[untouched],
++                                   initial_ssm[untouched],
++                                   atol=0,
++                                   rtol=0)
++
++
+ # GQA ratio num_v_heads/num_k_heads == 3 regression. The SLM-tiled prefill
+ # conv1d (chunk_causal_conv1d_tiled_xe2) reorders the z gate one feat_chunk at a
+ # time: its 64 work-items cover feats_per_wg = wg_size * elems_per_item = 256 z
+@@ -1051,9 +1189,9 @@ def test_chunk_prepare_vhead_oob_guard(dtype):
+ 
+ 
+ # chunk_update_states_kernel conv_elems guard coverage. When total conv_elems
+-# is not a multiple of elems_per_group (1024), the last work-group is 
++# is not a multiple of elems_per_group (1024), the last work-group is
+ # over-provisioned and requires an upper bound check to prevent out-of-bounds
+-# memory writes. Qwen3.6-27B at TP=4 (local num_k_heads=4, num_v_heads=12) 
++# memory writes. Qwen3.6-27B at TP=4 (local num_k_heads=4, num_v_heads=12)
+ # forces conv_elems = 2560. 2560 % 1024 != 0, exercising this guard.
+ @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
+                          ids=format_tc)
+@@ -1063,15 +1201,15 @@ def test_causal_conv1d_conv_elems_oob_guard(dtype):
+     random.seed(0)
+     torch.manual_seed(0)
+ 
+-    # Qwen-27B global heads: K=16, V=48. 
+-    # At TP=4, local heads are K=4 and V=12. 
++    # Qwen-27B global heads: K=16, V=48.
++    # At TP=4, local heads are K=4 and V=12.
+     tp_size = 4
+     num_k_heads = 16
+     num_v_heads = 48
+     # local heads will be K=4, V=12 internally
+     head_k_dim = 128
+-    head_v_dim = 128 
+-    
++    head_v_dim = 128
++
+     width = 4
+     activation = "silu"
+     num_actual_tokens = 64  # single prefill
+@@ -1080,13 +1218,13 @@ def test_causal_conv1d_conv_elems_oob_guard(dtype):
+ 
+     local_num_k_heads = num_k_heads // tp_size
+     local_num_v_heads = num_v_heads // tp_size
+-    
++
+     mixed_qkvz_size = local_num_k_heads * (
+         2 * head_k_dim + 2 * head_v_dim * \
+         local_num_v_heads // local_num_k_heads)
+     mixed_ba_size = local_num_k_heads * (
+         2 * local_num_v_heads // local_num_k_heads)
+-    
++
+     # conv_elems will equal mixed_qkv_size (2560 here)
+     mixed_qkv_size = local_num_k_heads * (
+         2 * head_k_dim + head_v_dim * local_num_v_heads // local_num_k_heads)
+@@ -1095,7 +1233,7 @@ def test_causal_conv1d_conv_elems_oob_guard(dtype):
+                                         dtype=dtype, device=device)
+     projected_states_ba = torch.randn((num_actual_tokens, mixed_ba_size),
+                                       dtype=dtype, device=device)
+-                                      
++
+     conv_state = torch.randn((cache_batch_size, width - 1, mixed_qkv_size),
+                              dtype=dtype, device=device)
+     ref_conv_state = conv_state.clone()
+@@ -1103,7 +1241,7 @@ def test_causal_conv1d_conv_elems_oob_guard(dtype):
+         (cache_batch_size, local_num_v_heads, head_v_dim, head_k_dim),
+         dtype=dtype, device=device)
+     ref_ssm_state = ssm_state.clone()
+-        
++
+     conv_weights = torch.randn(
+         (mixed_qkv_size, width), dtype=dtype, device=device)
+     conv_bias = torch.randn((mixed_qkv_size), dtype=dtype, device=device)

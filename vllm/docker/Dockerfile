@@ -188,6 +188,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # ---------------------------------------------------------------------------
 # oneDNN 3.12.3 fixes zero-pool pause/resume under native SYCL graph recording.
 ARG ONEDNN_COMMIT=6db5f1ba860ca8f65c3f65c4498ad867e9642447
+# analytics-zoo/vllm-xpu-kernels#21, commit 488ad801e0f5b32b56235243d21e3ec57a16a54f.
+# Preserve the pinned kernel base; compile the packed MTP cache fix into the wheel.
+COPY ./patches/vllm_xpu_gdn_mtp_packed_cache.patch /tmp/
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=secret,id=build-ca,target=/etc/ssl/certs/ca-certificates.crt \
     set -eo pipefail && \
@@ -196,6 +199,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     cd /src/vllm-xpu-kernels && \
     git checkout ${VLLM_XPU_KERNELS_COMMIT} && \
     git apply /tmp/vllm_xpu_kernels.patch && \
+    git apply --check /tmp/vllm_xpu_gdn_mtp_packed_cache.patch && \
+    git apply /tmp/vllm_xpu_gdn_mtp_packed_cache.patch && \
     sed -i "s/80afa71049cd69a3df32adcccb623b12cd7baa22/${ONEDNN_COMMIT}/" CMakeLists.txt && \
     sed -i 's/torch == 2.12.0+xpu/torch == 2.14.0+xpu/' pyproject.toml && \
     sed -i 's/set(CMAKE_CXX_STANDARD 17)/set(CMAKE_CXX_STANDARD 20)/g' cmake/utils.cmake && \
@@ -272,8 +277,11 @@ RUN ls -la ${WHEELS}/
 
 # Final v0.26 compatibility patches are kept after the independent native
 # builds so a Python compatibility fix does not invalidate their compilation.
+# Downstream PR50 (932726f4cb86b818bf8fbc2566905f53b49eb77d) backports
+# upstream f725046204878c7de7c7dae10db6885d02d311a1 (vLLM#51599).
 COPY ./patches/gemma4_graph_scalar.patch ./patches/xpu_memory_accounting.patch \
-     ./patches/xpu_allreduce_functional.patch /tmp/
+     ./patches/xpu_allreduce_functional.patch \
+     ./patches/vllm_mtp_accepted_count_ownership.patch /tmp/
 RUN --mount=type=cache,target=/root/.cache/uv \
     set -eo pipefail && \
     source /opt/intel/oneapi/setvars.sh --force && \
@@ -284,7 +292,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     git apply /tmp/xpu_memory_accounting.patch && \
     git apply --check /tmp/xpu_allreduce_functional.patch && \
     git apply /tmp/xpu_allreduce_functional.patch && \
+    git apply --check /tmp/vllm_mtp_accepted_count_ownership.patch && \
+    git apply /tmp/vllm_mtp_accepted_count_ownership.patch && \
     git diff --check && \
+    mkdir -p ${WHEELS}/initial-vllm && \
+    for wheel in ${WHEELS}/vllm-*.whl; do mv "$wheel" ${WHEELS}/initial-vllm/; done && \
     export CMAKE_PREFIX_PATH="$(python3 -c 'import site; print(site.getsitepackages()[0])'):${CMAKE_PREFIX_PATH:-}" && \
     (pip wheel --verbose --no-build-isolation --no-deps . -w ${WHEELS} \
         > ${WHEELS}/build-logs/vllm-compatibility.log 2>&1 || \
