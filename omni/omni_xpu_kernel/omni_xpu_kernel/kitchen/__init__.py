@@ -9,6 +9,105 @@ from .. import _compile_meta as _meta
 from .._compile_ops import compile_op
 
 
+def supports_decode_attention() -> bool:
+    try:
+        native = _load_extension().kitchen
+        return all(hasattr(native, name) for name in ("decode_attention", "decode_step_merge"))
+    except (AttributeError, ImportError):
+        return False
+
+
+def supports_int8_decode() -> bool:
+    try:
+        native = _load_extension().kitchen
+        return all(hasattr(native, name) for name in ("int8_decode_update", "int8_decode"))
+    except (AttributeError, ImportError):
+        return False
+
+
+def supports_gated_delta_deferred() -> bool:
+    try:
+        native = _load_extension().kitchen
+        return all(hasattr(native, name) for name in ("deltanet_conv_deferred", "gated_delta_decode_deferred"))
+    except (AttributeError, ImportError):
+        return False
+
+
+@compile_op("kitchen_deltanet_conv_deferred", _meta.void,
+            mutates_args=("conv_state", "proj_buf", "qkv_buf"))
+def deltanet_conv_deferred(proj: torch.Tensor, conv_state: torch.Tensor,
+                           conv_w: torch.Tensor, conv_b: torch.Tensor | None,
+                           proj_buf: torch.Tensor, qkv_buf: torch.Tensor, ctl: torch.Tensor) -> None:
+    """Commit the previous accepted projections; verify current conv into side buffers."""
+    args = (proj.contiguous(),conv_state,conv_w.contiguous(),
+            None if conv_b is None else conv_b.contiguous(),proj_buf,qkv_buf,ctl)
+    if torch.compiler.is_compiling():
+        torch.ops.omni_xpu.kitchen_deltanet_conv_deferred(*args)
+    else:
+        _load_extension().kitchen.deltanet_conv_deferred(*args)
+
+
+@compile_op("kitchen_gated_delta_decode_deferred", _meta.kitchen_deferred_delta,
+            mutates_args=("state", "gates_buf", "sumsq_buf"))
+def gated_delta_decode_deferred(x: torch.Tensor, w_a: torch.Tensor, w_b: torch.Tensor,
+    dt_bias: torch.Tensor, g_decay: torch.Tensor, state: torch.Tensor, key_dim: int,
+    key_heads: int, scale: float, z: torch.Tensor, norm_weight: torch.Tensor, eps: float,
+    qkv_buf: torch.Tensor, gates_buf: torch.Tensor, sumsq_buf: torch.Tensor, ctl: torch.Tensor) -> torch.Tensor:
+    """Commit the previous accepted prefix and verify current rows without committing them."""
+    args = (x.contiguous(),w_a.contiguous(),w_b.contiguous(),dt_bias,g_decay,state,
+            key_dim,key_heads,scale,z.contiguous(),norm_weight.contiguous(),eps,
+            qkv_buf,gates_buf,sumsq_buf,ctl)
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.kitchen_gated_delta_decode_deferred(*args)
+    return _load_extension().kitchen.gated_delta_decode_deferred(*args)
+
+
+@compile_op("kitchen_int8_decode_update", _meta.void,
+            mutates_args=("key", "value", "key_scale", "value_scale"))
+def int8_decode_update(source_key: torch.Tensor, source_value: torch.Tensor,
+                       key: torch.Tensor, value: torch.Tensor,
+                       key_scale: torch.Tensor, value_scale: torch.Tensor,
+                       length: torch.Tensor, capacity: int, initialize: bool = False) -> None:
+    """Quantize the growing prefix or refresh its last two pages on device."""
+    args = (source_key,source_value,key,value,key_scale,value_scale,length,capacity,initialize)
+    if torch.compiler.is_compiling():
+        torch.ops.omni_xpu.kitchen_int8_decode_update(*args)
+    else:
+        _load_extension().kitchen.int8_decode_update(*args)
+
+
+@compile_op("kitchen_int8_decode", _meta.kitchen_int8_decode)
+def int8_decode(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                key_scale: torch.Tensor, value_scale: torch.Tensor,
+                length: torch.Tensor, capacity: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Attend a signed INT8 committed prefix, including query quantization."""
+    args = (query,key,value,key_scale,value_scale,length,capacity)
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.kitchen_int8_decode(*args)
+    out, lse = _load_extension().kitchen.int8_decode(*args)
+    return out, lse
+
+
+@compile_op("kitchen_decode_attention", _meta.kitchen_decode)
+def decode_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                     lengths: torch.Tensor, causal: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+    """BF16 D128/256 fixed-cache decode, returning output and natural-log LSE."""
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.kitchen_decode_attention(q, k, v, lengths, causal)
+    out, lse = _load_extension().kitchen.decode_attention(q, k, v, lengths, causal)
+    return out, lse
+
+
+@compile_op("kitchen_decode_step_merge", _meta.void, mutates_args=("merged",))
+def decode_step_merge(out: torch.Tensor, lse: torch.Tensor, q: torch.Tensor,
+                      k: torch.Tensor, v: torch.Tensor, merged: torch.Tensor) -> None:
+    """Merge current causal rows into prefix attention; merged may alias out."""
+    if torch.compiler.is_compiling():
+        torch.ops.omni_xpu.kitchen_decode_step_merge(out, lse, q, k, v, merged)
+    else:
+        _load_extension().kitchen.decode_step_merge(out, lse, q, k, v, merged)
+
+
 def supports_deltanet_conv_step() -> bool:
     try:
         return hasattr(_load_extension().kitchen, "deltanet_conv_step")
@@ -322,6 +421,9 @@ def scaled_residual(
 
 
 __all__ = [
+    "deltanet_conv_deferred", "gated_delta_decode_deferred", "supports_gated_delta_deferred",
+    "int8_decode_update", "int8_decode", "supports_int8_decode",
+    "decode_attention", "decode_step_merge", "supports_decode_attention",
     "deltanet_conv_step",
     "gated_delta_decode_fused",
     "group_norm_silu_pad3d",
