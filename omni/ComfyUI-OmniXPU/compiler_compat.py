@@ -22,6 +22,7 @@ SIGNATURES = {
         "cast_to_gathered": ("tensors", "r", "non_blocking", "stream", "r2"),
         "cast_to": ("weight", "dtype", "device", "non_blocking", "copy", "stream", "r"),
         "soft_empty_cache": ("force",),
+        "synchronize": (),
     },
     "comfy/model_prefetch.py": {
         "malloc_graph_enabled": ("device",), "malloc_graph_begin": ("device",),

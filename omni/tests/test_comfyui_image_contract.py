@@ -77,16 +77,16 @@ COMPONENT_PINS = {
     ),
     "COMFYUI_COMMIT": (
         "COMFYUI_COMMIT",
-        "b0b743566f65daafc423b4fea8a2fbda94b3384a",
+        "63be2f9b82ad0dac88a7ceaa28a9cf3154125a18",
     ),
-    "COMFYUI_VERSION": ("COMFYUI_VERSION", "0.39.0"),
+    "COMFYUI_VERSION": ("COMFYUI_VERSION", "0.42.1"),
     "COMFYUI_FRONTEND_VERSION": (
         "COMFYUI_FRONTEND_VERSION",
-        "1.53.10",
+        "1.55.18",
     ),
     "COMFYUI_WORKFLOW_TEMPLATES_VERSION": (
         "COMFYUI_WORKFLOW_TEMPLATES_VERSION",
-        "0.11.76",
+        "0.11.89",
     ),
     "COMFYUI_MANAGER_VERSION": ("COMFYUI_MANAGER_VERSION", "4.2.2"),
     "COMFY_KITCHEN_REPOSITORY": (
@@ -95,7 +95,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_KITCHEN_COMMIT": (
         "KITCHEN_COMMIT",
-        "ee898a3a7825b158637c92fe8da5e47a710b2fbf",
+        "3c9c495f3c648166ec4b0c69b676904f09b53267",
     ),
     "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.39"),
     "COMFY_KITCHEN_PROVIDER_VERSION": (
@@ -108,12 +108,12 @@ COMPONENT_PINS = {
     ),
     "COMFY_AIMDO_COMMIT": (
         "AIMDO_COMMIT",
-        "80ef0f9abdb384a47d81058b4bec87a201ff63e4",
+        "74d103f856e5b995376ad59579b3cd4511922004",
     ),
-    "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.5.5"),
+    "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.5.6"),
     "COMFY_AIMDO_PROVIDER_VERSION": (
         "AIMDO_PROVIDER_VERSION",
-        "0.5.5",
+        "0.5.6",
     ),
     "COMFY_GGUF_REPOSITORY": (
         "GGUF_REPOSITORY",
@@ -248,7 +248,9 @@ class ComfyUIImageContractTest(unittest.TestCase):
         )
 
         self.assertTrue(documentation)
-        forbidden = re.compile(r"(?i)b580|0xe20b|arc[ -]?b580")
+        # Device names are words; a matching substring in a package hash is not
+        # a support claim.
+        forbidden = re.compile(r"(?i)\b(?:b580|0xe20b|arc[ -]?b580)\b")
         for path in documentation:
             with self.subTest(path=path):
                 document = path.read_text(encoding="utf-8")
@@ -695,9 +697,9 @@ class ComfyUIImageContractTest(unittest.TestCase):
         self.assertEqual(
             COMPONENT_PINS["COMFY_KITCHEN_PROVIDER_VERSION"][1], "0.2.39"
         )
-        self.assertEqual(COMPONENT_PINS["COMFY_AIMDO_VERSION"][1], "0.5.5")
+        self.assertEqual(COMPONENT_PINS["COMFY_AIMDO_VERSION"][1], "0.5.6")
         self.assertEqual(
-            COMPONENT_PINS["COMFY_AIMDO_PROVIDER_VERSION"][1], "0.5.5"
+            COMPONENT_PINS["COMFY_AIMDO_PROVIDER_VERSION"][1], "0.5.6"
         )
         for label, expected in (
             (
@@ -722,7 +724,7 @@ class ComfyUIImageContractTest(unittest.TestCase):
 
         pairs = (
             ("comfy_kitchen.xpu", "0.2.39", "0.2.39", "https://github.com/xiangyuT/comfy-kitchen-xpu.git"),
-            ("comfy_aimdo.xpu", "0.5.5", "0.5.5", "https://github.com/xiangyuT/comfy-aimdo-xpu.git"),
+            ("comfy_aimdo.xpu", "0.5.6", "0.5.6", "https://github.com/xiangyuT/comfy-aimdo-xpu.git"),
         )
         for provider_id, source_version, official_version, source_repository in pairs:
             with self.subTest(

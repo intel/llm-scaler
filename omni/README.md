@@ -142,14 +142,14 @@ see [ComfyUI usage](docs/COMFYUI.md).
 
 The focused source build selects:
 
-- upstream [ComfyUI v0.39.0](https://github.com/Comfy-Org/ComfyUI/tree/v0.39.0),
-  pinned to `b0b743566f65daafc423b4fea8a2fbda94b3384a`;
+- upstream [ComfyUI v0.42.1](https://github.com/Comfy-Org/ComfyUI/tree/v0.42.1),
+  pinned to `63be2f9b82ad0dac88a7ceaa28a9cf3154125a18`;
 - `omni_xpu_kernel`, built for the selected Torch minor and XPU target;
 - official `comfy-kitchen==0.2.39` plus the matching co-installable XPU runtime provider
-  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/ee898a3a7825b158637c92fe8da5e47a710b2fbf),
+  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/3c9c495f3c648166ec4b0c69b676904f09b53267),
   including the managed GGUF and Nunchaku W4A16 routes;
-- official `comfy-aimdo==0.5.5` plus the co-installable XPU runtime provider
-  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/80ef0f9abdb384a47d81058b4bec87a201ff63e4),
+- official `comfy-aimdo==0.5.6` plus the co-installable XPU runtime provider
+  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/74d103f856e5b995376ad59579b3cd4511922004),
   built with its Level Zero backend and native allocator hook;
 - [`ComfyUI-GGUF-XPU`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),
   with GGUF, SentencePiece, and Protobuf dependencies installed from the same
@@ -160,7 +160,7 @@ The focused source build selects:
   Kitchen and the packaged `omni_xpu_kernel` XPU operators; see
   [usage and legacy-node migration](docs/SPARSE_ATTENTION.md);
 - [ComfyUI-OmniXPU](ComfyUI-OmniXPU/README.md);
-- ComfyUI v0.39.0 integrated Node Manager plus pinned VideoHelperSuite,
+- ComfyUI v0.42.1 integrated Node Manager plus pinned VideoHelperSuite,
   Easy-Use, KJNodes, CacheDiT, and ControlNet auxiliary nodes;
 - an exact installed Python dependency snapshot at
   `/llm/manifests/comfyui-python-freeze.txt`.
