@@ -136,9 +136,13 @@ def _apply_input_act(
     if input_act == "swiglu":
         gate, up = x.chunk(2, dim=-1)
         return torch.nn.functional.silu(gate).mul_(up)
+    if input_act == "situ":
+        hidden, gate = x.chunk(2, dim=-1)
+        gated = gate.div(4.0).tanh_().mul_(4.0).mul_(torch.sigmoid(gate))
+        return hidden.div(25.0).tanh_().mul_(25.0).mul_(gated)
     raise ValueError(
         f"unsupported input_act: {input_act!r} "
-        "(expected one of ['gelu_tanh', 'none', 'swiglu'])"
+        "(expected one of ['gelu_tanh', 'none', 'situ', 'swiglu'])"
     )
 
 
@@ -1095,9 +1099,10 @@ def int8_linear(
         out_dtype: Output dtype (defaults to x.dtype).
         convrot: If True, apply online activation rotation before quantization.
         convrot_groupsize: Group size for Hadamard rotation (must be power of 4).
-        input_act: Optional ``gelu_tanh`` or ``swiglu`` activation applied before
-            activation quantization. SwiGLU consumes concatenated ``[gate | up]``
-            halves and therefore halves the input width.
+        input_act: Optional ``gelu_tanh``, ``swiglu`` or ``situ`` activation
+            applied before activation quantization. SwiGLU consumes concatenated
+            ``[gate | up]`` halves; SiTU consumes ``[hidden | gate]`` halves.
+            Both gated activations halve the input width.
 
     Returns:
         Result tensor [..., N] in out_dtype.
@@ -1106,8 +1111,8 @@ def int8_linear(
         return torch.ops.omni_xpu.int8_linear(x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize, input_act)
     if out_dtype is None:
         out_dtype = x.dtype
-    width = 2 if input_act == "swiglu" else 1
-    if input_act not in (None, "none", "gelu_tanh", "swiglu"):
+    width = 2 if input_act in ("swiglu", "situ") else 1
+    if input_act not in (None, "none", "gelu_tanh", "swiglu", "situ"):
         _apply_input_act(x, input_act)
     if x.shape[-1] != weight.shape[-1] * width:
         raise ValueError(
@@ -1121,6 +1126,22 @@ def int8_linear(
             torch.float16: 1,
             torch.bfloat16: 2,
         }.get(out_dtype, 2)
+        if (input_act == "situ" and x.dtype in (torch.float16, torch.bfloat16)
+                and 0 < x.shape[-1] // 2 <= 8192
+                and (not convrot or convrot_groupsize in (64, 256))
+                and (not convrot or x.shape[-1] // 2 % convrot_groupsize == 0)
+                and hasattr(native, "int8_linear_prequantized")):
+            from .. import kitchen
+
+            if kitchen.supports_gated_quantize_int8():
+                _clear_krea2_activation_cache()
+                _clear_bmg_qkv_activation_cache()
+                quantized, scale = kitchen.gated_quantize_int8(
+                    x, input_act, convrot_groupsize if convrot else 0,
+                )
+                return native.int8_linear_prequantized(
+                    quantized, scale, weight, weight_scale, bias, dtype_code,
+                )
         if (
             input_act == "swiglu"
             and not convrot

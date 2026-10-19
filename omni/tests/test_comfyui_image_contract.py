@@ -95,12 +95,12 @@ COMPONENT_PINS = {
     ),
     "COMFY_KITCHEN_COMMIT": (
         "KITCHEN_COMMIT",
-        "49b0aa14aed3a60b148c95658b025a6f38fd6464",
+        "ee898a3a7825b158637c92fe8da5e47a710b2fbf",
     ),
-    "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.37"),
+    "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.39"),
     "COMFY_KITCHEN_PROVIDER_VERSION": (
         "KITCHEN_PROVIDER_VERSION",
-        "0.2.37",
+        "0.2.39",
     ),
     "COMFY_AIMDO_REPOSITORY": (
         "AIMDO_REPOSITORY",
@@ -691,9 +691,9 @@ class ComfyUIImageContractTest(unittest.TestCase):
         validator = load_validator()
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
 
-        self.assertEqual(COMPONENT_PINS["COMFY_KITCHEN_VERSION"][1], "0.2.37")
+        self.assertEqual(COMPONENT_PINS["COMFY_KITCHEN_VERSION"][1], "0.2.39")
         self.assertEqual(
-            COMPONENT_PINS["COMFY_KITCHEN_PROVIDER_VERSION"][1], "0.2.37"
+            COMPONENT_PINS["COMFY_KITCHEN_PROVIDER_VERSION"][1], "0.2.39"
         )
         self.assertEqual(COMPONENT_PINS["COMFY_AIMDO_VERSION"][1], "0.5.5")
         self.assertEqual(
@@ -721,7 +721,7 @@ class ComfyUIImageContractTest(unittest.TestCase):
                 self.assertIn(label, dockerfile)
 
         pairs = (
-            ("comfy_kitchen.xpu", "0.2.37", "0.2.37", "https://github.com/xiangyuT/comfy-kitchen-xpu.git"),
+            ("comfy_kitchen.xpu", "0.2.39", "0.2.39", "https://github.com/xiangyuT/comfy-kitchen-xpu.git"),
             ("comfy_aimdo.xpu", "0.5.5", "0.5.5", "https://github.com/xiangyuT/comfy-aimdo-xpu.git"),
         )
         for provider_id, source_version, official_version, source_repository in pairs:
@@ -763,19 +763,19 @@ class ComfyUIImageContractTest(unittest.TestCase):
         mismatched_manifest = {
             "provider_distribution": {"version": "0.2.34"},
             "source": {
-                "version": "0.2.37",
+                "version": "0.2.39",
                 "repository": "https://github.com/xiangyuT/comfy-kitchen-xpu.git",
             },
             "canonical_distribution": {
-                "compatible_versions": ["0.2.37"]
+                "compatible_versions": ["0.2.39"]
             },
         }
         with self.assertRaisesRegex(RuntimeError, "distribution version"):
             validator.require_provider_version_compatibility(
                 "comfy_kitchen.xpu",
                 mismatched_manifest,
-                official_version="0.2.37",
-                provider_version="0.2.37",
+                official_version="0.2.39",
+                provider_version="0.2.39",
                 source_repository="https://github.com/xiangyuT/comfy-kitchen-xpu.git",
             )
         validator.require_provider_package_is_disjoint(

@@ -153,6 +153,8 @@ namespace fp8 {
     torch::Tensor stochastic_rounding(const torch::Tensor& input, const torch::Tensor& rng, torch::ScalarType out_dtype);
 }
 namespace int8_ops {
+    std::tuple<torch::Tensor, torch::Tensor> gated_quantize_int8(
+        torch::Tensor input, const std::string& input_act, int64_t group_size);
     torch::Tensor mm_int8(torch::Tensor a, torch::Tensor b);
     std::tuple<torch::Tensor, torch::Tensor> rms_norm_convrot_quantize_int8(
         torch::Tensor input, torch::Tensor norm_weight, double eps,
@@ -1006,6 +1008,10 @@ PYBIND11_MODULE(_C, m) {
         "rms_norm_for_int8", &omni_xpu::kitchen::rms_norm_for_int8,
         "XPU RMSNorm materialization for Kitchen INT8 projection",
         py::arg("input"), py::arg("weight"), py::arg("eps") = 1e-6);
+    kitchen.def(
+        "gated_quantize_int8", &omni_xpu::int8_ops::gated_quantize_int8,
+        "XPU SiTU/SwiGLU, optional ConvRot and rowwise INT8 quantization",
+        py::arg("input"), py::arg("input_act"), py::arg("group_size") = 0);
     kitchen.def(
         "rms_norm_quantize_int8", &omni_xpu::kitchen::rms_norm_quantize_int8,
         "XPU RMSNorm and rowwise INT8 quantization in one launch",

@@ -51,6 +51,12 @@ def kitchen_rms_norm_convrot_quantize(input, weight, eps=1e-6, group_size=256):
     return kitchen_rms_norm_quantize(input, weight, eps)
 
 
+def kitchen_gated_quantize(input, input_act, group_size=0):
+    shape = (*input.shape[:-1], input.shape[-1] // 2)
+    return (input.new_empty(shape, dtype=torch.int8),
+            input.new_empty((*input.shape[:-1], 1), dtype=torch.float32))
+
+
 def kitchen_group_norm_pad(input, weight=None, bias=None, groups=32,
                            eps=1e-6, pad=(0, 0, 0, 0, 0), silu=True,
                            zero_pad=False):
