@@ -65,8 +65,11 @@ For the ComfyUI 0.42.1 candidate, official Kitchen 0.2.39 uses the matching
 decode/cache and deferred-state adapters paired with the Omni kernels in this
 checkout. Official AIMDO 0.5.6 uses
 the matching 0.5.6 provider source at `xiangyuT/comfy-aimdo-xpu`
-(`74d103f856e5b995376ad59579b3cd4511922004`). Both provider manifests
-accept their matching official 0.2.39 and 0.5.6 versions. The ComfyUI release
+(`a3f55a9f2a9e648b0d30b57c850aa6c8a0f46966`). Both provider manifests
+accept their matching official 0.2.39 and 0.5.6 versions. AIMDO provider metadata
+comes from its source wheel; its builder has no manual release allowlist or
+version-to-upstream-commit table. This image selects the version combination and
+validates it at integration time. The ComfyUI release
 requirements also pin embedded docs to 0.5.14; frontend and workflow templates
 are selected as 1.55.18 and 0.11.89 by the build inputs.
 GGUF repository and commit must be updated together.
