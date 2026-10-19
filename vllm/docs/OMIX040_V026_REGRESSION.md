@@ -1,5 +1,16 @@
 # OMIX 0.4.0 / Ubuntu 26.04 — vLLM v0.26.0 regression snapshot
 
+## Latest rebuild: 2026-10-19 UTC
+
+The merged MTP fixes are now incorporated through exact source patches and a
+fresh full build. Current runtime: `llm-scaler-vllm:omix040-v026-mtpfix-r1`
+(`sha256:9096e420a27adc1e69e2aac1cb806e9c28be53c8a3afdc3fae9e2a09ffc1a114`).
+All wheels are exported and verified. New-image regression is still running;
+no all-pass release claim. See [MTP rebuild evidence](OMIX040_V026_MTP_REBUILD.md)
+for the current identities, exact fixes, measured results and remaining work.
+
+## Historical snapshot: 2026-10-16 UTC
+
 Updated 2026-10-16 UTC from archived results. This documentation refresh does
 not change the shipped runtime or rerun models. PR #764 remains Draft:
 **scheduled testing completed, release acceptance FAIL**.
