@@ -15,9 +15,11 @@ XPU_TARGET=bmg bash build.sh
 The current image supports Intel Arc B-series/Battlemage GPUs. `build.sh`
 assigns the `-comfyui-bmg` suffix to local builds because their native binaries
 are AOT-compiled for BMG. Published BMG releases use
-`intel/llm-scaler-omni:<version>` without a flavor or target suffix, but
-`0.2.0-b2` is currently available only as a source build. The command above
-produces `llm-scaler-omni:0.2.0-b2-comfyui-bmg`.
+`intel/llm-scaler-omni:<version>` without a flavor or target suffix.
+[`0.2.0-b2`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.2.0-b2/images/sha256-cc127efc23f8d6033d00e9d759468241ef478562ba63a56bb1dd8e83bbab46e3)
+is published. The current development version, `0.2.0-b3`, is available only
+as a source build. The command above produces
+`llm-scaler-omni:0.2.0-b3-comfyui-bmg`.
 
 The supported environment overrides are:
 
@@ -59,16 +61,19 @@ ComfyUI repository, commit, and version must be updated together. Kitchen and
 AIMDO official dependency versions are separate from the versions of their
 pinned provider source wheels. The provider manifests declare which official
 versions each source wheel accepts, and image validation checks both identities.
-For the ComfyUI 0.39.0 candidate, official Kitchen 0.2.39 uses the matching
+For the ComfyUI 0.42.1 candidate, official Kitchen 0.2.39 uses the matching
 0.2.39 provider source at `xiangyuT/comfy-kitchen-xpu`
-(`ee898a3a7825b158637c92fe8da5e47a710b2fbf`). This provider includes the native XPU LLM
+(`3c9c495f3c648166ec4b0c69b676904f09b53267`). This provider includes the native XPU LLM
 decode/cache and deferred-state adapters paired with the Omni kernels in this
-checkout. Official AIMDO 0.5.5 uses
-the matching 0.5.5 provider source at `xiangyuT/comfy-aimdo-xpu`
-(`80ef0f9abdb384a47d81058b4bec87a201ff63e4`). Both provider manifests
-accept their matching official 0.2.39 and 0.5.5 versions. The ComfyUI release
-requirements also pin embedded docs to 0.5.13; frontend and workflow templates
-are selected as 1.53.10 and 0.11.76 by the build inputs.
+checkout. Official AIMDO 0.5.6 uses
+the matching 0.5.6 provider source at `xiangyuT/comfy-aimdo-xpu`
+(`96e6503c01124ce62bc4f5215458371a650c539f`). Both provider manifests
+accept their matching official 0.2.39 and 0.5.6 versions. AIMDO provider metadata
+comes from its source wheel; its builder has no manual release allowlist or
+version-to-upstream-commit table. This image selects the version combination and
+validates it at integration time. The ComfyUI release
+requirements also pin embedded docs to 0.5.14; frontend and workflow templates
+are selected as 1.55.18 and 0.11.89 by the build inputs.
 GGUF repository and commit must be updated together.
 The private sidecar build requires the Torch release supported by llm-scaler
 (currently `2.14.0+xpu`) and an explicitly selected AIMDO revision that contains
@@ -211,7 +216,7 @@ the destination XPU.
 Run the validator inside the final container:
 
 ```bash
-IMAGE=llm-scaler-omni:0.2.0-b2-comfyui-bmg
+IMAGE=llm-scaler-omni:0.2.0-b3-comfyui-bmg
 
 sudo docker run --rm \
     --device=/dev/dri \

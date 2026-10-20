@@ -179,6 +179,10 @@ class Runtime:
         if graph.recording:
             graph.native.abort()
             graph.recording = False
+        else:
+            # Match ComfyUI's completed-graph cleanup barrier before backing
+            # is released. Checked close still owns XPU release/error handling.
+            self.mm.synchronize()
         self._exit_scope(graph)
         rogues = graph.native.rogue_count
         if not graph.native.close():

@@ -131,6 +131,7 @@ def runtime(monkeypatch):
         events.append("empty")
     mm = ModuleType("test_management")
     mm.cast_to, mm.cast_to_gathered, mm.get_cast_buffer, mm.soft_empty_cache = cast_to, gathered, buffer, empty
+    mm.synchronize = lambda: events.append("synchronize")
     mm.is_device_xpu = lambda d: d.type == "xpu"
     mm.current_stream = lambda d: stream
     mm.get_all_torch_devices = lambda: [device]
@@ -192,7 +193,32 @@ def test_begin_end_replay_keeps_scope_order(runtime):
     r.mp.malloc_graph_end()
     r.mp.cleanup_malloc_graph()
     assert r.events == ["record", "scope-enter", "int8-context", "kitchen-context", "pop", "scope-exit",
-                        "push", "scope-enter", "int8-context", "kitchen-context", "pop", "scope-exit", "close"]
+                        "push", "scope-enter", "int8-context", "kitchen-context", "pop", "scope-exit", "synchronize", "close"]
+    assert r.mp.MALLOC_GRAPHS == {}
+    assert r.mp.MALLOC_GRAPH_ROGUES == 3
+
+
+def test_completed_graph_sync_failure_retains_graph_before_close(runtime):
+    r = runtime
+    r.install()
+    r.mp.malloc_graph_begin(r.device)
+    r.mp.malloc_graph_end()
+    graph = r.graph()
+
+    def fail_sync():
+        r.events.append("synchronize-failed")
+        raise RuntimeError("sync-error")
+
+    r.mm.synchronize = fail_sync
+    with pytest.raises(RuntimeError, match="sync-error"):
+        r.mp.cleanup_malloc_graph()
+    assert r.graph() is graph
+    assert "close" not in r.events
+    assert r.mp.MALLOC_GRAPH_ROGUES == 0
+
+    r.mm.synchronize = lambda: r.events.append("synchronize")
+    r.mp.cleanup_malloc_graph()
+    assert r.events[-2:] == ["synchronize", "close"]
     assert r.mp.MALLOC_GRAPHS == {}
     assert r.mp.MALLOC_GRAPH_ROGUES == 3
 

@@ -6,7 +6,8 @@ default image is a single-XPU ComfyUI environment with target-specific
 ComfyUI integration layer.
 
 > [!IMPORTANT]
-> The current `0.2.0-b2` beta preview is available only as a source build. It is
+> The current `0.2.0-b3` beta preview is available only as a source build. The
+> published ComfyUI image is `intel/llm-scaler-omni:0.2.0-b2`. This source build is
 > experimental and focused on single-XPU ComfyUI workloads, and does not replace
 > the broader b8 image. For SGLang Diffusion, Raylight, or other multi-XPU
 > scenarios, use the published
@@ -39,9 +40,11 @@ Published BMG releases use the version as the image tag:
 intel/llm-scaler-omni:<version>
 ```
 
-`0.2.0-b2` has not been published as `intel/llm-scaler-omni:0.2.0-b2`.
-The source-build command above produces the local tag
-`llm-scaler-omni:0.2.0-b2-comfyui-bmg`. Published tags are listed
+The published BMG image is
+[`intel/llm-scaler-omni:0.2.0-b2`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.2.0-b2/images/sha256-cc127efc23f8d6033d00e9d759468241ef478562ba63a56bb1dd8e83bbab46e3).
+The source-build command above produces the development tag
+`llm-scaler-omni:0.2.0-b3-comfyui-bmg`; `0.2.0-b3` has not been published.
+The component pins below describe this source build. Published tags are listed
 in [Releases](../Releases.md). The development version is defined in
 `omni_xpu_kernel/omni_xpu_kernel/_version.py`.
 
@@ -51,7 +54,7 @@ Run the supplied acceptance script against the final image with the GPU device
 exposed:
 
 ```bash
-IMAGE=llm-scaler-omni:0.2.0-b2-comfyui-bmg
+IMAGE=llm-scaler-omni:0.2.0-b3-comfyui-bmg
 
 sudo docker run --rm \
     --device=/dev/dri \
@@ -69,7 +72,7 @@ Mount the existing ComfyUI model directory rather than copying models into the
 image:
 
 ```bash
-IMAGE=llm-scaler-omni:0.2.0-b2-comfyui-bmg
+IMAGE=llm-scaler-omni:0.2.0-b3-comfyui-bmg
 CONTAINER_NAME=comfyui
 COMFYUI_MODEL_DIR=/path/to/comfyui_models
 COMFYUI_INPUT_DIR=/path/to/comfyui_input
@@ -142,14 +145,14 @@ see [ComfyUI usage](docs/COMFYUI.md).
 
 The focused source build selects:
 
-- upstream [ComfyUI v0.39.0](https://github.com/Comfy-Org/ComfyUI/tree/v0.39.0),
-  pinned to `b0b743566f65daafc423b4fea8a2fbda94b3384a`;
+- upstream [ComfyUI v0.42.1](https://github.com/Comfy-Org/ComfyUI/tree/v0.42.1),
+  pinned to `63be2f9b82ad0dac88a7ceaa28a9cf3154125a18`;
 - `omni_xpu_kernel`, built for the selected Torch minor and XPU target;
 - official `comfy-kitchen==0.2.39` plus the matching co-installable XPU runtime provider
-  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/ee898a3a7825b158637c92fe8da5e47a710b2fbf),
+  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/3c9c495f3c648166ec4b0c69b676904f09b53267),
   including the managed GGUF and Nunchaku W4A16 routes;
-- official `comfy-aimdo==0.5.5` plus the co-installable XPU runtime provider
-  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/80ef0f9abdb384a47d81058b4bec87a201ff63e4),
+- official `comfy-aimdo==0.5.6` plus the co-installable XPU runtime provider
+  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/96e6503c01124ce62bc4f5215458371a650c539f),
   built with its Level Zero backend and native allocator hook;
 - [`ComfyUI-GGUF-XPU`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),
   with GGUF, SentencePiece, and Protobuf dependencies installed from the same
@@ -160,7 +163,7 @@ The focused source build selects:
   Kitchen and the packaged `omni_xpu_kernel` XPU operators; see
   [usage and legacy-node migration](docs/SPARSE_ATTENTION.md);
 - [ComfyUI-OmniXPU](ComfyUI-OmniXPU/README.md);
-- ComfyUI v0.39.0 integrated Node Manager plus pinned VideoHelperSuite,
+- ComfyUI v0.42.1 integrated Node Manager plus pinned VideoHelperSuite,
   Easy-Use, KJNodes, CacheDiT, and ControlNet auxiliary nodes;
 - an exact installed Python dependency snapshot at
   `/llm/manifests/comfyui-python-freeze.txt`.

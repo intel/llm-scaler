@@ -60,7 +60,10 @@ library hashes. Public XPU memory-compiler availability remains disabled.
 
 The adapter owns the XPU graph lifecycle and wraps cast, prefetch and explicit
 free-memory boundaries. It calls the original ComfyUI functions for copying,
-prefetch queue processing and prompt execution. ComfyUI upgrades can proceed
+prefetch queue processing and prompt execution. Completed XPU graphs synchronize
+before checked close releases their backing, matching upstream cleanup ordering;
+a synchronization failure retains the graph for cleanup rather than dropping
+its owner. ComfyUI upgrades can proceed
 normally: comments, source locations and unrelated changes are accepted;
 local renaming, logging, documentation and optional forwarding arguments are
 accepted. Interface removal or incompatible queue/iterate/core and
