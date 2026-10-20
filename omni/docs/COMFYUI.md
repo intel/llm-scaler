@@ -9,7 +9,7 @@ Mount an existing ComfyUI model directory and start ComfyUI directly. This is
 the recommended default when the workflow fits in XPU memory. The following
 uses the local image produced by the source-build command in
 [`../README.md`](../README.md). The source version is `0.2.0-b3`; the published
-image is [`intel/llm-scaler-omni:0.2.0-b2`](../../Releases.md#llm-scaler-omni):
+image is [`intel/llm-scaler-omni:0.2.0-b2`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.2.0-b2/images/sha256-cc127efc23f8d6033d00e9d759468241ef478562ba63a56bb1dd8e83bbab46e3).
 
 ```bash
 IMAGE=llm-scaler-omni:0.2.0-b3-comfyui-bmg

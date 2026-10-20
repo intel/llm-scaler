@@ -36,13 +36,10 @@
 
 ## llm-scaler-omni
 
-Current source builds use `0.2.0-b3`; see the [Omni build guide](omni/docs/IMAGE_BUILD.md).
-
 ### Latest Release 
-* [`intel/llm-scaler-omni:0.2.0-b2`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.2.0-b2/images/sha256-cc127efc23f8d6033d00e9d759468241ef478562ba63a56bb1dd8e83bbab46e3) [10/2026]
+* [`intel/llm-scaler-omni:0.2.0-b1`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.2.0-b1/images/sha256-b692be544940c3896bdf11fb3d66bbc089f1214a9e4f6749c34de43db8fddf23) [08/2026]
 
 ### Previous Releases
-* [`intel/llm-scaler-omni:0.2.0-b1`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.2.0-b1/images/sha256-b692be544940c3896bdf11fb3d66bbc089f1214a9e4f6749c34de43db8fddf23) [08/2026]
 * [`intel/llm-scaler-omni:0.1.0-b8`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b8/images/sha256-7e28f7e3aaa9448ce70151a1e6a89de13f0b3b844c0d76d4b40f1dece9b2da81) [07/2026]
 * [`intel/llm-scaler-omni:0.1.0-b7`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b7/images/sha256-0cda2f6c8666027aa64aaa6ce0bd8d6081a043ce046b65e2a28a5b5db2d85f61) [05/2026]
 * [`intel/llm-scaler-omni:0.1.0-b6`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b6/images/sha256-fcf14ab440bc8a9b0903ffdb2f9ec6b678ba6d0c5b8217a6e749bacb8ea5fc87) [03/2026]
