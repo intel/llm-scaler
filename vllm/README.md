@@ -1610,19 +1610,14 @@ All commands below run inside this same container.
 
 ##### LMCache only: RAW cache (recommended default)
 
-This single-host TP2 profile does not require explicit `CCL_ZE_IPC_EXCHANGE`,
-`FI_PROVIDER` or `FI_TCP_IFACE` overrides. Network-specific troubleshooting
-settings should not be applied as defaults for other deployments.
-
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
-# Match the image entrypoint when starting from an interactive bash shell.
 export LD_LIBRARY_PATH="/opt/venv/lib:${LD_LIBRARY_PATH:-}"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export LMCACHE_MP_TRANSFER_MODE=data
 unset LMCACHE_USE_UPSTREAM_MP
 
-# Start with lossless L1 cache reuse. These also override inherited settings.
+# Use RAW cache without KVWeave quantization.
 export LMCACHE_MP_L1_KVWEAVE_QUANT=0
 export LMCACHE_MP_KVWEAVE_ATTENTION_QUANT_ENABLED=0
 export LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED=0
@@ -1693,9 +1688,7 @@ a production or publicly accessible server.
 #### LMCache + KVWeave: Attention8 cache compression (Experimental)
 
 This optional profile adds lossy Attention-cache compression to LMCache.
-RAW cache validation does not establish KVWeave output quality or model
-compatibility. Validate cold and restored outputs and task accuracy for your
-model before adopting it; identical generated text is not guaranteed.
+Evaluate output quality for your model before use.
 
 Stop both LMCache and vLLM. In the startup block above, **replace** the RAW
 settings (the five `LMCACHE_MP_*QUANT*` exports) with the following, then
@@ -1719,9 +1712,7 @@ is enabled. To return to RAW, stop both processes, restore all five RAW
 settings and restart with a separate cache directory.
 
 Only Attention is compressed in this example; linear/Conv/SSM groups remain
-RAW. Attention-cache savings do **not** imply the same reduction for the whole
-hybrid cache. Keep Conv/SSM quantization disabled for this model: enabling it
-can trigger `rh requires a power-of-2 transform length, got 3072`.
+RAW. Keep Conv/SSM quantization disabled for this model.
 
 ## 4. Troubleshooting
 
