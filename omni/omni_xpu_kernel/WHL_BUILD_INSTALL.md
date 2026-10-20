@@ -1,5 +1,11 @@
 # omni_xpu_kernel Windows WHL 构建与 Portable 安装
 
+> **源码版本更新 — 2026-10-20。** 当前源码的 image / native wheel 基础版本为
+> `0.2.0-b3` / `0.2.0b3`，例如 Torch 2.14 BMG wheel 为
+> `0.2.0b3+torch214.bmg`。下方 2026-10-09 通知与各节的 b2 wheel 文件名、
+> SHA 和验收记录保留为历史身份；从当前源码构建时，应按实际 Torch/target
+> 选择 b3 wheel。Windows b3 wheel 尚未完成构建与安装态验收。
+
 > **Windows Torch 2.14 构建合同更新 — 2026-10-09。** 构建代码允许
 > `2.14.0+xpu`，使用 oneAPI 2026.1、oneDNN package 2026.1.0 /
 > native ABI 3.12.0，并将三组 Windows 扩展的语言标准切换为 C++20。
