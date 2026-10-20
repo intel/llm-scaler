@@ -277,8 +277,7 @@ RUN ls -la ${WHEELS}/
 
 # Final v0.26 compatibility patches are kept after the independent native
 # builds so a Python compatibility fix does not invalidate their compilation.
-# Downstream PR50 (932726f4cb86b818bf8fbc2566905f53b49eb77d) backports
-# upstream f725046204878c7de7c7dae10db6885d02d311a1 (vLLM#51599).
+# Backport the accepted-count ownership fix from vLLM#51599.
 COPY ./patches/gemma4_graph_scalar.patch ./patches/xpu_memory_accounting.patch \
      ./patches/xpu_allreduce_functional.patch \
      ./patches/vllm_mtp_accepted_count_ownership.patch /tmp/
