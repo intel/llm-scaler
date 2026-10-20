@@ -1,0 +1,43 @@
+diff --git a/vllm/model_executor/models/gemma4.py b/vllm/model_executor/models/gemma4.py
+--- a/vllm/model_executor/models/gemma4.py
++++ b/vllm/model_executor/models/gemma4.py
+@@ -1919,7 +1919,7 @@ class Gemma4DecoderLayer(nn.Module):
+ 
+         # Layer scalar (loaded from checkpoint) — applies to ALL text layers
+         self.register_buffer("layer_scalar", torch.ones(1))
+-        self._layer_scalar_host: float | None = None
++        self._layer_scalar_host: float = 1.0
+ 
+     def forward(
+         self,
+@@ -2237,8 +2237,6 @@ def _run_decoder_layers(
+             prev_layer_scalar=prev_layer_scalar,
+             **kwargs,
+         )
+-        if layer._layer_scalar_host is None:
+-            layer._layer_scalar_host = float(layer.layer_scalar.item())
+         prev_layer_scalar = layer._layer_scalar_host
+     if residual is not None and prev_layer_scalar is not None:
+         hidden_states = (hidden_states + residual) * prev_layer_scalar
+@@ -2803,8 +2801,6 @@ class Gemma4Model(nn.Module):
+                 prev_layer_scalar=prev_layer_scalar,
+                 **kwargs,
+             )
+-            if layer._layer_scalar_host is None:
+-                layer._layer_scalar_host = float(layer.layer_scalar.item())
+             prev_layer_scalar = layer._layer_scalar_host
+             self._maybe_add_hidden_state(
+                 aux_hidden_states, layer_idx + 1, hidden_states, residual
+@@ -2988,6 +2984,12 @@ class Gemma4Model(nn.Module):
+                     weight_loader(param, loaded_weight)
+             loaded_params.add(name)
+ 
++        # Read immutable checkpoint scalars before compilation/capture. A lazy
++        # Tensor.item() in forward introduces an uncapturable device-host sync.
++        for layer in islice(self.layers, self.start_layer, self.end_layer):
++            if isinstance(layer, Gemma4DecoderLayer):
++                layer._layer_scalar_host = float(layer.layer_scalar.item())
++
+         return loaded_params
+ 
+ 
