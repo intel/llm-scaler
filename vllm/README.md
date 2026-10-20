@@ -1534,10 +1534,10 @@ other parameters unchanged.
 
 LMCache's multiprocess connector stores and restores the model's Attention,
 Conv and SSM caches using host-memory L1 and optional filesystem L2. Cache
-quantization is **disabled by default**. Enabling KVWeave quantization only
-compresses Attention by default; linear/Conv/SSM quantization remains opt-in.
-For this hybrid model, use Attention8 with Conv/SSM kept in their original
-format. FP8 **weight** quantization is independent of cache quantization.
+quantization is **disabled by default**. Start with LMCache only (RAW cache,
+no KVWeave quantization), optionally adding filesystem L2. KVWeave cache
+compression is a separate **experimental, opt-in** profile described below.
+FP8 **weight** quantization is independent of cache quantization.
 
 The following text-inference configuration was validated on two Intel XPU
 devices: TP2, FP16 dtype, online FP8 weights, 1024-token cache chunks and
@@ -1588,7 +1588,8 @@ cd vllm
 DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile \
   -t llm-scaler-vllm:lmcache .
 
-docker run -it --name qwen38-lmcache --network host \
+docker run -it --name qwen38-lmcache \
+  -p 127.0.0.1:8000:8000 \
   --device /dev/dri \
   -v /dev/dri/by-path:/dev/dri/by-path:ro \
   --shm-size 40g \
@@ -1600,21 +1601,25 @@ docker run -it --name qwen38-lmcache --network host \
 Replace the model path and GPU mask with your local weights and **free**
 devices. The `/dev/dri/by-path` mount is required for oneCCL topology discovery.
 Allow at least 28 GiB of available host RAM for L1, in addition to model-loading
-and serving memory. All commands below run inside this same container.
+and serving memory. This example uses Docker's default bridge network and
+exposes only the vLLM API on the host's loopback interface. LMCache and vLLM
+communicate inside the same container; LMCache ports need not be published.
+All commands below run inside this same container.
 
 #### Start LMCache and vLLM
 
+##### LMCache only: RAW cache (recommended default)
+
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
-source /opt/intel/oneapi/ccl/2021.15/env/vars.sh --force
-export CCL_ZE_IPC_EXCHANGE=pidfd
-export FI_PROVIDER=tcp
-export FI_TCP_IFACE=lo
+export LD_LIBRARY_PATH="/opt/venv/lib:${LD_LIBRARY_PATH:-}"
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export LMCACHE_MP_TRANSFER_MODE=data
 unset LMCACHE_USE_UPSTREAM_MP
 
-# Start with lossless L1 cache reuse. These also override inherited settings.
+# Use RAW cache without KVWeave quantization.
 export LMCACHE_MP_L1_KVWEAVE_QUANT=0
+export LMCACHE_MP_KVWEAVE_ATTENTION_QUANT_ENABLED=0
 export LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED=0
 export LMCACHE_MP_KVWEAVE_CONV_QUANT_ENABLED=0
 export LMCACHE_MP_KVWEAVE_SSM_QUANT_ENABLED=0
@@ -1637,7 +1642,7 @@ done
 curl -fsS http://127.0.0.1:18078/healthcheck || exit 1
 
 vllm serve /llm/models/Qwen3.8-27B \
-  --served-model-name Qwen3.8-27B --host 127.0.0.1 --port 8000 \
+  --served-model-name Qwen3.8-27B --host 0.0.0.0 --port 8000 \
   --dtype float16 --quantization fp8 --tensor-parallel-size 2 \
   --block-size 1024 --max-num-batched-tokens 1024 \
   --max-model-len 18432 --max-num-seqs 4 --gpu-memory-utilization 0.85 \
@@ -1650,34 +1655,11 @@ kill "$LMCACHE_PID"
 ```
 
 Keep the vLLM block size, LMCache chunk size and max batched tokens at 1024
-for this validated profile. `pidfd` may fall back to `drmfd` on supported
-systems; that warning alone does not indicate a serving failure.
-
-#### Optional: Attention8 cache compression
-
-Before starting **both** LMCache and vLLM, replace the lossless settings with:
-
-```bash
-export LMCACHE_MP_L1_KVWEAVE_QUANT=1
-export LMCACHE_MP_KVWEAVE_ATTENTION_QUANT_ENABLED=1
-export LMCACHE_MP_KVWEAVE_ATTENTION_QBITS=8
-export LMCACHE_MP_KVWEAVE_PRECOND=1
-export LMCACHE_MP_KVWEAVE_SCALING_METHOD=per_channel
-export LMCACHE_MP_KVWEAVE_NUM_THREADS=8
-export LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED=0
-export LMCACHE_MP_KVWEAVE_CONV_QUANT_ENABLED=0
-export LMCACHE_MP_KVWEAVE_SSM_QUANT_ENABLED=0
-```
-
-Restart both processes after changing settings. Do not re-export the lossless
-`LMCACHE_MP_L1_KVWEAVE_QUANT=0` setting when using this profile. Attention8
-reduced the validated Attention group's storage by approximately 49%; this
-does **not** mean the whole hybrid cache is halved, since Mamba groups remain
-raw. Conv/SSM quantization is experimental for this model; enabling it can
-trigger `rh requires a power-of-2 transform length, got 3072`.
+for this profile.
 
 #### Optional: filesystem L2 and verifying recovery
 
+Filesystem L2 works with the RAW profile above; it does not require KVWeave.
 Mount a writable host directory into the container, for example
 `-v /path/to/lmcache-data:/cache`, and add this option to the LMCache command:
 
@@ -1702,6 +1684,35 @@ For isolated validation only, starting vLLM with `VLLM_SERVER_DEV_MODE=1`
 enables `POST /reset_prefix_cache?reset_external=false` to clear its local
 prefix cache while retaining LMCache. Do not enable development endpoints on
 a production or publicly accessible server.
+
+#### LMCache + KVWeave: Attention8 cache compression (Experimental)
+
+This optional profile adds lossy Attention-cache compression to LMCache.
+Evaluate output quality for your model before use.
+
+Stop both LMCache and vLLM. In the startup block above, **replace** the RAW
+settings (the five `LMCACHE_MP_*QUANT*` exports) with the following, then
+restart both processes using the same commands. Keep the common runtime and
+transfer settings; do not subsequently reapply the RAW exports.
+
+```bash
+export LMCACHE_MP_L1_KVWEAVE_QUANT=1
+export LMCACHE_MP_KVWEAVE_ATTENTION_QUANT_ENABLED=1
+export LMCACHE_MP_KVWEAVE_ATTENTION_QBITS=8
+export LMCACHE_MP_KVWEAVE_PRECOND=1
+export LMCACHE_MP_KVWEAVE_SCALING_METHOD=per_channel
+export LMCACHE_MP_KVWEAVE_NUM_THREADS=8
+export LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED=0
+export LMCACHE_MP_KVWEAVE_CONV_QUANT_ENABLED=0
+export LMCACHE_MP_KVWEAVE_SSM_QUANT_ENABLED=0
+```
+
+Use a separate, empty filesystem L2 directory when changing profiles, if L2
+is enabled. To return to RAW, stop both processes, restore all five RAW
+settings and restart with a separate cache directory.
+
+Only Attention is compressed in this example; linear/Conv/SSM groups remain
+RAW. Keep Conv/SSM quantization disabled for this model.
 
 ## 4. Troubleshooting
 
