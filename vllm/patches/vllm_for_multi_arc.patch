@@ -12708,7 +12708,7 @@ index 70566871e..d5338e514 100644
  
      # Overwrite canvas with argmax for newly converged denoise requests
 diff --git a/vllm/model_executor/models/gemma4.py b/vllm/model_executor/models/gemma4.py
-index 63d97fbd1..cdec38580 100644
+index 63d97fb..fc9f35a 100644
 --- a/vllm/model_executor/models/gemma4.py
 +++ b/vllm/model_executor/models/gemma4.py
 @@ -18,6 +18,7 @@
@@ -14109,7 +14109,7 @@ index 63d97fbd1..cdec38580 100644
  
          hidden_states = self.self_attn(
              positions=positions,
-@@ -721,27 +1974,211 @@ class Gemma4DecoderLayer(nn.Module):
+@@ -721,30 +1974,215 @@ class Gemma4DecoderLayer(nn.Module):
              **kwargs,
          )
  
@@ -14335,7 +14335,11 @@ index 63d97fbd1..cdec38580 100644
  
          # Apply PLE (Per-Layer Embedding) if configured
          if per_layer_input is not None and self.per_layer_input_gate is not None:
-@@ -754,8 +2191,23 @@ class Gemma4DecoderLayer(nn.Module):
++            hidden_states = hidden_states + residual
+             gate = self.per_layer_input_gate(hidden_states)
+             gate = torch.nn.functional.gelu(gate, approximate="tanh")
+             gated_per_layer = gate * per_layer_input
+@@ -754,8 +2192,24 @@ class Gemma4DecoderLayer(nn.Module):
              )
              hidden_states = hidden_states + per_layer_contribution
  
@@ -14357,11 +14361,12 @@ index 63d97fbd1..cdec38580 100644
 +            # combine it with its input RMSNorm in one launch.
 +            return hidden_states, residual
 +
-+        hidden_states = hidden_states + residual
++        if per_layer_input is None or self.per_layer_input_gate is None:
++            hidden_states = hidden_states + residual
          hidden_states = hidden_states * self.layer_scalar
  
          return hidden_states, None
-@@ -771,6 +2223,7 @@ def _run_decoder_layers(
+@@ -771,6 +2225,7 @@ def _run_decoder_layers(
  ) -> torch.Tensor:
      """Run a slice of decoder layers with PLE extraction."""
      residual = None
@@ -14369,7 +14374,7 @@ index 63d97fbd1..cdec38580 100644
      for idx, layer in enumerate(decoder_layers):
          layer_idx = idx + layer_idx_start
          layer_per_input = (
-@@ -781,8 +2234,14 @@ def _run_decoder_layers(
+@@ -781,8 +2236,14 @@ def _run_decoder_layers(
              hidden_states,
              residual,
              per_layer_input=layer_per_input,
@@ -14384,7 +14389,7 @@ index 63d97fbd1..cdec38580 100644
      return hidden_states
  
  
-@@ -1323,6 +2782,7 @@ class Gemma4Model(nn.Module, EagleModelMixin):
+@@ -1323,6 +2784,7 @@ class Gemma4Model(nn.Module, EagleModelMixin):
              if per_layer_inputs is not None:
                  per_layer_inputs = intermediate_tensors["per_layer_inputs"]
          residual = None
@@ -14392,7 +14397,7 @@ index 63d97fbd1..cdec38580 100644
          aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
          for layer_idx, layer in enumerate(
              islice(self.layers, self.start_layer, self.end_layer)
-@@ -1340,12 +2800,18 @@ class Gemma4Model(nn.Module, EagleModelMixin):
+@@ -1340,12 +2802,18 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                  hidden_states,
                  residual,
                  per_layer_input=layer_per_input,
@@ -14411,7 +14416,7 @@ index 63d97fbd1..cdec38580 100644
              tensors: dict[str, torch.Tensor] = {
                  "hidden_states": hidden_states,
              }
-@@ -1357,7 +2823,9 @@ class Gemma4Model(nn.Module, EagleModelMixin):
+@@ -1357,7 +2825,9 @@ class Gemma4Model(nn.Module, EagleModelMixin):
          if residual is None:
              hidden_states = self.norm(hidden_states)
          else:
@@ -14422,7 +14427,7 @@ index 63d97fbd1..cdec38580 100644
  
          if len(aux_hidden_states) > 0:
              return hidden_states, aux_hidden_states
-@@ -1508,7 +2976,12 @@ class Gemma4Model(nn.Module, EagleModelMixin):
+@@ -1508,7 +2978,12 @@ class Gemma4Model(nn.Module, EagleModelMixin):
  class Gemma4ForCausalLM(
      nn.Module, SupportsLoRA, SupportsPP, MixtureOfExperts, SupportsEagle3
  ):
@@ -14435,7 +14440,7 @@ index 63d97fbd1..cdec38580 100644
          orig_to_new_prefix={
              # Gemma4ForConditionalGeneration already loads the text stack
              # from `model.language_model.*`. We reuse that same checkpoint
-@@ -1616,6 +3089,16 @@ class Gemma4ForCausalLM(
+@@ -1616,6 +3091,16 @@ class Gemma4ForCausalLM(
      ) -> torch.Tensor | None:
          return self.logits_processor(self.lm_head, hidden_states)
  
