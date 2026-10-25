@@ -11,6 +11,46 @@
 
 To launch `dots.ocr`, follow the instructions in [Launching the Serving Service](../README.md#14-launching-the-serving-service), specifying the dots.ocr model, setting the model path to `/llm/models/dots.ocr`, the served-model-name to `model`, and the port to 8000.
 
+Pass `--chat-template` as well:
+
+```bash
+python3 -m vllm.entrypoints.openai.api_server \
+  --model /llm/models/dots.ocr \
+  --served-model-name model \
+  --trust-remote-code \
+  --chat-template /llm/llm-scaler/vllm/OCR/chat_template_dots_ocr.jinja \
+  --max-model-len 8192 \
+  --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.85 \
+  --enforce-eager \
+  --port 8000 \
+  --host 0.0.0.0
+```
+
+> **💡 Notes**
+>
+> - The `chat_template.json` shipped with the model does not emit the `<|user|>` /
+>   `<|endofuser|>` role delimiters (token ids 151670 / 151671) when `content` is an array,
+>   and concatenates the array in the order supplied by the caller. The generation marker
+>   `<|assistant|>` then follows the image patch tokens with no role terminator in between,
+>   which causes a significant fraction of requests to return hallucinated text instead of
+>   the expected JSON. `chat_template_dots_ocr.jinja` in this directory restores the role
+>   wrapper and normalises the ordering; `system`, `assistant` and the trailing section are
+>   unchanged from the original. No client-side change is required.
+> - vLLM 0.15.1 and earlier are unaffected, because they read the text-only template
+>   embedded in `tokenizer_config.json` rather than `chat_template.json`.
+> - To confirm the template was picked up, check that `/tokenize` returns 151670 as the
+>   first token id:
+>
+>   ```bash
+>   curl -s http://127.0.0.1:8000/tokenize \
+>     -H 'Content-Type: application/json' \
+>     -d '{"model":"model","messages":[{"role":"user","content":[
+>           {"type":"text","text":"hi"},
+>           {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,<any small image>"}}]}]}' \
+>     | python3 -c "import json,sys; print(json.load(sys.stdin)['tokens'][:3])"
+>   ```
+
 Once the service is running, you can use the method provided in the `dots.ocr` repository to launch Gradio for testing.
 
 ---
