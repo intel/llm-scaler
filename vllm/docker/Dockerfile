@@ -432,8 +432,13 @@ RUN sed -n -E 's/^([A-Za-z0-9_.-]+[=<>!~]+[^ ]+).*/\1/p' \
 #     shrink all in ONE layer: cleanup must happen in the same RUN that
 #     creates the bloat, otherwise a later layer can't reclaim the space.
 #     Wheels are bind-mounted (not COPY'd): a COPY would bake them into their
-#     own image layer that a later `rm` could never reclaim. ---
+#     own image layer that a later `rm` could never reclaim. The uv cache is a
+#     cache mount for the same reason (UV_LINK_MODE=copy keeps the venv
+#     independent of it). Wheels cannot carry symlinks, so identical copies of
+#     versioned shared libraries are relinked after installation. ---
 RUN --mount=type=bind,from=wheels,target=/wheels \
+    --mount=type=bind,source=docker/dedupe_shared_libs.py,target=/tmp/dedupe_shared_libs.py \
+    --mount=type=cache,target=/root/.cache/uv \
     --mount=type=secret,id=build-ca,target=/etc/ssl/certs/ca-certificates.crt \
     set -eo pipefail && \
     python /opt/runtime-checks/wheel_manifest.py verify \
@@ -446,6 +451,7 @@ RUN --mount=type=bind,from=wheels,target=/wheels \
         /wheels/vllm_xpu_kernels-*.whl \
         /wheels/kvweave-*.whl \
         /wheels/lmcache-*.whl && \
+    python /tmp/dedupe_shared_libs.py ${VIRTUAL_ENV} && \
     python -c 'import lmcache.xpu_ops, kvweave.kvweave_quant; print(lmcache.xpu_ops.__file__); print(kvweave.kvweave_quant.__file__)' && \
     python -c 'from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_mp_connector import LMCacheMPConnector; assert LMCacheMPConnector.__module__ == "lmcache.integration.vllm.lmcache_mp_connector"; print(LMCacheMPConnector)' && \
     python -c 'import importlib.metadata as m; assert m.version("torch") == "2.14.0+xpu"; assert m.version("triton") == "3.8.0+xpu"; assert m.version("triton-xpu") == "3.8.0"; assert m.version("oneccl") == m.version("oneccl-devel") == "2022.1.2"' && \
