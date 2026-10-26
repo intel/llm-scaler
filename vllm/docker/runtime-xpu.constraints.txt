@@ -17,8 +17,8 @@ intel-openmp==2026.1.1
 oneccl==2022.1.2
 oneccl-devel==2022.1.2
 intel-pti==1.1.0
-xgrammar==0.2.8
-transformers==5.8.0
+xgrammar==0.2.7
+transformers==5.18.0
 huggingface-hub>=1.5.0,<2.0
 # datasets 5.1.0 (vLLM XPU dependency) bounds fsspec. Preserve the validated
 # filesystem and locking stack when resolving Hub's transitive dependencies.
@@ -33,5 +33,4 @@ opentelemetry-exporter-otlp-proto-common==1.40.0
 opentelemetry-exporter-otlp-proto-grpc==1.40.0
 opentelemetry-exporter-otlp-proto-http==1.40.0
 opentelemetry-proto==1.40.0
-opentelemetry-exporter-prometheus==0.61b0
 opentelemetry-semantic-conventions==0.61b0

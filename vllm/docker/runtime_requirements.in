@@ -1,6 +1,6 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
-# Every distribution installed into the runtime venv, except the five native
+# Every distribution installed into the runtime venv, except the native
 # wheels built by docker/Dockerfile (installed with --no-deps). Versions of the
 # shared XPU stack come from runtime-xpu.constraints.txt and
 # intel-runtime.overrides.txt. Regenerate the lock with
@@ -23,7 +23,7 @@ triton-xpu
 -r vllm-requirements/xpu.txt
 
 # Serving extras.
-transformers==5.8.0
+transformers==5.18.0
 accelerate
 hf_transfer
 modelscope!=1.15.0
@@ -31,32 +31,3 @@ librosa
 soundfile
 decord
 ijson
-bigdl-core==2.4.0b2
-
-# LMCache MP / filesystem / observability profile. The LMCache wheel itself
-# declares CUDA, Redis and cloud-storage backends that are not enabled here.
-aiofiles
-aiohttp>=3.13.3
-blake3
-fastapi>=0.133.0,<0.137.0
-httpx
-huggingface-hub>=1.5.0
-httptools
-msgspec
-numba==0.65.0
-numpy<=2.2.6
-opentelemetry-api>=1.27.0,<=1.40.0
-opentelemetry-sdk>=1.27.0
-opentelemetry-exporter-otlp>=1.27.0
-opentelemetry-exporter-prometheus>=0.50b0,<=0.61b0
-prometheus-client>=0.18.0,<=0.24.1
-psutil
-py-cpuinfo
-pyyaml
-pyzmq>=25.0.0
-safetensors>=0.6.2
-setuptools>=77.0.3,<81.0.0
-setuptools-scm>=8
-sortedcontainers
-cachetools
-uvicorn

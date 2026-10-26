@@ -1,0 +1,27 @@
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index 051070e..11ce685 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -1052,6 +1052,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         3. Output projection
+         """
+         num_tokens = hidden_states.size(0)
++        if torch.compiler.is_compiling():
++            # Stream-keyed eager workspaces are not traceable. Keep allocation
++            # visible to the MiniCPM XPU GDN allocation/fusion passes instead.
++            projected_qkvz, _ = self.in_proj_qkvz(hidden_states)
++            projected_ba, _ = self.in_proj_ba(hidden_states)
++            core_attn_out = torch.zeros(
++                (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
++                dtype=hidden_states.dtype,
++                device=hidden_states.device,
++            )
++            z = torch.empty_like(core_attn_out)
++            torch.ops.vllm.gdn_attention_core_xpu(
++                core_attn_out, z, projected_qkvz, projected_ba, self.prefix
++            )
++            return self._output_projection(core_attn_out, z)
++
+         fused = (
+             try_esimd_gdn_spec_workspace(self, hidden_states)
+             if 2 <= num_tokens <= 8

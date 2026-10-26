@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Describe, record and verify the native wheel set built by docker/Dockerfile.
 
-inputs: print the build inputs (source revisions, patch and source hashes,
-        runtime lock hash, Python/torch/arch) as JSON.
+inputs: print the build inputs (source revisions, patch hashes,
+        runtime lock hash, Python/torch) as JSON.
 create: write manifest.json for a wheel directory.
 verify: reject a wheel directory that does not match this build's inputs.
 """
@@ -18,20 +18,13 @@ from pathlib import Path
 
 # Distribution names of the wheels built by this Dockerfile, one wheel each.
 DISTRIBUTIONS = (
-    "custom_esimd_kernels_vllm",
-    "kvweave",
-    "lmcache",
     "vllm",
     "vllm_xpu_kernels",
 )
 REVISION_ARGS = (
     "VLLM_VERSION",
     "VLLM_XPU_KERNELS_COMMIT",
-    "ONEDNN_COMMIT",
-    "KVWEAVE_COMMIT",
-    "LMCACHE_COMMIT",
     "PYTHON_VERSION",
-    "ESIMD_TORCH_XPU_ARCH_LIST",
 )
 
 
@@ -40,16 +33,6 @@ def sha256(path):
     with open(path, "rb") as f:
         for block in iter(lambda: f.read(1 << 20), b""):
             digest.update(block)
-    return digest.hexdigest()
-
-
-def tree_sha256(root):
-    """Hash relative paths and contents of every file below root."""
-    digest = hashlib.sha256()
-    root = Path(root)
-    for path in sorted(p for p in root.rglob("*") if p.is_file()):
-        digest.update(path.relative_to(root).as_posix().encode() + b"\0")
-        digest.update(sha256(path).encode() + b"\0")
     return digest.hexdigest()
 
 
@@ -68,7 +51,6 @@ def build_inputs(args):
     return {
         "revisions": {name: os.environ[name] for name in REVISION_ARGS},
         "patches": {Path(p).name: sha256(p) for p in sorted(args.patch)},
-        "custom_esimd_kernels_vllm_source": tree_sha256(args.esimd_source),
         "runtime_requirements": sha256(args.lock),
         "torch": torch_version(args.constraints),
     }
@@ -135,7 +117,6 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     inputs = commands.add_parser("inputs")
     inputs.add_argument("--patch", action="append", required=True)
-    inputs.add_argument("--esimd-source", required=True)
     inputs.add_argument("--lock", required=True)
     inputs.add_argument("--constraints", required=True)
     create = commands.add_parser("create")
