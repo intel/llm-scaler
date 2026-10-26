@@ -170,6 +170,36 @@ docker pull intelanalytics/multi-arc-serving:latest
 ```
 - Usage Instructions: [VLLM Docker Quickstart for A770](https://github.com/intel/ipex-llm/blob/main/docs/mddocs/DockerGuides/vllm_docker_quickstart.md#3-start-the-docker-container)
 
+**Supplement: Build the image or its wheels from source**
+
+Run from `vllm/` with Docker Buildx:
+
+```bash
+cd vllm
+# Image
+docker buildx build -f docker/Dockerfile -t llm-scaler-vllm:local --load .
+
+# All native wheels (vLLM, vllm-xpu-kernels, custom ESIMD kernels, KVWeave,
+# LMCache) with manifest.json and the runtime lock, written to ./dist/wheels
+docker buildx build -f docker/Dockerfile --target wheels \
+  --output type=local,dest=./dist/wheels .
+
+# One wheel: vllm-wheel, vllm-xpu-kernels-wheel, custom-esimd-kernels-wheel,
+# kvweave-wheel or lmcache-wheel
+docker buildx build -f docker/Dockerfile --target lmcache-wheel \
+  --output type=local,dest=./dist/lmcache .
+
+# Image from previously exported wheels, without compiling
+docker buildx build -f docker/Dockerfile --build-context wheels=./dist/wheels \
+  -t llm-scaler-vllm:local --load .
+```
+
+The last command needs a complete `--target wheels` export built from the same
+source revisions, patches and runtime lock; otherwise the build stops before
+installing anything. Behind a proxy, add `--build-arg http_proxy --build-arg
+https_proxy --build-arg no_proxy`; for a custom CA, add
+`--secret id=build-ca,src=/path/to/ca-bundle.crt`.
+
 ---
 
 ## (Optional) Run Docker without sudo
@@ -1548,28 +1578,24 @@ architecture solely based on the model directory name.
 
 #### Build and start a container
 
-The runtime applies `docker/runtime-xpu.constraints.txt` before installing
-vLLM or LMCache. This protects torch/triton-xpu/transformers and resolves the
-shared NumPy and OpenTelemetry versions consistently. LMCache's MP,
-filesystem and observability dependencies are maintained in
-`docker/lmcache_xpu_runtime_requirements.in`; the corresponding `.txt` is a
-generated, hash-verified lock, including Transformers' shared dependency
-bounds. Do not edit transitive pins by hand. Regenerate from `vllm/` using
-uv 0.12.5:
+The runtime installs its Python dependencies from
+`docker/runtime-requirements.txt`, a generated, hash-verified lock resolved
+in one pass for vLLM, LMCache's MP, filesystem and observability profile, and
+the serving extras listed in `docker/runtime_requirements.in`.
+`docker/runtime-xpu.constraints.txt` protects torch/triton-xpu/transformers and
+the shared NumPy and OpenTelemetry versions during that resolution. Do not
+edit transitive pins by hand. Regenerate from `vllm/` with Docker Buildx:
 
 ```bash
-bash docker/compile_lmcache_xpu_requirements.sh
+bash docker/compile_runtime_requirements.sh
 # Deliberately refresh compatible transitive versions:
-bash docker/compile_lmcache_xpu_requirements.sh --upgrade
+bash docker/compile_runtime_requirements.sh --upgrade
 ```
 
-The same lock is also passed as constraints during vLLM's dependency resolution;
-incompatible shared requirements fail rather than being overwritten later.
 The lock targets Python 3.12 / Linux x86_64 and the source revisions in the
-Dockerfile. Re-run resolution and image validation when those change. This
-locks the LMCache/Transformers profile, not every optional vLLM dependency.
-The build checks the complete installed environment and fails on new missing
-or conflicting requirements, including shared packages outside this lock.
+Dockerfile. Re-run resolution and image validation when those change.
+The build checks the complete installed environment and fails on missing
+or conflicting requirements.
 Only exact, documented XPU metadata gaps are exempt: system oneCCL replaces
 torch's Python oneCCL packages, triton-xpu replaces xgrammar's triton, and the
 LMCache wheel still declares unused CUDA/cloud/Redis/test backends. Decord's
