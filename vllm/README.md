@@ -180,14 +180,14 @@ cd vllm
 # Image
 docker buildx build -f docker/Dockerfile -t llm-scaler-vllm:local --load .
 
-# All native wheels (vLLM, vllm-xpu-kernels) with manifest.json and the
-# runtime lock, written to ./dist/wheels
+# All native wheels (vLLM, vllm-xpu-kernels, KVWeave, LMCache) with
+# manifest.json and the runtime lock, written to ./dist/wheels
 docker buildx build -f docker/Dockerfile --target wheels \
   --output type=local,dest=./dist/wheels .
 
-# One wheel: vllm-wheel or vllm-xpu-kernels-wheel
-docker buildx build -f docker/Dockerfile --target vllm-xpu-kernels-wheel \
-  --output type=local,dest=./dist/vllm-xpu-kernels .
+# One wheel: vllm-wheel, vllm-xpu-kernels-wheel, kvweave-wheel or lmcache-wheel
+docker buildx build -f docker/Dockerfile --target lmcache-wheel \
+  --output type=local,dest=./dist/lmcache .
 
 # Image from previously exported wheels, without compiling
 docker buildx build -f docker/Dockerfile --build-context wheels=./dist/wheels \
@@ -1572,6 +1572,8 @@ FP8 **weight** quantization is independent of cache quantization.
 The following text-inference configuration was validated on two Intel XPU
 devices: TP2, FP16 dtype, online FP8 weights, 1024-token cache chunks and
 `mamba-cache-mode=align`. Multimodal cache recovery and MTP are not covered.
+Qwen3.8-Flash-Next is not supported with LMCache; its QSA caches are rejected
+at startup.
 Use local Qwen3.8-27B weights; the validated checkpoint declares the
 `Qwen3_5ForConditionalGeneration` architecture. Do not substitute a different
 architecture solely based on the model directory name.

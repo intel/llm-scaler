@@ -18,12 +18,16 @@ from pathlib import Path
 
 # Distribution names of the wheels built by this Dockerfile, one wheel each.
 DISTRIBUTIONS = (
+    "kvweave",
+    "lmcache",
     "vllm",
     "vllm_xpu_kernels",
 )
 REVISION_ARGS = (
     "VLLM_VERSION",
     "VLLM_XPU_KERNELS_COMMIT",
+    "KVWEAVE_COMMIT",
+    "LMCACHE_COMMIT",
     "PYTHON_VERSION",
 )
 
