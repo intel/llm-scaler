@@ -1,3 +1,20 @@
+diff --git a/docs/design/integration/vllm/kv_cache_group_edits.md b/docs/design/integration/vllm/kv_cache_group_edits.md
+index b63a3b5..d6e9d09 100644
+--- a/docs/design/integration/vllm/kv_cache_group_edits.md
++++ b/docs/design/integration/vllm/kv_cache_group_edits.md
+@@ -40,8 +40,10 @@ when `kv_cache_config.has_mamba_layers`).
+ 
+ A Mamba / linear-attention layer (e.g. Qwen3.5 GDN) registers `[conv_state,
+ ssm_state]` — two tensors with different shapes and dtypes, laid out
+-contiguously in one padded page (`conv | ssm | pad`). The raw pair trips
+-format discovery (the SSM view starts mid-page). The edit reinterprets each
++contiguously in one padded page (`conv | ssm | pad`). From vLLM 0.31 it
++registers one byte view of the same pages instead, inside an allocation shared
++with other layers. Neither form fits format discovery (the SSM view starts
++mid-page; the byte view has no attention shape). The edit reinterprets each
+ page as one bf16 tensor shaped `(num_blocks, 2, block_size, 1, head_size)`
+ over the same storage, where `head_size` is derived so the bytes fill the page
+ exactly.
 diff --git a/docs/source/getting_started/installation.rst b/docs/source/getting_started/installation.rst
 index f0710d0..9a4d79d 100644
 --- a/docs/source/getting_started/installation.rst
@@ -13,7 +30,7 @@ index f0710d0..9a4d79d 100644
  
  
 diff --git a/lmcache/integration/vllm/kv_cache_group_edits.py b/lmcache/integration/vllm/kv_cache_group_edits.py
-index c8feb86..0a81894 100644
+index c8feb86..e8afbac 100644
 --- a/lmcache/integration/vllm/kv_cache_group_edits.py
 +++ b/lmcache/integration/vllm/kv_cache_group_edits.py
 @@ -38,6 +38,7 @@ from __future__ import annotations
@@ -24,8 +41,14 @@ index c8feb86..0a81894 100644
  from typing import TypeAlias
  
  # Third Party
-@@ -58,6 +59,59 @@ logger = init_logger(__name__)
- # for Mamba layers.
+@@ -54,10 +55,63 @@ from lmcache.logging import init_logger
+ 
+ logger = init_logger(__name__)
+ 
+-# One registered cache value: a paged KV tensor, or [conv_state, ssm_state]
+-# for Mamba layers.
++# One registered cache value: a paged KV tensor, or for Mamba layers either
++# [conv_state, ssm_state] (vLLM < 0.31) or one byte view of the page.
  RegisteredKVCache: TypeAlias = torch.Tensor | list[torch.Tensor]
  
 +
@@ -84,6 +107,17 @@ index c8feb86..0a81894 100644
  # Synthetic head count for a reinterpreted page. The page is opaque bytes, so
  # one "head" holding the whole per-(K/V) slab is enough; head_size is derived
  # to fill the page.
+@@ -201,8 +255,8 @@ class _MambaPageViewEdit(KVCacheGroupEdit):
+ 
+     A Mamba layer registers ``[conv_state, ssm_state]`` -- two tensors with
+     different shapes and dtypes sharing one padded page per block
+-    (``conv | ssm | pad``) -- which LMCache's attention-shaped transfer path
+-    cannot represent. Each page is one recurrent state snapshot, equivalent
++    (``conv | ssm | pad``) -- or, from vLLM 0.31, one byte view of those
++    pages; LMCache's attention-shaped transfer path cannot represent either. Each page is one recurrent state snapshot, equivalent
+     for caching purposes to one block of a sliding-window attention layer with
+     window == block_size: only the last matched block is ever consumed. The
+     edit reinterprets the page buffer as one
 @@ -210,7 +264,11 @@ class _MambaPageViewEdit(KVCacheGroupEdit):
      dtype, with ``head_size`` derived to fill the page exactly.
  
@@ -97,7 +131,7 @@ index c8feb86..0a81894 100644
      """
  
      name = "mamba-page-view"
-@@ -218,6 +276,77 @@ class _MambaPageViewEdit(KVCacheGroupEdit):
+@@ -218,15 +276,88 @@ class _MambaPageViewEdit(KVCacheGroupEdit):
      def matches(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> bool:
          return get_kv_cache_spec_kind(spec) == KVCacheSpecKind.MAMBA
  
@@ -175,7 +209,49 @@ index c8feb86..0a81894 100644
      def apply(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> torch.Tensor:
          # vLLM lays out one padded page per block as (conv | ssm | pad), and
          # the conv state is the view that starts at the page base: its leading
-@@ -314,6 +443,7 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
+         # dim is the block count and its per-block stride is one full page.
+         # Re-striding it therefore covers the whole page, ssm and pad included.
++        if isinstance(kv_cache, torch.Tensor):
++            return self._apply_page_view(spec, kv_cache)
+         if not isinstance(kv_cache, list) or not kv_cache:
+             raise ValueError(
+-                f"expected a Mamba [conv_state, ssm_state] tensor list, "
+-                f"got {type(kv_cache).__name__}"
++                f"expected a Mamba [conv_state, ssm_state] tensor list or page "
++                f"view, got {type(kv_cache).__name__}"
+             )
+         conv_state = kv_cache[0]
+         if conv_state.storage_offset() != 0:
+@@ -248,6 +379,28 @@ class _MambaPageViewEdit(KVCacheGroupEdit):
+         flat = conv_state.as_strided((num_blocks, elems_per_page), (elems_per_page, 1))
+         return flat.reshape(num_blocks, 2, spec.block_size, num_heads, head_size)
+ 
++    def _apply_page_view(self, spec: KVCacheSpec, page_view: torch.Tensor) -> torch.Tensor:
++        """Re-view a vLLM >= 0.31 Mamba page view like :meth:`apply`.
++
++        vLLM 0.31 places the pages of many layers in one shared allocation and
++        registers a per-layer view whose leading dim is the block count and
++        whose first element is the layer's page base. The page is addressed in
++        ``conv_state``'s dtype, as for the ``[conv_state, ssm_state]`` form.
++        """
++        if page_view.stride(0) * page_view.element_size() != spec.page_size_bytes:
++            raise ValueError(
++                f"Mamba page view per-block stride "
++                f"({page_view.stride(0) * page_view.element_size()} bytes) "
++                f"does not equal the page size ({spec.page_size_bytes} bytes)"
++            )
++        num_blocks = page_view.shape[0]
++        page_bytes = page_view if page_view.dtype == torch.int8 else page_view.view(torch.int8)
++        flat = page_bytes.as_strided(
++            (num_blocks, spec.page_size_bytes), (spec.page_size_bytes, 1)
++        ).view(spec.dtypes[0])
++        num_heads, head_size = _synthetic_attention_shape(flat.shape[1], spec.block_size)
++        return flat.view(num_blocks, 2, spec.block_size, num_heads, head_size)
++
+ 
+ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
+     """Re-view a kernel-paged attention tensor as logical-block pages.
+@@ -314,6 +467,7 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
                  f"expected a (num_blocks, 2, block_size, num_heads, head_size) "
                  f"attention KV tensor, got {got}"
              )
@@ -183,6 +259,16 @@ index c8feb86..0a81894 100644
          logical_block_size = spec.block_size
          kernel_block_size = kv_cache.shape[2]
          if logical_block_size % kernel_block_size != 0:
+@@ -370,7 +524,8 @@ def apply_kv_cache_group_edits(
+     Args:
+         kv_cache_config: vLLM ``KVCacheConfig`` (read for per-group specs).
+         kv_caches: Registered tensors keyed by layer name. Mamba entries are
+-            ``[conv_state, ssm_state]`` lists; others are single tensors.
++            ``[conv_state, ssm_state]`` lists or (vLLM >= 0.31) page views;
++            others are single tensors.
+ 
+     Returns:
+         A new ``dict`` with edited layers re-viewed, others untouched.
 diff --git a/lmcache/integration/vllm/kv_cache_groups.py b/lmcache/integration/vllm/kv_cache_groups.py
 index b15ae67..7467650 100644
 --- a/lmcache/integration/vllm/kv_cache_groups.py
@@ -6820,6 +6906,73 @@ index 0000000..b348b28
 +
 +    with pytest.raises(ValueError, match="Explicit KVWeave num_kv_heads"):
 +        context._init_l1_kvweave_quant_codec()
+diff --git a/tests/v1/test_kv_cache_group_edits.py b/tests/v1/test_kv_cache_group_edits.py
+new file mode 100644
+index 0000000..2e8ce2d
+--- /dev/null
++++ b/tests/v1/test_kv_cache_group_edits.py
+@@ -0,0 +1,61 @@
++# SPDX-License-Identifier: Apache-2.0
++# Standard
++from types import SimpleNamespace
++
++# Third Party
++import pytest
++import torch
++
++pytest.importorskip("vllm", reason="kv_cache_group_edits imports vLLM at module top")
++
++# First Party
++from lmcache.integration.vllm.kv_cache_group_edits import _MambaPageViewEdit  # noqa: E402
++
++BLOCK_SIZE = 4
++PAGE_BYTES = 2 * BLOCK_SIZE * 8 * 2  # (2, block_size, 1 head, 8) fp16 elements
++NUM_BLOCKS = 3
++NUM_LAYERS = 2
++
++
++def _spec() -> SimpleNamespace:
++    return SimpleNamespace(
++        page_size_bytes=PAGE_BYTES,
++        block_size=BLOCK_SIZE,
++        dtypes=(torch.float16, torch.float32),
++    )
++
++
++def _page_view(
++    buf: torch.Tensor, layer: int, block_stride: int, layer_stride: int
++) -> torch.Tensor:
++    # vLLM >= 0.31: [B, H, N, C] byte view whose block b starts at
++    # layer * layer_stride + b * block_stride in the shared allocation.
++    content = PAGE_BYTES - 16
++    return buf.as_strided(
++        (NUM_BLOCKS, 1, 1, content),
++        (block_stride, content, content, 1),
++        layer * layer_stride,
++    )
++
++
++def test_page_view_covers_each_layer_page_in_place() -> None:
++    buf = torch.arange(NUM_LAYERS * NUM_BLOCKS * PAGE_BYTES, dtype=torch.int32).to(torch.int8)
++    view = _page_view(buf, 1, PAGE_BYTES, NUM_BLOCKS * PAGE_BYTES)
++
++    edited = _MambaPageViewEdit().apply(_spec(), view)
++
++    assert edited.shape == (NUM_BLOCKS, 2, BLOCK_SIZE, 1, 8)
++    assert edited.dtype == torch.float16
++    assert edited.untyped_storage().data_ptr() == buf.untyped_storage().data_ptr()
++    for block in range(NUM_BLOCKS):
++        start = (NUM_BLOCKS + block) * PAGE_BYTES
++        expected = buf[start : start + PAGE_BYTES]
++        assert torch.equal(edited[block].reshape(-1).view(torch.int8), expected)
++
++
++def test_page_view_rejects_interleaved_layer_pages() -> None:
++    buf = torch.zeros(NUM_LAYERS * NUM_BLOCKS * PAGE_BYTES, dtype=torch.int8)
++    view = _page_view(buf, 0, NUM_LAYERS * PAGE_BYTES, PAGE_BYTES)
++
++    with pytest.raises(ValueError, match="per-block stride"):
++        _MambaPageViewEdit().apply(_spec(), view)
 diff --git a/tests/v1/test_kv_cache_groups.py b/tests/v1/test_kv_cache_groups.py
 index b7a0f51..919c124 100644
 --- a/tests/v1/test_kv_cache_groups.py

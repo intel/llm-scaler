@@ -35,6 +35,7 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    3.8 [DFlash Enable](#38-dflash-enable)<br>
    3.9 [Rust Frontend](#39-rust-frontend)<br>
    3.10 [Qwen3.8-27B + LMCache](#310-qwen38-27b--lmcache)<br>
+   3.11 [Qwen3.8-Flash-Next and MiniCPM-V 4.7](#311-qwen38-flash-next-and-minicpm-v-47)<br>
 4. [Troubleshooting](#4-troubleshooting)
 5. [Performance tuning](#5-performance-tuning)
 
@@ -179,13 +180,12 @@ cd vllm
 # Image
 docker buildx build -f docker/Dockerfile -t llm-scaler-vllm:local --load .
 
-# All native wheels (vLLM, vllm-xpu-kernels, custom ESIMD kernels, KVWeave,
-# LMCache) with manifest.json and the runtime lock, written to ./dist/wheels
+# All native wheels (vLLM, vllm-xpu-kernels, KVWeave, LMCache) with
+# manifest.json and the runtime lock, written to ./dist/wheels
 docker buildx build -f docker/Dockerfile --target wheels \
   --output type=local,dest=./dist/wheels .
 
-# One wheel: vllm-wheel, vllm-xpu-kernels-wheel, custom-esimd-kernels-wheel,
-# kvweave-wheel or lmcache-wheel
+# One wheel: vllm-wheel, vllm-xpu-kernels-wheel, kvweave-wheel or lmcache-wheel
 docker buildx build -f docker/Dockerfile --target lmcache-wheel \
   --output type=local,dest=./dist/lmcache .
 
@@ -1572,6 +1572,8 @@ FP8 **weight** quantization is independent of cache quantization.
 The following text-inference configuration was validated on two Intel XPU
 devices: TP2, FP16 dtype, online FP8 weights, 1024-token cache chunks and
 `mamba-cache-mode=align`. Multimodal cache recovery and MTP are not covered.
+Qwen3.8-Flash-Next is not supported with LMCache; its QSA caches are rejected
+at startup.
 Use local Qwen3.8-27B weights; the validated checkpoint declares the
 `Qwen3_5ForConditionalGeneration` architecture. Do not substitute a different
 architecture solely based on the model directory name.
@@ -1739,6 +1741,45 @@ settings and restart with a separate cache directory.
 
 Only Attention is compressed in this example; linear/Conv/SSM groups remain
 RAW. Keep Conv/SSM quantization disabled for this model.
+
+### 3.11 Qwen3.8-Flash-Next and MiniCPM-V 4.7
+
+Build this checkout's image (see [1.3](#13-pulling-and-running-the-vllm-docker-container)),
+start a container as in [3.2](#32-reference-commands-for-running-the-supported-qwen3536-models)
+with the weights of
+[Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) or
+[openbmb/MiniCPM-V-4.7-35B-A3B](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B)
+mounted under `/llm/models`, and run inside it:
+
+```bash
+source /opt/intel/oneapi/setvars.sh --force
+export LD_LIBRARY_PATH="/opt/venv/lib:${LD_LIBRARY_PATH:-}"
+```
+
+Qwen3.8-Flash-Next, online INT4, four 32 GB GPUs:
+
+```bash
+vllm serve /llm/models/Qwen3.8-Flash-Next --served-model-name Qwen3.8-Flash-Next \
+  --quantization sym_int4 --dtype float16 --tensor-parallel-size 4 \
+  --mamba-ssm-cache-dtype float16 --language-model-only --trust-remote-code \
+  --max-model-len 32768 --gpu-memory-utilization 0.9 --port 8000
+```
+
+`--language-model-only` serves text only and is required for the default
+single-request decode graph.
+
+MiniCPM-V 4.7, online FP8, two GPUs:
+
+```bash
+vllm serve /llm/models/MiniCPM-V-4.7-35B-A3B --served-model-name MiniCPM-V-4.7-35B-A3B \
+  --quantization fp8 --tensor-parallel-size 2 --trust-remote-code \
+  --max-model-len 32768 --gpu-memory-utilization 0.9 \
+  --reasoning-parser minicpmv --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+  --port 8000
+```
+
+Thinking is off by default; enable it per request with
+`"chat_template_kwargs": {"enable_thinking": true}`.
 
 ## 4. Troubleshooting
 
