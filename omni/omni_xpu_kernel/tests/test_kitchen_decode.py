@@ -24,7 +24,7 @@ def reference(q, k, v, lengths, causal=True):
     return out, lse
 
 
-@pytest.mark.parametrize("dim", [128, 256])
+@pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("seq", [1, 4, 8])
 @pytest.mark.parametrize("ratio", [1, 2, 5])
 def test_native_decode_staircase_strides_and_empty_rows(dim, seq, ratio):
@@ -93,7 +93,7 @@ def test_decode_rejects_invalid_metadata_and_output_overlap():
             torch.zeros(1,2,2,device="xpu"), q,k,k,q.view(1,2,512))
 
 
-@pytest.mark.parametrize("dim", [128, 256])
+@pytest.mark.parametrize("dim", [64, 128, 256])
 def test_native_decode_long_prefix(dim):
     """Match upstream's 32768-slot case, including the capped split count."""
     torch.manual_seed(181)
@@ -152,3 +152,30 @@ def test_native_decode_independent_stream_graphs(second_capacity):
         for actual, reference_output in zip(outputs, expected, strict=True):
             for got, want in zip(actual, reference_output, strict=True):
                 torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dim", [64,128,256])
+def test_native_tree_merge_matches_masked_full_attention(dim):
+    torch.manual_seed(328)
+    q=torch.randn(2,6,4,dim,device="xpu",dtype=torch.bfloat16)
+    pk=torch.randn(2,2,17,dim,device="xpu",dtype=q.dtype)
+    pv=torch.randn_like(pk)
+    k=torch.randn(2,4,2,dim,device="xpu",dtype=q.dtype).transpose(1,2)
+    v=torch.randn_like(k)
+    lengths=torch.tensor([0,17],device="xpu",dtype=torch.int32)
+    out,lse=kitchen.decode_attention(q,pk,pv,lengths,False)
+    mask=torch.tensor([1,3,5,11],device="xpu",dtype=torch.int32)
+    merged=torch.empty_like(out)
+    kitchen.decode_tree_merge(out,lse,q,k,v,mask,merged)
+    expected=[]
+    for b,n in enumerate([0,17]):
+        keys=torch.cat([pk[b:b+1,:,:n],k[b:b+1]],2).float().repeat_interleave(3,1)
+        values=torch.cat([pv[b:b+1,:,:n],v[b:b+1]],2).float().repeat_interleave(3,1)
+        scores=q[b:b+1].float()@keys.transpose(-1,-2)*dim**-.5
+        visible=torch.cat([torch.ones(4,n,device="xpu",dtype=torch.bool),
+                           ((mask[:,None]>>torch.arange(4,device="xpu"))&1).bool()],1)
+        scores.masked_fill_(~visible,-torch.inf)
+        expected.append((scores.softmax(-1)@values).transpose(1,2).reshape(1,4,6*dim).to(q.dtype))
+    torch.testing.assert_close(merged,torch.cat(expected),rtol=.01,atol=.003)
+    kitchen.decode_tree_merge(out,lse,q,k,v,mask,out)
+    torch.testing.assert_close(out,merged,rtol=0,atol=0)

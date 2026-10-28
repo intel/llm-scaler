@@ -120,7 +120,9 @@ def comfy_runtime():
             bootstrap = importlib.util.module_from_spec(spec)
             patch.setitem(sys.modules, name, bootstrap)
             spec.loader.exec_module(bootstrap)
-        state = bootstrap.bootstrap(dynamic_vram_override=False)
+        state = bootstrap.get_state()
+        if state["providers"].get("comfy_kitchen.xpu", {}).get("status") != "active":
+            state = bootstrap.bootstrap(dynamic_vram_override=False)
         assert state["providers"]["comfy_kitchen.xpu"]["status"] == "active", state
         # With an installed runtime, missing or incompatible model imports fail
         # collection of the fixture instead of silently skipping its checks.
@@ -610,3 +612,58 @@ def test_non_xpu_prefix_wrapper_is_transparent():
     assert adapter._guard_prefix_cache(Executor(), x, x, x,
                                       transformer_options=options) == "original"
     assert calls[0][0][-1] is options
+
+
+def test_writable_prefix_cache_fill_hit_and_exception_invalidation(runtime, monkeypatch):
+    activate(runtime)
+    patcher = make_patcher(runtime)
+    model = patcher.model.diffusion_model
+    slot = runtime.qwen.PrefixCacheSlot((1, 2, 5, 1, 128), 2, torch.float32, "default")
+    owner = runtime.qwen.KVCacheModel([slot])
+    for layer in slot:
+        layer.weight = torch.nn.Parameter(torch.empty_like(layer.weight, device=runtime.device), requires_grad=False)
+    prefix = {runtime.device: [slot]}
+    options = model_options(patcher)
+    x = torch.randn(1, 64, 3, 3, device=runtime.device)
+    context = torch.randn(1, 5, 128, device=runtime.device)
+    t = torch.ones(1, device=runtime.device)
+    with torch.inference_mode():
+        patcher.pre_run()
+        try:
+            first = model(x, t, context, transformer_options=options, prefix_cache=prefix)
+            assert slot.key is not None
+            hit = model(x, t, context, transformer_options=options, prefix_cache=prefix)
+            model.reset_prefix_cache(False)
+            full = model(x, t, context, transformer_options=options)
+            torch.testing.assert_close(hit, first, rtol=2e-5, atol=2e-5)
+            torch.testing.assert_close(hit, full, rtol=2e-5, atol=2e-5)
+            model.reset_prefix_cache(True)
+            # A later block can fail after an earlier layer changed backing.
+            def fail(*args, **kwargs):
+                raise RuntimeError("interrupted writable cache fill")
+            monkeypatch.setattr(model.transformer_blocks[1], "forward", fail)
+            with pytest.raises(RuntimeError, match="interrupted writable cache"):
+                model(x, t, context + 1, transformer_options=options, prefix_cache=prefix)
+            assert slot.key is None
+        finally:
+            patcher.cleanup()
+    assert owner.slots[0] is slot
+
+
+def test_unsafe_prefix_hooks_invalidate_writable_slots(runtime):
+    activate(runtime)
+    slot = types.SimpleNamespace(key=torch.ones(1))
+    model = types.SimpleNamespace(prefix_cache_enabled=True)
+    def reset(enabled):
+        model.prefix_cache_enabled = enabled
+    model.reset_prefix_cache = reset
+    class Executor:
+        class_obj = model
+        def __call__(self, *args, **kwargs):
+            assert not model.prefix_cache_enabled and slot.key is None
+            return "uncached"
+    x = torch.ones(1, device=runtime.device)
+    assert runtime.adapter._guard_prefix_cache(Executor(), x, x, x,
+        transformer_options={"patches": {"post_input": [object()]}},
+        prefix_cache={runtime.device: [slot]}) == "uncached"
+    assert model.prefix_cache_enabled and slot.key is None

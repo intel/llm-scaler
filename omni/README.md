@@ -143,16 +143,20 @@ see [ComfyUI usage](docs/COMFYUI.md).
 
 ## Image contents
 
+The 0.43.0 source-build selection supersedes the 0.42.1 / Kitchen 0.2.39 /
+AIMDO 0.5.6 defaults on 2026-10-28. Existing image and workflow results retain
+their original source/image identities; see the [build details](docs/IMAGE_BUILD.md).
+
 The focused source build selects:
 
-- upstream [ComfyUI v0.42.1](https://github.com/Comfy-Org/ComfyUI/tree/v0.42.1),
-  pinned to `63be2f9b82ad0dac88a7ceaa28a9cf3154125a18`;
+- upstream [ComfyUI v0.43.0](https://github.com/Comfy-Org/ComfyUI/tree/v0.43.0),
+  pinned to `426f5eea52a7ece1dd599fff4cb6cd1f352ddd24`;
 - `omni_xpu_kernel`, built for the selected Torch minor and XPU target;
-- official `comfy-kitchen==0.2.39` plus the matching co-installable XPU runtime provider
-  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/3c9c495f3c648166ec4b0c69b676904f09b53267),
+- official `comfy-kitchen==0.2.40` plus the matching co-installable XPU runtime provider
+  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/3a5728c21038c03a62e6cd74d3ffff740856b755),
   including the managed GGUF and Nunchaku W4A16 routes;
-- official `comfy-aimdo==0.5.6` plus the co-installable XPU runtime provider
-  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/96e6503c01124ce62bc4f5215458371a650c539f),
+- official `comfy-aimdo==0.6.0` plus the co-installable XPU runtime provider
+  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/0f86ae803d741319c86cc8f978a540de4d99f991),
   built with its Level Zero backend and native allocator hook;
 - [`ComfyUI-GGUF-XPU`](https://github.com/xiangyuT/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),
   with GGUF, SentencePiece, and Protobuf dependencies installed from the same
@@ -163,7 +167,7 @@ The focused source build selects:
   Kitchen and the packaged `omni_xpu_kernel` XPU operators; see
   [usage and legacy-node migration](docs/SPARSE_ATTENTION.md);
 - [ComfyUI-OmniXPU](ComfyUI-OmniXPU/README.md);
-- ComfyUI v0.42.1 integrated Node Manager plus pinned VideoHelperSuite,
+- ComfyUI v0.43.0 integrated Node Manager plus pinned VideoHelperSuite,
   Easy-Use, KJNodes, CacheDiT, and ControlNet auxiliary nodes;
 - an exact installed Python dependency snapshot at
   `/llm/manifests/comfyui-python-freeze.txt`.

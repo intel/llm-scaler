@@ -122,6 +122,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     assert config.dynamic_vram_boundary_trim
     assert config.lora_memory
     assert config.qwen_image21_cache
+    assert config.writable_weights
     assert config.seedvr_ada_reshape
     assert config.seedvr_capacity
     assert config.seedvr_cat_pad
@@ -148,6 +149,7 @@ def test_disabled_components_are_reported_without_importing_modules(monkeypatch)
         dynamic_vram_boundary_trim=False,
         lora_memory=False,
         qwen_image21_cache=False,
+        writable_weights=False,
         quantized_matmul=False,
         seedvr_ada_reshape=False,
         seedvr_capacity=False,

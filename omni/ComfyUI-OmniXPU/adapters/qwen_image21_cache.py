@@ -220,23 +220,41 @@ def _pinned_put(function):
     return functools.update_wrapper(namespace[function.__name__], function)
 
 
+def _invalidate_writable_prefix_cache(cache):
+    if cache is not None:
+        for slots in cache.values():
+            for slot in slots:
+                slot.key = None
+
+
 def _guard_prefix_cache(executor, x, timesteps, context, ref_latents=None,
                         image_slots=None, transformer_options=None, **kwargs):
     options = {} if transformer_options is None else transformer_options
     patches = options.get("patches", {})
     unsafe = any(patches.get(name) for name in _PREFIX_PATCHES)
     unsafe = unsafe or bool(options.get("patches_replace", {}).get("dit", {}))
-    model = executor.class_obj
-    if x.device.type != "xpu" or not unsafe:
+    if x.device.type != "xpu":
         return executor(x, timesteps, context, ref_latents, image_slots, options, **kwargs)
 
+    model = executor.class_obj
     enabled = model.prefix_cache_enabled
-    model.reset_prefix_cache(False)
+    writable_cache = kwargs.get("prefix_cache")
+    if unsafe:
+        model.reset_prefix_cache(False)
+        _invalidate_writable_prefix_cache(writable_cache)
     try:
         return executor(x, timesteps, context, ref_latents, image_slots, options, **kwargs)
+    except BaseException:
+        # A failed fill may have overwritten backing while its old key is
+        # still present. Neither legacy nor writable slots may survive it.
+        _invalidate_writable_prefix_cache(writable_cache)
+        if not unsafe:
+            model.reset_prefix_cache(enabled)
+        raise
     finally:
-        # Never restore a stale slot, including after an interrupted forward.
-        model.reset_prefix_cache(enabled)
+        if unsafe:
+            model.reset_prefix_cache(enabled)
+
 
 
 def apply():
@@ -282,17 +300,25 @@ def apply():
         if tuple(inspect.signature(original_put).parameters) != ("self", "i", "t"):
             raise ValueError("unsupported PoseBranchCache.put signature")
         forward = qwen.QwenImage21Transformer2DModel._forward
-        if tuple(inspect.signature(forward).parameters) != (
-            "self", "x", "timesteps", "context", "ref_latents", "image_slots",
-            "transformer_options", "kwargs",
-        ):
+        parameters = tuple(inspect.signature(forward).parameters)
+        legacy = ("self", "x", "timesteps", "context", "ref_latents", "image_slots",
+                  "transformer_options", "kwargs")
+        writable = legacy[:-1] + ("prefix_cache", "kwargs")
+        if parameters not in (legacy, writable):
             raise ValueError("unsupported Qwen Image 2.1 forward signature")
         entry = inspect.getsource(qwen.QwenImage21Transformer2DModel.forward)
         body = inspect.getsource(forward)
-        if ("WrappersMP.DIFFUSION_MODEL" not in entry
-                or "self._forward" not in entry
-                or "self.prefix_cache_enabled and prefix_len > 0 and not hooked" not in body
-                or any(f'patches.get("{name}")' not in body for name in _PREFIX_PATCHES)):
+        if parameters == writable:
+            eligibility = inspect.getsource(qwen.QwenImage21Transformer2DModel.can_cache_prefix)
+            compatible = ("prefix_len > 0 and self.can_cache_prefix(transformer_options)" in body
+                          and "PrefixCache(prefix_cache[x.device])" in body
+                          and "self.prefix_cache_enabled and not hooked" in eligibility)
+        else:
+            eligibility = body
+            compatible = "self.prefix_cache_enabled and prefix_len > 0 and not hooked" in body
+        if ("WrappersMP.DIFFUSION_MODEL" not in entry or "self._forward" not in entry
+                or not compatible
+                or any(f'patches.get("{name}")' not in eligibility for name in _PREFIX_PATCHES)):
             raise ValueError("unsupported Qwen Image 2.1 wrapper/cache contract")
         qwen_type = model_base.QwenImage21
         if not callable(getattr(patcher, "add_wrapper_with_key", None)):

@@ -100,6 +100,13 @@ COMPONENTS = (
         "adapters/lora_memory.py",
     ),
     Component(
+        "writable_weight_adapter",
+        "writable_weights",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/writable_weights.py",
+    ),
+    Component(
         "qwen_image21_cache_adapter",
         "qwen_image21_cache",
         "adapter",

@@ -38,8 +38,8 @@ void validate_qkv(const torch::Tensor& q, const torch::Tensor& k,
     TORCH_CHECK(q.size(0) > 0 && q.size(1) > 0 && q.size(2) >= 1 && q.size(2) <= 8
                 && k.size(1) > 0 && k.size(2) > 0 && k.size(0) == q.size(0)
                 && q.size(1) % k.size(1) == 0 && k.size(3) == q.size(3)
-                && (q.size(3) == 128 || q.size(3) == 256),
-                "decode requires B,H,Hk,L>0, 1<=S<=8, D=128/256 and H divisible by Hk");
+                && (q.size(3) == 64 || q.size(3) == 128 || q.size(3) == 256),
+                "decode requires B,H,Hk,L>0, 1<=S<=8, D=64/128/256 and H divisible by Hk");
 }
 struct DenseReader {
     View Q,K,V;
@@ -211,8 +211,8 @@ std::vector<torch::Tensor> decode_quantized(torch::Tensor q,torch::Tensor qi,tor
     return {out,lse};
 }
 
-void decode_step_merge(torch::Tensor out, torch::Tensor lse, torch::Tensor q,
-    torch::Tensor k, torch::Tensor v, torch::Tensor merged) {
+static void decode_merge(torch::Tensor out, torch::Tensor lse, torch::Tensor q,
+    torch::Tensor k, torch::Tensor v, std::optional<torch::Tensor> mask, torch::Tensor merged) {
     validate_qkv(q,k,v);
     const int B=q.size(0), H=q.size(1), S=q.size(2), D=q.size(3), HK=k.size(1);
     TORCH_CHECK(k.size(2)==S,"step merge requires S key/value rows");
@@ -224,6 +224,13 @@ void decode_step_merge(torch::Tensor out, torch::Tensor lse, torch::Tensor q,
                 "step merge requires contiguous BF16 out/merged[B,S,H*D] and FP32 LSE[B,H,S]");
     at::assert_no_internal_overlap(merged); at::assert_no_partial_overlap(merged,out);
     for(const auto& input:{q,k,v,lse}) at::assert_no_overlap(merged,input);
+    if(mask) {
+        TORCH_CHECK(mask->device()==q.device() && mask->scalar_type()==at::kInt
+                    && mask->sizes()==at::IntArrayRef({S}) && mask->is_contiguous(),
+                    "tree mask must be contiguous XPU int32 [S]");
+        at::assert_no_overlap(merged,*mask);
+    }
+    const int32_t* masks=mask?mask->data_ptr<int32_t>():nullptr;
     const auto Q=view(q), K=view(k), V=view(v);
     const BF16* prefix=static_cast<const BF16*>(out.data_ptr());
     BF16* dest=static_cast<BF16*>(merged.data_ptr());
@@ -235,19 +242,33 @@ void decode_step_merge(torch::Tensor out, torch::Tensor lse, torch::Tensor q,
                 const int index=it.get_group(0), t=it.get_local_id(0), lane=t%SG, row=t/SG;
                 const int s=index%S, h=index/S%H, b=index/(S*H), kh=h/(H/HK);
                 float dot=0;
-                if(row<=s) for(int d=lane;d<D;d+=SG) dot+=Q.load(b,h,s,d)*K.load(b,kh,row,d);
+                const bool allowed=row<S && (masks?((masks[s]>>row)&1):(row<=s));
+                if(allowed) for(int d=lane;d<D;d+=SG) dot+=Q.load(b,h,s,d)*K.load(b,kh,row,d);
                 dot=sycl::reduce_over_group(it.get_sub_group(),dot,sycl::plus<float>());
-                if(lane==0) score[row]=row<=s?dot*scale:-INFINITY;
+                if(lane==0) score[row]=allowed?dot*scale:-INFINITY;
                 it.barrier(sycl::access::fence_space::local_space);
                 if(t>=D) return;
-                float m=ls[index]; for(int i=0;i<=s;++i) m=sycl::fmax(m,score[i]);
+                float m=ls[index]; for(int i=0;i<S;++i) m=sycl::fmax(m,score[i]);
                 const float wp=ls[index]==-INFINITY?0.f:sycl::exp(ls[index]-m);
                 const int64_t pos=((int64_t(b)*S+s)*H+h)*D+t;
                 float sum=wp, value=wp>0?wp*float(prefix[pos]):0.f;
-                for(int i=0;i<=s;++i) { const float w=sycl::exp(score[i]-m); sum+=w; value+=w*V.load(b,kh,i,t); }
-                dest[pos]=BF16(value/sum);
+                for(int i=0;i<S;++i) {
+                    if(score[i]==-INFINITY) continue;
+                    const float w=sycl::exp(score[i]-m);sum+=w;value+=w*V.load(b,kh,i,t);
+                }
+                dest[pos]=BF16(sum>0?value/sum:0.f);
             });
     };
     utils::submit_kernel(submit,q.device(),"kitchen_decode_step_merge");
+}
+
+void decode_step_merge(torch::Tensor out,torch::Tensor lse,torch::Tensor q,
+    torch::Tensor k,torch::Tensor v,torch::Tensor merged) {
+    decode_merge(out,lse,q,k,v,std::nullopt,merged);
+}
+
+void decode_tree_merge(torch::Tensor out,torch::Tensor lse,torch::Tensor q,
+    torch::Tensor k,torch::Tensor v,torch::Tensor mask,torch::Tensor merged) {
+    decode_merge(out,lse,q,k,v,mask,merged);
 }
 }

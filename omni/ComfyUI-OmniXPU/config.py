@@ -29,6 +29,7 @@ class Config:
         self.lora_memory = (
             master and os.environ.get("OMNIXPU_LORA_MEMORY", "1") != "0"
         )
+        self.writable_weights = master
         self.qwen_image21_cache = (
             master and os.environ.get("OMNIXPU_QWEN_IMAGE21_CACHE", "1") != "0"
         )
