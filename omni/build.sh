@@ -82,7 +82,7 @@ case "${AIMDO_NATIVE_OWNER_DIAGNOSTIC}" in
         exit 1
         ;;
 esac
-GGUF_REPOSITORY="${COMFY_GGUF_REPOSITORY:-https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git}"
+GGUF_REPOSITORY="${COMFY_GGUF_REPOSITORY:-https://github.com/xiangyuT/ComfyUI-GGUF-XPU.git}"
 GGUF_COMMIT="${COMFY_GGUF_COMMIT:-39671fe73117ba97de7011e7e06e32599dcda06d}"
 NUNCHAKU_REPOSITORY="${COMFY_NUNCHAKU_REPOSITORY:-https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git}"
 NUNCHAKU_COMMIT="${COMFY_NUNCHAKU_COMMIT:-9f5604445f56154dd44e8b4acfed1aef868003c5}"
