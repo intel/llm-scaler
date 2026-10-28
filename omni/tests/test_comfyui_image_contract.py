@@ -117,7 +117,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_GGUF_REPOSITORY": (
         "GGUF_REPOSITORY",
-        "https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git",
+        "https://github.com/xiangyuT/ComfyUI-GGUF-XPU.git",
     ),
     "COMFY_GGUF_COMMIT": (
         "GGUF_COMMIT",

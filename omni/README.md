@@ -154,7 +154,7 @@ The focused source build selects:
 - official `comfy-aimdo==0.5.6` plus the co-installable XPU runtime provider
   from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/96e6503c01124ce62bc4f5215458371a650c539f),
   built with its Level Zero backend and native allocator hook;
-- [`ComfyUI-GGUF-XPU`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),
+- [`ComfyUI-GGUF-XPU`](https://github.com/xiangyuT/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),
   with GGUF, SentencePiece, and Protobuf dependencies installed from the same
   pinned checkout's requirements;
 - [`ComfyUI-nunchaku-XPU==1.2.1+xpu.3`](https://github.com/xiangyuT/ComfyUI-nunchaku-XPU/commit/9f5604445f56154dd44e8b4acfed1aef868003c5),
