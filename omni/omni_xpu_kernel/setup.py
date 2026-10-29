@@ -37,7 +37,9 @@ WINDOWS_ONEDNN_CONTRACTS = {
     "2.11": ("2025.3.0", (3, 9, 1), "2025.3"),
     "2.12": ("2025.3.0", (3, 9, 1), "2025.3"),
     "2.13": ("2026.0.0", (3, 11, 2), "2026.0"),
-    "2.14": ("2026.1.0", (3, 12, 0), "2026.1"),
+    # PyTorch 2.14 builds its XPU oneDNN from v3.12.3, which no Intel Windows
+    # package ships: build it from source and point DNNLROOT at the install.
+    "2.14": ("3.12.3", (3, 12, 3), "2026.1"),
 }
 
 

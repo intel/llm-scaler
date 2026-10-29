@@ -114,7 +114,7 @@ def test_windows_onednn_contract_tracks_torch_minor(monkeypatch):
 
     assert get_contract("2.12.0+xpu") == ("2025.3.0", (3, 9, 1), "2025.3")
     assert get_contract("2.13.0+xpu") == ("2026.0.0", (3, 11, 2), "2026.0")
-    assert get_contract("2.14.0+xpu") == ("2026.1.0", (3, 12, 0), "2026.1")
+    assert get_contract("2.14.0+xpu") == ("3.12.3", (3, 12, 3), "2026.1")
     with pytest.raises(RuntimeError, match="No Windows oneDNN contract"):
         get_contract("2.15.0+xpu")
 
@@ -502,7 +502,7 @@ def test_windows_cute_extension_is_explicit_opt_in(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize(
     ("torch_version", "install_series", "expected_version"),
-    [("2.13.0", "2026.0", "3.11.2"), ("2.14.0", "2026.1", "3.12.0")],
+    [("2.13.0", "2026.0", "3.11.2"), ("2.14.0", "2026.1", "3.12.3")],
 )
 def test_windows_onednn_runtime_bundle_contains_notices_and_hash(
     monkeypatch, tmp_path, torch_version, install_series, expected_version
@@ -553,9 +553,9 @@ def test_windows_onednn_runtime_bundle_contains_notices_and_hash(
 @pytest.mark.parametrize(
     ("header_version", "runtime_version", "error"),
     [
-        ((3, 12, 0), (3, 12, 0), None),
+        ((3, 12, 3), (3, 12, 3), None),
         ((3, 11, 2), (3, 11, 2), "Unsupported oneDNN headers"),
-        ((3, 12, 0), (3, 11, 2), "oneDNN header/runtime mismatch"),
+        ((3, 12, 3), (3, 11, 2), "oneDNN header/runtime mismatch"),
     ],
 )
 def test_windows_torch214_selects_matched_oneapi_installation(
