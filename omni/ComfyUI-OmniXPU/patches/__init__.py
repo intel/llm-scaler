@@ -128,13 +128,6 @@ COMPONENTS = (
         "adapters/seedvr_capacity.py",
     ),
     Component(
-        "seedvr_cat_pad_adapter",
-        "seedvr_cat_pad",
-        "adapter",
-        "ComfyUI-OmniXPU",
-        "adapters/seedvr_cat_pad.py",
-    ),
-    Component(
         "large_video_preprocess_adapter",
         "large_video_preprocess",
         "adapter",

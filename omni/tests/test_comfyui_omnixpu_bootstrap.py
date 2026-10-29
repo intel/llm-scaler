@@ -105,7 +105,6 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
         "OMNIXPU_QWEN_IMAGE21_CACHE",
         "OMNIXPU_SEEDVR_ADA_RESHAPE",
         "OMNIXPU_SEEDVR_CAPACITY",
-        "OMNIXPU_SEEDVR_CAT_PAD",
         "OMNIXPU_LARGE_VIDEO_PREPROCESS",
         "OMNIXPU_INTERPOLATE_FIX",
         "OMNIXPU_MEDIAN_FIX",
@@ -125,7 +124,6 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     assert config.writable_weights
     assert config.seedvr_ada_reshape
     assert config.seedvr_capacity
-    assert config.seedvr_cat_pad
     assert config.large_video_preprocess
     assert not config.interpolate_fix
     assert not config.median_fix
@@ -153,7 +151,6 @@ def test_disabled_components_are_reported_without_importing_modules(monkeypatch)
         quantized_matmul=False,
         seedvr_ada_reshape=False,
         seedvr_capacity=False,
-        seedvr_cat_pad=False,
         large_video_preprocess=False,
         interpolate_fix=False,
         median_fix=False,

@@ -1,7 +1,12 @@
-"""Bound large SeedVR2 activation lifetimes without changing its graph.
+"""Bound SeedVR2 window-attention materialization without changing its graph.
 
-The adapter keeps the selected attention backend and quantized Linear modules
-opaque.  It only changes when independent rows and windows are materialized.
+ComfyUI's ``NaSwinAttention`` projects QKV for every video token, partitions
+it into windows, and concatenates each window with the text tokens for one
+varlen attention call. Above a byte threshold this adapter runs those same
+upstream operations over consecutive groups of whole windows, so only one
+group's QKV is live at a time. The Linear modules, QK norms, RoPE, attention
+backend, and output projection remain ComfyUI's own. MLP chunking is owned by
+ComfyUI's ``NaMMSRTransformerBlock._chunked_mlp``.
 """
 
 from __future__ import annotations
@@ -18,23 +23,34 @@ log = logging.getLogger("ComfyUI-OmniXPU")
 
 _ATTENTION_THRESHOLD_BYTES = 4 * 1024**3
 _ATTENTION_GROUP_BYTES = 256 * 1024**2
-_MLP_THRESHOLD_BYTES = 4 * 1024**3
-_MLP_GROUP_BYTES = 384 * 1024**2
-_LINEAR_GROUP_ROWS = 65536
 _PATCH_MARKER = "_omnixpu_seedvr_capacity_patched"
+_CACHE_PREFIX = "omnixpu_capacity."
 _attention_logged = False
-_swiglu_logged = False
 
+_MODULE_SYMBOLS = (
+    "AttentionTensorContainer",
+    "NaMMRotaryEmbedding3d",
+    "_apply_rope1_partial",
+    "optimized_var_attention",
+    "repeat_concat_idx",
+    "window",
+)
 _ATTENTION_SOURCE_CONTRACT = (
     "vid_qkv, txt_qkv = self.proj_qkv(vid, txt)",
-    "window_idx(vid_shape, make_window)",
-    "optimized_var_attention(",
-    "self.proj_out(vid_out, txt_out)",
+    "window_slices = self.window_op((t, h, w), self.window)",
+    "lambda: window_idx(vid_shape, make_window)",
+    "vid_q, txt_q = self.norm_q(vid_q, txt_q)",
+    "vid_k, txt_k = self.norm_k(vid_k, txt_k)",
+    "vid_q, vid_k, window_shape, txt_q, txt_k, txt_shape, txt_shape_win, cache_win",
+    "repeat_concat_idx(vid_len_win, txt_len, window_count)",
+    "preferred_attention=self.comfy_attention",
+    "vid_out, txt_out = unconcat_win(out)",
+    "vid_out, txt_out = self.proj_out(vid_out, txt_out)",
 )
-_SWIGLU_SOURCE_CONTRACT = (
-    "self.proj_out(",
-    "F.silu(self.proj_in_gate(x))",
-    "self.proj_in(x)",
+_ROPE_SOURCE_CONTRACT = (
+    "self.get_freqs(vid_shape, txt_shape, vid_txt_shape)",
+    "vid_q = _apply_rope1_partial(vid_q, vid_freqs)",
+    "txt_q = _apply_rope1_partial(txt_q, txt_freqs)",
 )
 
 
@@ -46,249 +62,168 @@ def _source_has(function, snippets):
     return all(snippet in source for snippet in snippets)
 
 
-def _chunk_rows(row_bytes, target_bytes, alignment=256):
-    rows = max(1, target_bytes // max(1, row_bytes))
-    if rows >= alignment:
-        rows = max(alignment, rows // alignment * alignment)
-    return rows
+def _branch(module, name):
+    """Return the vid or txt module of a ComfyUI SeedVR2 ``MMModule``."""
+    return module.all if module.shared_weights else getattr(module, name)
 
 
-def _chunked_forward(module, value, chunk_rows):
-    value_2d = value.reshape(-1, value.shape[-1])
-    output = None
-    offset = 0
-    for chunk in value_2d.split(chunk_rows, dim=0):
-        chunk_output = module(chunk)
-        if output is None:
-            output = chunk_output.new_empty(
-                (value_2d.shape[0], *chunk_output.shape[1:])
-            )
-        output[offset : offset + chunk_output.shape[0]] = chunk_output
-        offset += chunk_output.shape[0]
-    return output.reshape(*value.shape[:-1], *output.shape[1:])
-
-
-def _bounded_swiglu(module, value, chunk_rows):
-    return _chunked_forward(
-        lambda chunk: module.proj_out(
-            torch.nn.functional.silu(module.proj_in_gate(chunk))
-            * module.proj_in(chunk)
-        ),
-        value,
-        chunk_rows,
-    )
-
-
-def _window_indices(seedvr_model, hid_shape, window_fn):
-    hid_idx = torch.arange(
-        hid_shape.prod(-1).sum(), device=hid_shape.device
+def _window_plan(seedvr_model, vid_shape, make_window):
+    """Token order, shapes, and lengths of the windows ``window_idx`` builds."""
+    token_index = torch.arange(
+        vid_shape.prod(-1).sum(), device=vid_shape.device
     ).unsqueeze(-1)
-    target_idx, target_shape, target_windows, target_lengths, window_counts = (
-        seedvr_model.window(hid_idx, hid_shape, window_fn)
+    order, window_shape, _, window_lengths, _ = seedvr_model.window(
+        token_index, vid_shape, make_window
     )
-    return (
-        target_idx.squeeze(-1),
-        target_shape,
-        target_windows,
-        target_lengths,
-        window_counts,
+    return order.squeeze(-1), window_shape, window_lengths
+
+
+def _window_groups(window_lengths, row_bytes, group_bytes):
+    """Split windows into consecutive groups holding at most ``group_bytes`` of QKV."""
+    max_tokens = max(1, group_bytes // row_bytes)
+    groups = []
+    first_window = first_token = tokens = 0
+    for index, length in enumerate(window_lengths):
+        if tokens and tokens + length > max_tokens:
+            groups.append(
+                (first_window, index, first_token, first_token + tokens)
+            )
+            first_window, first_token, tokens = (
+                index,
+                first_token + tokens,
+                0,
+            )
+        tokens += length
+    groups.append(
+        (first_window, len(window_lengths), first_token, first_token + tokens)
     )
+    return groups
+
+
+def _qkv_bytes(self, vid):
+    return vid.shape[0] * 3 * self.heads * self.head_dim * vid.element_size()
 
 
 def _should_bound_attention(self, vid, txt, vid_shape, model_management):
-    qkv_bytes = (
-        vid.shape[0]
-        * 3
-        * self.heads
-        * self.head_dim
-        * vid.element_size()
-    )
     return bool(
-        self.rope is not None
-        and self.rope.mm
+        getattr(self.rope, "mm", False)
+        and not getattr(self, "version_7b", False)
         and vid_shape.shape[0] == 1
         and not model_management.in_training
         and not vid.requires_grad
         and not txt.requires_grad
-        and qkv_bytes > _ATTENTION_THRESHOLD_BYTES
+        and _qkv_bytes(self, vid) > _ATTENTION_THRESHOLD_BYTES
     )
 
 
 def _bounded_attention(seedvr_model, self, vid, txt, vid_shape, txt_shape, cache):
-    cache_win = cache.namespace(
-        f"{self.window_method}_{self.window}_sd3"
-    )
+    cache_win = cache.namespace(f"{self.window_method}_{self.window}_sd3")
 
     def make_window(value):
-        temporal, height, width, _ = value.shape
-        slices = self.window_op(
-            (temporal, height, width), self.window
+        t, h, w, _ = value.shape
+        window_slices = self.window_op((t, h, w), self.window)
+        return [value[st, sh, sw] for st, sh, sw in window_slices]
+
+    order, window_shape, window_lengths = cache_win(
+        _CACHE_PREFIX + "windows",
+        lambda: _window_plan(seedvr_model, vid_shape, make_window),
+    )
+    row_bytes = 3 * self.heads * self.head_dim * vid.element_size()
+    groups = cache_win(
+        _CACHE_PREFIX + f"groups_{row_bytes}_{_ATTENTION_GROUP_BYTES}",
+        lambda: _window_groups(
+            window_lengths, row_bytes, _ATTENTION_GROUP_BYTES
+        ),
+    )
+
+    def group_rope(first, last):
+        # mmrope frequencies depend only on each window's own shape and the
+        # text length of its sample, so a window subset yields its own rows.
+        return self.rope.get_freqs(
+            window_shape[first:last],
+            txt_shape,
+            txt_shape.repeat(last - first, 1),
         )
-        return [value[st, sh, sw] for st, sh, sw in slices]
 
-    window_order, window_shape, _, vid_lengths, window_counts = cache_win(
-        "win_indices",
-        lambda: _window_indices(seedvr_model, vid_shape, make_window),
-    )
-    window_count = window_counts[0]
+    def group_concat(first, last):
+        return seedvr_model.repeat_concat_idx(
+            window_shape[first:last].prod(-1),
+            txt_shape.prod(-1).to(window_shape.device),
+            torch.tensor([last - first], device=window_shape.device),
+        )
 
-    qkv_row_bytes = 3 * self.heads * self.head_dim * vid.element_size()
-    max_group_tokens = max(1, _ATTENTION_GROUP_BYTES // qkv_row_bytes)
-    groups = []
-    first_window = first_token = group_tokens = 0
-    for next_window, window_tokens in enumerate(vid_lengths, 1):
-        if group_tokens and group_tokens + window_tokens > max_group_tokens:
-            groups.append(
-                (
-                    first_window,
-                    next_window - 1,
-                    first_token,
-                    first_token + group_tokens,
-                )
-            )
-            first_window = next_window - 1
-            first_token += group_tokens
-            group_tokens = 0
-        group_tokens += window_tokens
-    groups.append(
-        (first_window, window_count, first_token, first_token + group_tokens)
-    )
-
-    vid_qkv_module = (
-        self.proj_qkv.vid
-        if not self.proj_qkv.shared_weights
-        else self.proj_qkv.all
-    )
-    txt_qkv_module = (
-        self.proj_qkv.txt
-        if not self.proj_qkv.shared_weights
-        else self.proj_qkv.all
-    )
-    vid_norm_q = (
-        self.norm_q.vid if not self.norm_q.shared_weights else self.norm_q.all
-    )
-    txt_norm_q = (
-        self.norm_q.txt if not self.norm_q.shared_weights else self.norm_q.all
-    )
-    vid_norm_k = (
-        self.norm_k.vid if not self.norm_k.shared_weights else self.norm_k.all
-    )
-    txt_norm_k = (
-        self.norm_k.txt if not self.norm_k.shared_weights else self.norm_k.all
-    )
+    vid_qkv_module = _branch(self.proj_qkv, "vid")
+    vid_norm_q = _branch(self.norm_q, "vid")
+    vid_norm_k = _branch(self.norm_k, "vid")
 
     txt = txt.to(device=vid.device, dtype=vid.dtype)
-    txt_qkv = txt_qkv_module(txt).reshape(
+    txt_qkv = _branch(self.proj_qkv, "txt")(txt).reshape(
         txt.shape[0], 3, self.heads, self.head_dim
     )
     txt_q, txt_k, txt_v = txt_qkv.unbind(1)
-    txt_q = txt_norm_q(txt_q)
-    txt_k = txt_norm_k(txt_k)
+    del txt_qkv
+    txt_q = _branch(self.norm_q, "txt")(txt_q)
+    txt_k = _branch(self.norm_k, "txt")(txt_k)
 
-    _, txt_freqs = self.rope.get_freqs(window_shape[:1], txt_shape)
-    txt_freqs = txt_freqs.to(device=txt_q.device)
-    txt_q = seedvr_model._apply_rope1_partial(
-        txt_q.transpose(0, 1), txt_freqs
-    ).transpose(0, 1)
-    txt_k = seedvr_model._apply_rope1_partial(
-        txt_k.transpose(0, 1), txt_freqs
-    ).transpose(0, 1)
+    vid_out = vid.new_empty((vid.shape[0], self.heads * self.head_dim))
+    txt_sum = None
+    for group_index, (first, last, token_start, token_end) in enumerate(groups):
+        vid_freqs, txt_freqs = cache_win(
+            _CACHE_PREFIX + f"rope_{first}_{last}",
+            functools.partial(group_rope, first, last),
+        )
+        if group_index == 0:
+            txt_freqs = txt_freqs.to(device=txt_q.device)
+            txt_q = seedvr_model._apply_rope1_partial(txt_q, txt_freqs)
+            txt_k = seedvr_model._apply_rope1_partial(txt_k, txt_freqs)
 
-    txt_windows = txt.new_empty(
-        (txt.shape[0], window_count, self.heads, self.head_dim)
-    )
-    for window_start, window_end, token_start, token_end in groups:
-        group_order = window_order[token_start:token_end]
-        vid_group = torch.index_select(vid, 0, group_order)
-        vid_qkv = vid_qkv_module(vid_group).reshape(
-            vid_group.shape[0], 3, self.heads, self.head_dim
+        group_order = order[token_start:token_end]
+        vid_qkv = vid_qkv_module(torch.index_select(vid, 0, group_order))
+        vid_qkv = vid_qkv.reshape(
+            vid_qkv.shape[0], 3, self.heads, self.head_dim
         )
         vid_q, vid_k, vid_v = vid_qkv.unbind(1)
+        del vid_qkv
         vid_q = vid_norm_q(vid_q)
         vid_k = vid_norm_k(vid_k)
-
-        group_window_shape = window_shape[window_start:window_end]
-        group_txt_shape = txt_shape.repeat(window_end - window_start, 1)
-        vid_freqs, _ = self.rope.get_freqs(
-            group_window_shape, group_txt_shape
-        )
         vid_freqs = vid_freqs.to(device=vid_q.device)
-        vid_q = seedvr_model._apply_rope1_partial(
-            vid_q.transpose(0, 1), vid_freqs
-        ).transpose(0, 1)
-        vid_k = seedvr_model._apply_rope1_partial(
-            vid_k.transpose(0, 1), vid_freqs
-        ).transpose(0, 1)
+        vid_q = seedvr_model._apply_rope1_partial(vid_q, vid_freqs)
+        vid_k = seedvr_model._apply_rope1_partial(vid_k, vid_freqs)
 
-        group_vid_lengths = vid_lengths[window_start:window_end]
-        group_vid_lengths_tensor = group_window_shape.prod(-1)
-        group_window_count = window_end - window_start
-        txt_length = txt.shape[0]
-        all_lengths = [
-            length + txt_length for length in group_vid_lengths
-        ]
-        q = seedvr_model.repeat_concat(
-            vid_q,
-            txt_q,
-            group_vid_lengths_tensor,
-            txt_shape.prod(-1),
-            [group_window_count],
+        concat, unconcat, cu_seqlens = cache_win(
+            _CACHE_PREFIX + f"concat_{first}_{last}",
+            functools.partial(group_concat, first, last),
         )
-        k = seedvr_model.repeat_concat(
-            vid_k,
-            txt_k,
-            group_vid_lengths_tensor,
-            txt_shape.prod(-1),
-            [group_window_count],
-        )
-        v = seedvr_model.repeat_concat(
-            vid_v,
-            txt_v,
-            group_vid_lengths_tensor,
-            txt_shape.prod(-1),
-            [group_window_count],
-        )
+        container = seedvr_model.AttentionTensorContainer
+        q = container(concat(vid_q, txt_q))
+        del vid_q
+        k = container(concat(vid_k, txt_k))
+        del vid_k
+        v = container(concat(vid_v, txt_v))
+        del vid_v
         out = seedvr_model.optimized_var_attention(
             q=q,
             k=k,
             v=v,
+            preferred_attention=self.comfy_attention,
             heads=self.heads,
             skip_reshape=True,
             skip_output_reshape=True,
-            cu_seqlens_q=seedvr_model.cumulative_lengths(all_lengths),
-            cu_seqlens_k=seedvr_model.cumulative_lengths(all_lengths),
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
         )
+        del q, k, v
+        group_vid, group_txt = unconcat(out)
+        del out
+        vid_out.index_copy_(0, group_order, group_vid.flatten(1, 2))
+        # ComfyUI averages the text output over every window; weight each
+        # group's mean by its window count to keep that average.
+        weighted = group_txt.float().mul_(last - first)
+        txt_sum = weighted if txt_sum is None else txt_sum.add_(weighted)
+        del group_vid, group_txt
 
-        vid_parts = []
-        for relative_window, (window_out, vid_length) in enumerate(
-            zip(out.split(all_lengths), group_vid_lengths)
-        ):
-            vid_parts.append(window_out[:vid_length])
-            txt_windows[:, window_start + relative_window] = window_out[
-                vid_length:
-            ]
-        vid.index_copy_(
-            0, group_order, torch.cat(vid_parts).flatten(1, 2)
-        )
-
-    txt_out = txt_windows.mean(1).flatten(1, 2)
-    vid_proj_out = (
-        self.proj_out.vid
-        if not self.proj_out.shared_weights
-        else self.proj_out.all
-    )
-    vid_out = _chunked_forward(
-        vid_proj_out, vid, _LINEAR_GROUP_ROWS
-    )
-    if not self.proj_out.vid_only:
-        txt_proj_out = (
-            self.proj_out.txt
-            if not self.proj_out.shared_weights
-            else self.proj_out.all
-        )
-        txt_out = txt_out.to(device=vid_out.device, dtype=vid_out.dtype)
-        txt_out = txt_proj_out(txt_out)
-    return vid_out, txt_out
+    txt_out = txt_sum.div_(len(window_lengths)).to(vid.dtype).flatten(1, 2)
+    return self.proj_out(vid_out, txt_out)
 
 
 def _patch_attention(seedvr_model):
@@ -296,9 +231,18 @@ def _patch_attention(seedvr_model):
     if attention is None:
         return False, "NaSwinAttention is unavailable"
     if getattr(attention, _PATCH_MARKER, False):
-        return False, "NaSwinAttention is already patched"
+        return False, "SeedVR2 capacity adapter is already applied"
+    missing = [
+        name for name in _MODULE_SYMBOLS if not hasattr(seedvr_model, name)
+    ]
+    if missing:
+        return False, "SeedVR2 model lacks " + ", ".join(missing)
     if not _source_has(attention.forward, _ATTENTION_SOURCE_CONTRACT):
         return False, "unsupported NaSwinAttention.forward contract"
+    if not _source_has(
+        seedvr_model.NaMMRotaryEmbedding3d.forward, _ROPE_SOURCE_CONTRACT
+    ):
+        return False, "unsupported NaMMRotaryEmbedding3d.forward contract"
 
     original = attention.forward
 
@@ -313,20 +257,13 @@ def _patch_attention(seedvr_model):
             seedvr_model.comfy.model_management,
         ):
             if not _attention_logged:
-                qkv_bytes = (
-                    vid.shape[0]
-                    * 3
-                    * self.heads
-                    * self.head_dim
-                    * vid.element_size()
-                )
                 log.info(
                     "[OmniXPU] SeedVR2 bounded attention: "
                     "tokens=%d heads=%d head_dim=%d qkv_bytes=%d",
                     vid.shape[0],
                     self.heads,
                     self.head_dim,
-                    qkv_bytes,
+                    _qkv_bytes(self, vid),
                 )
                 _attention_logged = True
             return _bounded_attention(
@@ -345,49 +282,6 @@ def _patch_attention(seedvr_model):
     return True, None
 
 
-def _patch_swiglu(seedvr_model):
-    swiglu = getattr(seedvr_model, "SwiGLUMLP", None)
-    if swiglu is None:
-        return False, "SwiGLUMLP is unavailable"
-    if getattr(swiglu, _PATCH_MARKER, False):
-        return False, "SwiGLUMLP is already patched"
-    if not _source_has(swiglu.forward, _SWIGLU_SOURCE_CONTRACT):
-        return False, "unsupported SwiGLUMLP.forward contract"
-
-    original = swiglu.forward
-
-    @functools.wraps(original)
-    def forward(self, value):
-        global _swiglu_logged
-        hidden = int(self.proj_in_gate.weight.shape[0])
-        rows = value.numel() // value.shape[-1]
-        intermediate_bytes = rows * hidden * value.element_size()
-        if (
-            seedvr_model.comfy.model_management.in_training
-            or value.requires_grad
-            or intermediate_bytes <= _MLP_THRESHOLD_BYTES
-        ):
-            return original(self, value)
-
-        row_bytes = (3 * hidden + value.shape[-1]) * value.element_size()
-        chunk_rows = _chunk_rows(row_bytes, _MLP_GROUP_BYTES)
-        if not _swiglu_logged:
-            log.info(
-                "[OmniXPU] SeedVR2 bounded SwiGLU: "
-                "rows=%d hidden=%d chunk_rows=%d intermediate_bytes=%d",
-                rows,
-                hidden,
-                chunk_rows,
-                intermediate_bytes,
-            )
-            _swiglu_logged = True
-        return _bounded_swiglu(self, value, chunk_rows)
-
-    swiglu.forward = forward
-    setattr(swiglu, _PATCH_MARKER, True)
-    return True, None
-
-
 def apply():
     try:
         from comfy.ldm.seedvr import model as seedvr_model
@@ -396,24 +290,4 @@ def apply():
             return False, "ComfyUI SeedVR2 model is not available"
         raise
 
-    attention = getattr(seedvr_model, "NaSwinAttention", None)
-    swiglu = getattr(seedvr_model, "SwiGLUMLP", None)
-    if attention is None or swiglu is None:
-        return False, "SeedVR2 attention or SwiGLU class is unavailable"
-    if getattr(attention, _PATCH_MARKER, False) or getattr(
-        swiglu, _PATCH_MARKER, False
-    ):
-        return False, "SeedVR2 capacity adapter is already applied"
-    if not _source_has(attention.forward, _ATTENTION_SOURCE_CONTRACT):
-        return False, "unsupported NaSwinAttention.forward contract"
-    if not _source_has(swiglu.forward, _SWIGLU_SOURCE_CONTRACT):
-        return False, "unsupported SwiGLUMLP.forward contract"
-
-    attention_ok, attention_reason = _patch_attention(seedvr_model)
-    swiglu_ok, swiglu_reason = _patch_swiglu(seedvr_model)
-    if not attention_ok or not swiglu_ok:
-        raise RuntimeError(
-            "SeedVR2 capacity patch changed after preflight: "
-            f"attention={attention_reason}, swiglu={swiglu_reason}"
-        )
-    return True, None
+    return _patch_attention(seedvr_model)

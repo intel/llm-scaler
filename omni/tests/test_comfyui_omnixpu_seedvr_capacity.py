@@ -1,4 +1,4 @@
-"""Installed-ComfyUI tests for bounded SeedVR2 activation scheduling."""
+"""Installed-ComfyUI tests for bounded SeedVR2 window attention."""
 
 from __future__ import annotations
 
@@ -34,56 +34,19 @@ def _load_seedvr():
     return pytest.importorskip("comfy.ldm.seedvr.model")
 
 
-def test_chunk_rows_follow_the_live_byte_budget():
+def test_window_groups_keep_whole_windows_within_the_byte_budget():
     adapter = _load_adapter()
 
-    assert adapter._chunk_rows(1024, 1024, alignment=256) == 1
-    assert adapter._chunk_rows(1024, 512 * 1024, alignment=256) == 512
-    assert adapter._chunk_rows(1024, 511 * 1024, alignment=256) == 256
-
-
-def test_chunked_forward_preallocates_one_output():
-    adapter = _load_adapter()
-
-    class Module(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.calls = []
-
-        def forward(self, value):
-            self.calls.append(value.shape[0])
-            return value[:, :2] * 3
-
-    module = Module()
-    value = torch.arange(30, dtype=torch.float32).reshape(10, 3)
-    actual = adapter._chunked_forward(module, value, 4)
-
-    assert module.calls == [4, 4, 2]
-    torch.testing.assert_close(actual, value[:, :2] * 3, rtol=0, atol=0)
-
-
-def test_bounded_swiglu_matches_the_installed_module():
-    seedvr = _load_seedvr()
-    comfy_ops = pytest.importorskip("comfy.ops")
-    adapter = _load_adapter()
-    module = seedvr.SwiGLUMLP(
-        dim=12,
-        expand_ratio=4,
-        multiple_of=8,
-        device="cpu",
-        dtype=torch.float32,
-        operations=comfy_ops.disable_weight_init,
-    )
-    generator = torch.Generator(device="cpu").manual_seed(53)
-    with torch.no_grad():
-        for parameter in module.parameters():
-            parameter.uniform_(-0.1, 0.1, generator=generator)
-    value = torch.randn(17, 12, generator=generator)
-
-    expected = module(value)
-    actual = adapter._bounded_swiglu(module, value, 5)
-
-    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+    assert adapter._window_groups([3, 4, 2, 6, 1], 10, 70) == [
+        (0, 2, 0, 7),
+        (2, 3, 7, 9),
+        (3, 5, 9, 16),
+    ]
+    # A window larger than the budget still forms one complete group.
+    assert adapter._window_groups([9, 2], 10, 30) == [
+        (0, 1, 0, 9),
+        (1, 2, 9, 11),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -91,8 +54,9 @@ def test_bounded_swiglu_matches_the_installed_module():
     ["720pwin_by_size_bysize", "720pswin_by_size_bysize"],
 )
 @pytest.mark.parametrize("shared_weights", [False, True])
+@pytest.mark.parametrize("cached", [False, True])
 def test_bounded_attention_matches_the_installed_full_path(
-    window_method, shared_weights, monkeypatch
+    window_method, shared_weights, cached, monkeypatch
 ):
     seedvr = _load_seedvr()
     comfy_ops = pytest.importorskip("comfy.ops")
@@ -131,7 +95,7 @@ def test_bounded_attention_matches_the_installed_full_path(
     optimized_var_attention = seedvr.optimized_var_attention
 
     def record(**kwargs):
-        calls.append(kwargs["q"].shape[0])
+        calls.append(kwargs["q"].peek().shape[0])
         return optimized_var_attention(**kwargs)
 
     monkeypatch.setattr(seedvr, "optimized_var_attention", record)
@@ -147,22 +111,25 @@ def test_bounded_attention_matches_the_installed_full_path(
     calls.clear()
     qkv_row_bytes = 3 * heads * head_dim * vid.element_size()
     monkeypatch.setattr(
-        adapter, "_ATTENTION_GROUP_BYTES", 12 * qkv_row_bytes
+        adapter, "_ATTENTION_GROUP_BYTES", 6 * qkv_row_bytes
     )
-    monkeypatch.setattr(adapter, "_LINEAR_GROUP_ROWS", 7)
-    actual_vid, actual_txt = adapter._bounded_attention(
-        seedvr,
-        attention,
-        vid.clone(),
-        txt.clone(),
-        vid_shape,
-        txt_shape,
-        seedvr.Cache(disable=True),
-    )
+    cache = seedvr.Cache(disable=not cached)
+    passes = 2 if cached else 1
+    for _ in range(passes):
+        actual_vid, actual_txt = adapter._bounded_attention(
+            seedvr,
+            attention,
+            vid.clone(),
+            txt.clone(),
+            vid_shape,
+            txt_shape,
+            cache,
+        )
 
     assert len(full_call_sizes) == 1
     assert len(calls) > 1
     assert max(calls) < full_call_sizes[0]
+    assert sum(calls) == passes * full_call_sizes[0]
     torch.testing.assert_close(actual_vid, expected_vid, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(actual_txt, expected_txt, rtol=1e-5, atol=1e-6)
 
@@ -177,13 +144,15 @@ def test_capacity_route_is_structural_not_model_named():
         rope = Rope()
         heads = 20
         head_dim = 128
+        version_7b = False
 
     management = type("Management", (), {"in_training": False})
     vid = torch.empty(1_000_000, 2560, device="meta", dtype=torch.bfloat16)
     txt = torch.empty(256, 2560, device="meta", dtype=torch.bfloat16)
+    shape = torch.tensor([[32, 125, 250]])
 
     assert adapter._should_bound_attention(
-        Attention(), vid, txt, torch.tensor([[32, 125, 250]]), management
+        Attention(), vid, txt, shape, management
     )
     assert not adapter._should_bound_attention(
         Attention(),
@@ -192,16 +161,27 @@ def test_capacity_route_is_structural_not_model_named():
         torch.tensor([[4, 16, 16]]),
         management,
     )
+    seven_b = Attention()
+    seven_b.version_7b = True
+    assert not adapter._should_bound_attention(
+        seven_b, vid, txt, shape, management
+    )
 
 
 def test_apply_accepts_the_installed_seedvr_contract_once():
     seedvr = _load_seedvr()
     adapter = _load_adapter()
+    attention = seedvr.NaSwinAttention
+    original = attention.forward
 
-    assert adapter.apply() == (True, None)
-    assert getattr(seedvr.NaSwinAttention, adapter._PATCH_MARKER)
-    assert getattr(seedvr.SwiGLUMLP, adapter._PATCH_MARKER)
-    assert adapter.apply() == (
-        False,
-        "SeedVR2 capacity adapter is already applied",
-    )
+    try:
+        assert adapter.apply() == (True, None)
+        assert getattr(attention, adapter._PATCH_MARKER)
+        assert adapter.apply() == (
+            False,
+            "SeedVR2 capacity adapter is already applied",
+        )
+    finally:
+        attention.forward = original
+        if hasattr(attention, adapter._PATCH_MARKER):
+            delattr(attention, adapter._PATCH_MARKER)

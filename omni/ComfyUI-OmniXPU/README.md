@@ -20,8 +20,8 @@ No workflow or model-pipeline replacement is required.
 | ComfyUI adapter | Attention routing, LayerNorm/RMSNorm class integration, the remaining FP8 model/factory bridge, and fused Lumina/Z-Image INT8 FFN wiring |
 | Memory adapter | Cached whole-LoRA model budgets plus optional DynamicVRAM per-layer XPU staging measurements |
 | Qwen Image 2.1 cache | XPU slot selection, patch-safe prefix reuse, and pinned host cache data |
-| SeedVR2 capacity | Guarded Ada broadcast plus byte-bounded RMSNorm, SwiGLU, and window-attention materialization |
-| SeedVR2 native adapters | Validated BMG FP16 GroupNorm and causal-prefix cat-pad routing |
+| SeedVR2 capacity | Byte-bounded window-attention materialization; ComfyUI owns MLP chunking and the causal-prefix VAE padding |
+| SeedVR2 native adapters | Validated BMG FP16 GroupNorm routing |
 | Large-video preprocessing | Source-guarded, bounded CPU materialization for PIL Lanczos resize, SeedVR input padding, and XPU VAE input staging |
 | Legacy fix | Global `F.interpolate` and `torch.median`/`torch.nanmedian` workarounds; disabled by default |
 
@@ -163,8 +163,7 @@ OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM=0  # Disable Windows XPU model-boundary trim
 OMNIXPU_LORA_MEMORY=0       # Disable cached whole-LoRA budgets and staging logs
 OMNIXPU_QWEN_IMAGE21_CACHE=0 # Disable Qwen Image 2.1 cache compatibility adapter
 OMNIXPU_SEEDVR_ADA_RESHAPE=0  # Disable the guarded SeedVR2 Ada reshape patch
-OMNIXPU_SEEDVR_CAPACITY=0     # Disable bounded SeedVR2 activation scheduling
-OMNIXPU_SEEDVR_CAT_PAD=0      # Disable validated BMG causal-prefix cat-pad routing
+OMNIXPU_SEEDVR_CAPACITY=0     # Disable bounded SeedVR2 window-attention scheduling
 OMNIXPU_LARGE_VIDEO_PREPROCESS=0  # Disable bounded large-video CPU preprocessing
 ```
 

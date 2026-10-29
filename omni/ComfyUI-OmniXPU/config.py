@@ -41,10 +41,6 @@ class Config:
             master
             and os.environ.get("OMNIXPU_SEEDVR_CAPACITY", "1") != "0"
         )
-        self.seedvr_cat_pad = (
-            master
-            and os.environ.get("OMNIXPU_SEEDVR_CAT_PAD", "1") != "0"
-        )
         self.large_video_preprocess = (
             master
             and os.environ.get("OMNIXPU_LARGE_VIDEO_PREPROCESS", "1") != "0"
