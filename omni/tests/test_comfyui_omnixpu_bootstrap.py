@@ -101,6 +101,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
         "OMNIXPU_FP8_GEMM",
         "OMNIXPU_INT8_FFN",
         "OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM",
+        "OMNIXPU_XPU_RAM_STAGING",
         "OMNIXPU_LORA_MEMORY",
         "OMNIXPU_QWEN_IMAGE21_CACHE",
         "OMNIXPU_SEEDVR_ADA_RESHAPE",
@@ -119,6 +120,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     assert config.fp8_gemm
     assert config.int8_ffn
     assert config.dynamic_vram_boundary_trim
+    assert config.xpu_ram_staging
     assert config.lora_memory
     assert config.qwen_image21_cache
     assert config.writable_weights
@@ -145,6 +147,7 @@ def test_disabled_components_are_reported_without_importing_modules(monkeypatch)
         fp8_gemm=False,
         int8_ffn=False,
         dynamic_vram_boundary_trim=False,
+        xpu_ram_staging=False,
         lora_memory=False,
         qwen_image21_cache=False,
         writable_weights=False,

@@ -93,6 +93,13 @@ COMPONENTS = (
         "adapters/dynamic_vram.py",
     ),
     Component(
+        "xpu_ram_staging_adapter",
+        "xpu_ram_staging",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/xpu_ram_staging.py",
+    ),
+    Component(
         "lora_memory_adapter",
         "lora_memory",
         "adapter",

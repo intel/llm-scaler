@@ -18,7 +18,7 @@ No workflow or model-pipeline replacement is required.
 |---|---|
 | Kitchen XPU backend | INT8/QTensor operations, FP8 QDQ and stochastic rounding, SVDQuant, AdaLN, four RoPE APIs, and ConvRot |
 | ComfyUI adapter | Attention routing, LayerNorm/RMSNorm class integration, the remaining FP8 model/factory bridge, and fused Lumina/Z-Image INT8 FFN wiring |
-| Memory adapter | Cached whole-LoRA model budgets plus optional DynamicVRAM per-layer XPU staging measurements |
+| Memory adapter | Cached whole-LoRA model budgets, optional DynamicVRAM per-layer XPU staging measurements, and DynamicVRAM host RAM weight staging on discrete XPU |
 | Qwen Image 2.1 cache | XPU slot selection, patch-safe prefix reuse, and pinned host cache data |
 | SeedVR2 capacity | Byte-bounded window-attention materialization; ComfyUI owns MLP chunking and the causal-prefix VAE padding |
 | SeedVR2 native adapters | Validated BMG FP16 GroupNorm routing |
@@ -160,6 +160,7 @@ OMNIXPU_FP8_GEMM=0          # Disable the temporary FP8 model/factory adapter
 OMNIXPU_QUANTIZED_MATMUL=0  # Disable native INT8 model-format eligibility
 OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
 OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM=0  # Disable Windows XPU model-boundary trim
+OMNIXPU_XPU_RAM_STAGING=0   # Disable DynamicVRAM host RAM weight staging on discrete XPU
 OMNIXPU_LORA_MEMORY=0       # Disable cached whole-LoRA budgets and staging logs
 OMNIXPU_QWEN_IMAGE21_CACHE=0 # Disable Qwen Image 2.1 cache compatibility adapter
 OMNIXPU_SEEDVR_ADA_RESHAPE=0  # Disable the guarded SeedVR2 Ada reshape patch
@@ -171,6 +172,15 @@ On Windows XPU, the boundary trim turns an unmet DynamicVRAM minimum-memory
 budget into an explicit partial VBAR reclaim before model loading. It preserves
 loaded models and is enabled by default; the environment variable above is the
 A/B-test escape hatch.
+
+ComfyUI stages DynamicVRAM weights in host RAM only on NVIDIA and AMD. On a
+discrete XPU the RAM staging adapter applies ComfyUI's own staging budget and
+answers its CUDA host-registration calls with success, so faulted weights are
+copied from RAM instead of being read from the model file again
+(intel/llm-scaler#761). Staged buffers stay pageable; `--disable-pinned-memory`
+and integrated XPUs keep the upstream behavior. On Arc Pro B60 with the MiniMax
+H3 text-to-video template (864x480, 124 frames) this lowered the sampling step
+from 11.65 s to 9.32 s with bit-identical output.
 
 Validated sub-routes can be disabled independently:
 
