@@ -415,6 +415,7 @@ def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
             ".libs/*.dll",
             ".libs/onednn/*",
             "policies/*.json",
+            "licenses/*.txt",
         ]
 
 
