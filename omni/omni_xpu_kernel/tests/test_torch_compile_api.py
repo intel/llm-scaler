@@ -70,6 +70,14 @@ def _rand(shape, dtype=torch.bfloat16):
     return torch.randn(shape, device="xpu", dtype=dtype) * 0.25
 
 
+def _deferred_control():
+    # Kitchen 0.2.40: pending, parity, accepted slots, parents, program.
+    return torch.tensor(
+        [0, 0, *range(8), -1, *range(7), *(i | 32 for i in range(8))],
+        device="xpu", dtype=torch.int32,
+    )
+
+
 def _packed(rows=32, width=128):
     return torch.randint(0, 256, (rows, width // 2), device="xpu", dtype=torch.uint8)
 
@@ -116,13 +124,13 @@ def case(api, *, dtype=torch.bfloat16, rows=3):
         if name == "deltanet_conv_deferred":
             return function, (_rand((1,2,16)),_rand((1,16,3)),_rand((16,4)),None,
                               _rand((2,1,8,16)),_rand((2,1,16,8)),
-                              torch.tensor([0,0],device="xpu",dtype=torch.int32)), {}
+                              _deferred_control()), {}
         if name == "gated_delta_decode_deferred":
             x=_rand((1,2,32));weight=_rand((2,32));dt=_rand((2,),torch.float32)
             return function, (x,weight,weight,dt,-dt.abs()-.5,_rand((1,2,128,128),torch.float32),
                 128,1,128**-.5,_rand((1,2,256)),torch.ones(128,device="xpu",dtype=x.dtype),1e-6,
                 _rand((2,1,512,8)),_rand((2,1,8,2,2),torch.float32),_rand((2,1,8,1,2),torch.float32),
-                torch.tensor([0,0],device="xpu",dtype=torch.int32)), {}
+                _deferred_control()), {}
         if name in ("int8_decode_update", "int8_decode"):
             sk = _rand((1,1,512,256))
             sv = torch.randn_like(sk)

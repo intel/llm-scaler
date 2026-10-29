@@ -13,14 +13,15 @@
 namespace omni_xpu::kitchen {
 namespace {
 constexpr int SLOT=8, D=128, RG=4, RPG=D/RG;
+constexpr int CTL_INTS=2+3*SLOT;
 template<typename T> class DeferredConv;
 template<typename T> class DeferredGates;
 template<typename T> class DeferredSums;
 template<typename T> class DeferredDelta;
 void ctl_check(const torch::Tensor& ctl,const torch::Tensor& ref) {
     TORCH_CHECK(ctl.device()==ref.device() && ctl.scalar_type()==at::kInt
-        && ctl.dim()==1 && (ctl.numel()==2 || ctl.numel()==26) && ctl.is_contiguous(),
-        "ctl must be contiguous XPU int32 [2] or [26]");
+        && ctl.dim()==1 && ctl.numel()==CTL_INTS && ctl.is_contiguous(),
+        "ctl must be contiguous XPU int32 [26]");
 }
 void tensor_check(const torch::Tensor& t,const torch::Tensor& ref,
                   at::ScalarType dtype,at::IntArrayRef shape,const char* label) {
@@ -35,7 +36,6 @@ void conv_launch(torch::Tensor proj,torch::Tensor state,torch::Tensor weight,
     const auto* x=static_cast<const T*>(proj.data_ptr());auto* st=static_cast<T*>(state.data_ptr());
     const auto* w=static_cast<const T*>(weight.data_ptr());const T* b=bias?static_cast<const T*>(bias->data_ptr()):nullptr;
     auto* pb=static_cast<T*>(prev.data_ptr());auto* qb=static_cast<T*>(qkv.data_ptr());const auto* control=ctl.data_ptr<int>();
-    const bool tree=ctl.numel()==26;
     auto submit=[&](sycl::handler& cgh) {
         cgh.parallel_for<DeferredConv<T>>(sycl::range<1>(size_t(B)*C),[=](sycl::id<1> it) {
             const int batch=it[0]/C,c=it[0]%C,p=control[1];const int n=control[0];
@@ -45,7 +45,7 @@ void conv_launch(torch::Tensor proj,torch::Tensor state,torch::Tensor weight,
             // Forward traversal is safe: each old source index is >= its destination.
             for(int r=0;r<W;++r) {
                 const int accepted=n+r-W;
-                const int slot=accepted>=0 ? (tree?control[2+accepted]:accepted) : 0;
+                const int slot=accepted>=0 ? control[2+accepted] : 0;
                 history[r]=n+r<W?history[n+r]:pb[previous+(int64_t(batch)*SLOT+slot)*C+c];
             }
             for(int t=0;t<S;++t) {
@@ -53,7 +53,7 @@ void conv_launch(torch::Tensor proj,torch::Tensor state,torch::Tensor weight,
                 int ancestor=t,missing=0;
                 for(int distance=0;distance<=W;++distance) {
                     if(distance) {
-                        ancestor=ancestor>=0 ? (tree?control[2+SLOT+ancestor]:ancestor-1) : -1;
+                        ancestor=ancestor>=0 ? control[2+SLOT+ancestor] : -1;
                         if(ancestor<0) ++missing;
                     }
                     const float value=ancestor>=0
@@ -86,7 +86,6 @@ torch::Tensor delta_launch(torch::Tensor x,torch::Tensor wa,torch::Tensor wb,
     const auto* qp=static_cast<const T*>(qkv.data_ptr());const auto* zp=static_cast<const T*>(z.data_ptr());
     const auto* np=static_cast<const T*>(nw.data_ptr());const auto* dp=dt.data_ptr<float>();const auto* gp=gd.data_ptr<float>();
     auto* gatesp=gates.data_ptr<float>();auto* sumsp=sums.data_ptr<float>();auto* sp=state.data_ptr<float>();
-    const bool tree=ctl.numel()==26;
     const auto* control=ctl.data_ptr<int>();auto output=torch::empty({B,S,HV,D},x.options());
     auto* out=static_cast<T*>(output.data_ptr());const float sc=scale,epsilon=eps;
     auto prepare=[&](sycl::handler& cgh) {
@@ -135,9 +134,9 @@ torch::Tensor delta_launch(torch::Tensor x,torch::Tensor wa,torch::Tensor wb,
                 for(int phase=0;phase<2;++phase) {
                     const int parity=phase?p:1-p,count=phase?S:pending;
                     for(int entry=0;entry<count;++entry) {
-                        const int instruction=phase && tree?control[2+2*SLOT+entry]:0;
-                        const int t=tree?(phase?(instruction&15):control[2+entry]):entry;
-                        const bool commit=!phase || !tree || (instruction&32);
+                        const int instruction=phase?control[2+2*SLOT+entry]:0;
+                        const int t=phase?(instruction&15):control[2+entry];
+                        const bool commit=!phase || (instruction&32);
                         if(t<0 || t>=SLOT || (phase && t>=S)) return;
                         float saved[RPG];
                         for(int r=0;r<RPG;++r) saved[r]=st[r];
