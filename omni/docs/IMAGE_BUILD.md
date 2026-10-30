@@ -61,12 +61,6 @@ ComfyUI repository, commit, and version must be updated together. Kitchen and
 AIMDO official dependency versions are separate from the versions of their
 pinned provider source wheels. The provider manifests declare which official
 versions each source wheel accepts, and image validation checks both identities.
-The source configuration below supersedes the 0.42.1 / Kitchen 0.2.39 /
-AIMDO 0.5.6 defaults on 2026-10-28. The historical provider revisions were
-`3c9c495f3c648166ec4b0c69b676904f09b53267` and
-`96e6503c01124ce62bc4f5215458371a650c539f`; their existing validation remains
-bound to those sources and their original image. Source selection alone does
-not establish acceptance of the new image.
 
 For the default ComfyUI 0.43.0 source build, official Kitchen 0.2.40 uses the matching
 0.2.40 provider source at `xiangyuT/comfy-kitchen-xpu`

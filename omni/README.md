@@ -143,10 +143,6 @@ see [ComfyUI usage](docs/COMFYUI.md).
 
 ## Image contents
 
-The 0.43.0 source-build selection supersedes the 0.42.1 / Kitchen 0.2.39 /
-AIMDO 0.5.6 defaults on 2026-10-28. Existing image and workflow results retain
-their original source/image identities; see the [build details](docs/IMAGE_BUILD.md).
-
 The focused source build selects:
 
 - upstream [ComfyUI v0.43.0](https://github.com/Comfy-Org/ComfyUI/tree/v0.43.0),
