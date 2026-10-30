@@ -254,15 +254,6 @@ gate are retired; see [migration and usage](SPARSE_ATTENTION.md).
 
 This source-built image supports BMG.
 
-The OMIX 0.4.1 / ComfyUI 0.43.0 configuration completed clean-build and
-installed-image validation on Linux / Arc Pro B70 on 2026-10-30. Current-template
-functional lifecycles cover Qwen Image 2.1, its Turbo text-to-image and
-single-reference editing variants, MOSS Image, Flux 3 Klein INT8, Qwen 3.5,
-MiniMax H3 and Krea2 Turbo INT8. They check cold execution, resident caching,
-profiling and forced text re-encoding, including prompt enhancement when enabled
-by the official template. H3 uses its default template for functional validation;
-performance comparisons remain separate from these lifecycle checks.
-
 Run the upgrade lifecycle check in a disposable container, passing an exact
 official ComfyUI revision accepted for the milestone:
 
