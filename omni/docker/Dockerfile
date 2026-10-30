@@ -8,7 +8,7 @@
 # and the disabled media/3D node bundle. Raylight's xDiT-based multi-XPU
 # ComfyUI integration is not part of this image; this image targets one XPU.
 
-ARG BASE_IMAGE=intel/omix:0.4.0-devel-ubuntu24.04@sha256:ee48e296161b7da989ffbfbbb3390b428e842590eda6258e1f86def3970ef0b3
+ARG BASE_IMAGE=intel/omix:0.4.1-devel-ubuntu24.04@sha256:6f8c8893cc89ff441e3604a3d785d78bdbe79726550e88d5cf8eab769444389a
 ARG PYTHON_VERSION=3.12
 ARG TORCH_VERSION=2.14.0+xpu
 ARG TORCHVISION_VERSION=0.29.0+xpu

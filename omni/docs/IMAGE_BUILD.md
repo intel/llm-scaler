@@ -27,7 +27,7 @@ The supported environment overrides are:
 |---|---|---|
 | `XPU_TARGET` | Native GPU build target | `bmg` |
 | `OMNI_IMAGE_REPOSITORY` | Local image repository | `intel/llm-scaler-omni` |
-| `OMNI_BASE_IMAGE` | OMIX development base | `intel/omix:0.4.0-devel-ubuntu24.04` at the digest pinned in `build.sh` |
+| `OMNI_BASE_IMAGE` | OMIX development base | `intel/omix:0.4.1-devel-ubuntu24.04` at the digest pinned in `build.sh` |
 | `OMNI_TORCH_VERSION` | PyTorch XPU wheel | `2.14.0+xpu` |
 | `OMNI_TORCHVISION_VERSION` | torchvision XPU wheel | `0.29.0+xpu` |
 | `OMNI_TORCHAUDIO_VERSION` | ComfyUI audio compatibility wheel | `2.11.0+xpu` |

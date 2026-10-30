@@ -18,10 +18,7 @@
 > 从源码构建，并应用 Linux 镜像相同的
 > `omni/patches/onednn-v3.11.2-enable-bf16-int4-dequantization.patch`。该补丁恢复
 > 上游 v3.10 起禁用的 bf16×u4 反量化路径；仍含此路径的 v3.9.x 预编译包链接
-> `sycl8.dll`，无法在 Torch 2.14 的 `sycl9.dll` runtime 中加载。在 Arc Pro B60 上
-> 以 Portable 的 2026.1.0 runtime 对 kernel 使用的 FP8、INT8、INT4（u4、分组
-> scale/zero point、sum post-op）和 dense matmul 配置做原语级验证：3.11–3.13 均
-> 通过且性能一致；打补丁后 bf16×u4 误差更低，M=4096 时约快 6%。按此工具链构建的
+> `sycl8.dll`，无法在 Torch 2.14 的 `sycl9.dll` runtime 中加载。按此工具链构建的
 > `omni_xpu_kernel-0.2.0b3+torch214.bmg-cp313-cp313-win_amd64.whl`（SHA256
 > `13ac801119911e7621491917dcbdc87d5b39638e0ec16251be7786a17a4ccf59`）已在
 > ComfyUI 0.43.0 Windows Portable（Python 3.13.14、torch 2.14.1+xpu、Arc Pro B60）

@@ -178,9 +178,7 @@ discrete XPU the RAM staging adapter applies ComfyUI's own staging budget and
 answers its CUDA host-registration calls with success, so faulted weights are
 copied from RAM instead of being read from the model file again
 (intel/llm-scaler#761). Staged buffers stay pageable; `--disable-pinned-memory`
-and integrated XPUs keep the upstream behavior. On Arc Pro B60 with the MiniMax
-H3 text-to-video template (864x480, 124 frames) this lowered the sampling step
-from 11.65 s to 9.32 s with bit-identical output.
+and integrated XPUs keep the upstream behavior.
 
 Validated sub-routes can be disabled independently:
 

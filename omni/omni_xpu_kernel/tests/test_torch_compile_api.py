@@ -42,11 +42,11 @@ APIS = {
     "sdp": ("sdp",),
     "linear": ("onednn_w8a16_fp8", "try_onednn_w8a16_fp8"),
     "layout": ("cat_pad_bmg",),
-    "kitchen": ("decode_attention", "decode_step_merge", "int8_decode_update", "int8_decode",
+    "kitchen": ("decode_attention", "decode_step_merge", "decode_tree_merge", "int8_decode_update", "int8_decode",
                 "deltanet_conv_deferred", "gated_delta_decode_deferred",
                 "deltanet_conv_step", "gated_delta_decode_fused",
                 "gemv_awq_w4a16",
-                "group_norm_silu_pad3d", "group_norm_silu_pad3d_out",
+                "group_norm_stats3d", "group_norm_silu_pad3d", "group_norm_silu_pad3d_out",
                 "fp16_linear", "fp16_conv3d", "fp16_conv3d_out",
                 "rms_norm_for_int8", "rms_norm_quantize_int8",
                 "rms_norm_convrot_quantize_int8", "gated_quantize_int8",
@@ -151,6 +151,17 @@ def case(api, *, dtype=torch.bfloat16, rows=3):
                 return function, (q,k,v,torch.tensor([7], device="xpu", dtype=torch.int32)), {}
             return function, (_rand((1,2,1024)), _rand((1,4,2),torch.float32), q,k,v,
                               torch.empty(1,2,1024,device="xpu",dtype=torch.bfloat16)), {}
+        if name == "decode_tree_merge":
+            q = _rand((1,4,2,64), dtype)
+            prefix_k = _rand((1,2,7,64), dtype)
+            prefix_v = torch.randn_like(prefix_k)
+            out, lse = kitchen.decode_attention(
+                q, prefix_k, prefix_v,
+                torch.tensor([7], device="xpu", dtype=torch.int32), False)
+            k = _rand((1,2,2,64), dtype)
+            v = torch.randn_like(k)
+            mask = torch.tensor([1,2], device="xpu", dtype=torch.int32)
+            return function, (out,lse,q,k,v,mask,torch.empty_like(out)), {}
         if name == "gemv_awq_w4a16":
             x = _rand((1, 128), torch.bfloat16)
             packed = torch.randint(
@@ -177,6 +188,8 @@ def case(api, *, dtype=torch.bfloat16, rows=3):
             snapshots = torch.empty((1, 1, 2, 8, 8), device="xpu", dtype=torch.float32)
             return function, (mixed, x, weight, weight, bias, decay, state,
                               8, 1, 8**-0.5, z, norm_weight, 1e-6, snapshots), {}
+        if name == "group_norm_stats3d":
+            return function, (_rand((1,4,2,5,6), dtype),2,1e-6), {}
         if name in ("group_norm_silu_pad3d", "group_norm_silu_pad3d_out"):
             x = _rand((1, 4, 2, 5, 6), dtype)
             if name.endswith("_out"):
@@ -376,7 +389,7 @@ def test_public_tensor_inventory_has_no_unclassified_api():
     assert controls == RUNTIME_CONTROLS
     assert not controls.intersection(API_NAMES)
     assert actual == set(API_NAMES)
-    assert len(actual) == 94
+    assert len(actual) == 96
 
 
 @pytest.mark.parametrize("api", API_NAMES)
