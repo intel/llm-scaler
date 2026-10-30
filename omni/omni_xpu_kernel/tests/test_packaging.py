@@ -101,24 +101,6 @@ def test_supported_torch_minors_select_distinct_wheel_tags(
     )
 
 
-def test_windows_onednn_contract_tracks_torch_minor(monkeypatch):
-    import setuptools
-
-    monkeypatch.chdir(PROJECT_ROOT)
-    monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "0")
-    monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
-    namespace = run_path(
-        str(PROJECT_ROOT / "setup.py"), run_name="__windows_onednn_contract_test__"
-    )
-    get_contract = namespace["get_windows_onednn_contract"]
-
-    assert get_contract("2.12.0+xpu") == ("2025.3.0", (3, 9, 1), "2025.3")
-    assert get_contract("2.13.0+xpu") == ("2026.0.0", (3, 11, 2), "2026.0")
-    assert get_contract("2.14.0+xpu") == ("3.12.3", (3, 12, 3), "2026.1")
-    with pytest.raises(RuntimeError, match="No Windows oneDNN contract"):
-        get_contract("2.15.0+xpu")
-
-
 def test_linux_cxx_standard_tracks_torch_headers(monkeypatch):
     monkeypatch.chdir(PROJECT_ROOT)
     monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "0")
@@ -502,11 +484,10 @@ def test_windows_cute_extension_is_explicit_opt_in(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("torch_version", "install_series", "expected_version"),
-    [("2.13.0", "2026.0", "3.11.2"), ("2.14.0", "2026.1", "3.12.3")],
+    "runtime_version", [(3, 11, 4), (3, 12, 3), (3, 13, 2)],
 )
 def test_windows_onednn_runtime_bundle_contains_notices_and_hash(
-    monkeypatch, tmp_path, torch_version, install_series, expected_version
+    monkeypatch, tmp_path, runtime_version
 ):
     import setuptools
 
@@ -519,10 +500,10 @@ def test_windows_onednn_runtime_bundle_contains_notices_and_hash(
     find_runtime = namespace["find_windows_onednn_runtime"]
     bundle_runtime = namespace["bundle_windows_onednn_runtime"]
     monkeypatch.setitem(find_runtime.__globals__, "IS_WINDOWS", True)
-    # Exercise both Windows contracts independently of the host Torch build.
-    monkeypatch.setitem(find_runtime.__globals__, "BUILD_TORCH_VERSION", torch_version)
+    monkeypatch.setitem(bundle_runtime.__globals__, "get_onednn_library_version",
+                        lambda path: runtime_version)
 
-    dnnl_root = tmp_path / "oneapi" / "dnnl" / install_series
+    dnnl_root = tmp_path / "custom-onednn"
     lib_dir = dnnl_root / "lib"
     runtime = dnnl_root / "bin" / "dnnl.dll"
     notices = dnnl_root / "share" / "doc" / "dnnl"
@@ -547,59 +528,90 @@ def test_windows_onednn_runtime_bundle_contains_notices_and_hash(
         "license\n"
     )
     version = (vendor / "onednn" / "VERSION").read_text(encoding="utf-8")
-    assert f"oneDNN={expected_version}" in version
+    assert f"oneDNN={'.'.join(map(str, runtime_version))}" in version
     assert hashlib.sha256(runtime_bytes).hexdigest() in version
 
 
-@pytest.mark.parametrize(
-    ("header_version", "runtime_version", "error"),
-    [
-        ((3, 12, 3), (3, 12, 3), None),
-        ((3, 11, 2), (3, 11, 2), "Unsupported oneDNN headers"),
-        ((3, 12, 3), (3, 11, 2), "oneDNN header/runtime mismatch"),
-    ],
-)
-def test_windows_torch214_selects_matched_oneapi_installation(
-    monkeypatch, tmp_path, header_version, runtime_version, error
-):
+def _windows_onednn_paths(monkeypatch, tmp_path):
     monkeypatch.chdir(PROJECT_ROOT)
     monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "0")
     monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
     namespace = run_path(str(PROJECT_ROOT / "setup.py"), run_name="__windows214_paths_test__")
     get_paths = namespace["get_onednn_paths"]
     monkeypatch.setitem(get_paths.__globals__, "IS_WINDOWS", True)
-    monkeypatch.setitem(get_paths.__globals__, "BUILD_TORCH_VERSION", "2.14.0")
     monkeypatch.setattr(sys, "prefix", str(tmp_path / "venv"))
     for name in ("ONEDNN_INCLUDE", "ONEDNN_LIB", "ONEDNN_RUNTIME", "DNNLROOT", "ONEDNNROOT"):
         monkeypatch.delenv(name, raising=False)
     for name in ("ProgramFiles(x86)", "ProgramFiles"):
         monkeypatch.setenv(name, str(tmp_path / "programs"))
+    return get_paths
 
-    # Both releases are installed: automatic discovery must select 2026.1.
-    for series, version in [("2026.0", (3, 11, 2)), ("2026.1", header_version)]:
-        sdk = tmp_path / "programs" / "Intel" / "oneAPI" / "dnnl" / series
-        headers = sdk / "include" / "oneapi" / "dnnl"
-        headers.mkdir(parents=True)
-        (headers / "dnnl.hpp").write_text("// test header\n")
-        (headers / "dnnl_version.h").write_text("\n".join(
-            f"#define DNNL_VERSION_{key} {value}"
-            for key, value in zip(("MAJOR", "MINOR", "PATCH"), version)
-        ) + "\n")
-        (sdk / "lib").mkdir()
-        (sdk / "lib" / "dnnl.lib").write_bytes(b"import library")
-        (sdk / "bin").mkdir()
-        (sdk / "bin" / "dnnl.dll").write_bytes(b"runtime")
+
+def _write_windows_onednn(sdk, version):
+    headers = sdk / "include" / "oneapi" / "dnnl"
+    headers.mkdir(parents=True)
+    (headers / "dnnl.hpp").write_text("// test header\n")
+    (headers / "dnnl_version.h").write_text("\n".join(
+        f"#define DNNL_VERSION_{key} {value}"
+        for key, value in zip(("MAJOR", "MINOR", "PATCH"), version)
+    ) + "\n")
+    (sdk / "lib").mkdir()
+    (sdk / "lib" / "dnnl.lib").write_bytes(b"import library")
+    (sdk / "bin").mkdir()
+    (sdk / "bin" / "dnnl.dll").write_bytes(b"runtime")
+    return sdk / "bin" / "dnnl.dll"
+
+
+@pytest.mark.parametrize("torch_version", ["2.12.0", "2.13.0", "2.14.0"])
+@pytest.mark.parametrize("version", [(3, 11, 4), (3, 12, 3), (3, 13, 2)])
+def test_windows_selected_onednn_version_is_independent_of_torch_minor(
+    monkeypatch, tmp_path, torch_version, version
+):
+    get_paths = _windows_onednn_paths(monkeypatch, tmp_path)
+    monkeypatch.setitem(get_paths.__globals__, "BUILD_TORCH_VERSION", torch_version)
+    sdk = tmp_path / "custom-onednn"
+    dll = _write_windows_onednn(sdk, version)
+    monkeypatch.setenv("DNNLROOT", str(sdk))
+    monkeypatch.setitem(get_paths.__globals__, "get_onednn_library_version", lambda path: version)
+
+    include, lib, library, runtime, source = get_paths()
+    assert include == sdk / "include" and lib == sdk / "lib"
+    assert library == lib / "dnnl.lib" and runtime == dll
+    assert source == "oneAPI"
+
+
+def test_windows_rejects_mismatched_selected_onednn_headers_and_runtime(monkeypatch, tmp_path):
+    get_paths = _windows_onednn_paths(monkeypatch, tmp_path)
+    sdk = tmp_path / "custom-onednn"
+    _write_windows_onednn(sdk, (3, 12, 3))
+    monkeypatch.setenv("DNNLROOT", str(sdk))
+    monkeypatch.setitem(get_paths.__globals__, "get_onednn_library_version", lambda path: (3, 11, 4))
+
+    with pytest.raises(RuntimeError, match="oneDNN header/runtime mismatch"):
+        get_paths()
+
+
+def test_windows_explicit_onednn_root_precedes_python_prefix(monkeypatch, tmp_path):
+    get_paths = _windows_onednn_paths(monkeypatch, tmp_path)
+    sdk = tmp_path / "custom-onednn"
+    selected = _write_windows_onednn(sdk, (3, 11, 4))
+    prefix = _write_windows_onednn(Path(sys.prefix) / "Library", (3, 13, 2))
+    versions = {selected: (3, 11, 4), prefix: (3, 13, 2)}
+    monkeypatch.setenv("DNNLROOT", str(sdk))
+    monkeypatch.setitem(get_paths.__globals__, "get_onednn_library_version", lambda path: versions[path])
+
+    assert get_paths()[3] == selected
+
+
+@pytest.mark.parametrize("series", ["latest", "2024.2", "2026.2"])
+def test_windows_discovers_onednn_without_a_torch_series_allowlist(monkeypatch, tmp_path, series):
+    get_paths = _windows_onednn_paths(monkeypatch, tmp_path)
+    sdk = tmp_path / "programs" / "Intel" / "oneAPI" / "dnnl" / series
+    runtime = _write_windows_onednn(sdk, (3, 11, 4))
+    runtime_version = (3, 11, 4)
     monkeypatch.setitem(get_paths.__globals__, "get_onednn_library_version", lambda path: runtime_version)
 
-    if error:
-        with pytest.raises(RuntimeError, match=error):
-            get_paths()
-    else:
-        include, lib, library, runtime, source = get_paths()
-        assert include.parent.name == lib.parent.name == "2026.1"
-        assert library == lib / "dnnl.lib"
-        assert runtime == lib.parent / "bin" / "dnnl.dll"
-        assert source == "oneAPI"
+    assert get_paths()[3] == runtime
 
 
 def test_bmg_cute_overlay_patches_private_header_copy(monkeypatch, tmp_path):

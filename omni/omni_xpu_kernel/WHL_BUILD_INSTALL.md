@@ -6,24 +6,11 @@
 > SHA 和验收记录保留为历史身份；从当前源码构建时，应按实际 Torch/target
 > 选择 b3 wheel。Windows b3 wheel 尚未完成构建与安装态验收。
 
-> **Windows Torch 2.14 工具链与 oneDNN 合同修订 — 2026-10-29。** 对齐 PyTorch
-> 2.14 官方组合：compiler 和 ocloc 使用 Intel《PyTorch Prerequisites for Intel
-> GPUs》2.14 指定的 Deep Learning Essentials 2026.1.2
-> （`intel-deep-learning-essentials-2026.1.2.22_offline.exe`，compiler/ocloc
-> 2026.1.0，与 Torch 2.14 wheel 固定的 2026.1.0 runtime 一致）；oneDNN 使用
-> PyTorch 2.14 `cmake/Modules/FindMKLDNN.cmake` 为 XPU 固定的 v3.12.3。Torch wheel
-> 中的 `oneapi/dnnl` 头文件属于 CPU 端 v3.12，不代表 XPU oneDNN 版本。DLE 不含
-> oneDNN，Intel 工具包和 PyPI 也不提供 3.12.3（oneAPI 2026.1.1 工具包为 3.11.4，
-> `onednn-devel==2026.1.0` 为 3.13.2 且 Windows wheel 不含头文件），因此按下文
-> 从源码构建，并应用 Linux 镜像相同的
-> `omni/patches/onednn-v3.11.2-enable-bf16-int4-dequantization.patch`。该补丁恢复
-> 上游 v3.10 起禁用的 bf16×u4 反量化路径；仍含此路径的 v3.9.x 预编译包链接
-> `sycl8.dll`，无法在 Torch 2.14 的 `sycl9.dll` runtime 中加载。按此工具链构建的
-> `omni_xpu_kernel-0.2.0b3+torch214.bmg-cp313-cp313-win_amd64.whl`（SHA256
-> `13ac801119911e7621491917dcbdc87d5b39638e0ec16251be7786a17a4ccf59`）已在
-> ComfyUI 0.43.0 Windows Portable（Python 3.13.14、torch 2.14.1+xpu、Arc Pro B60）
-> 中完成安装，ComfyUI-OmniXPU 以 `OMNIXPU_PROVIDER_BOOTSTRAP=required` 启动并运行
-> MiniMax H3 模板。
+> **Windows oneDNN 选择说明 — 2026-10-30。** 下列版本组合和 v3.12.3 源码构建
+> 步骤供配置环境时参考，不是构建版本白名单。使用 `DNNLROOT` 或显式路径选择
+> 配套的 oneDNN 头文件、import library 和 runtime DLL；构建检查头文件与 DLL 的
+> 版本匹配，并记录实际 DLL 版本与 SHA256。compiler 和 SYCL runtime 仍需与
+> 所用 Torch XPU 环境兼容。
 
 > **Windows Torch 2.14 构建合同更新 — 2026-10-09。** 构建代码允许
 > `2.14.0+xpu`，使用 oneAPI 2026.1（compiler 与 oneDNN 已于 2026-10-29 修订，见上），
@@ -34,20 +21,20 @@
 > 以下 Torch 2.13 配方和 artifact SHA 保留为最近一次实测的历史身份；
 > 用 2.14 构建时，Torch 安装/断言和 wheel 选择必须一致改为
 > `2.14.0+xpu` / `torch214`；compiler 和 ocloc 的安装目录必须对齐 `2026.1`，
-> oneDNN 使用下文源码构建的 v3.12.3，不能复用下列 Torch 2.13 wheel。
+> oneDNN 可参考下文 v3.12.3 源码配方，不能复用下列 Torch 2.13 wheel。
 
-Windows 依赖按 Torch minor 选择：
+以下是可参考的 Windows 构建组合：
 
 | Torch | oneAPI 安装系列 | oneDNN package / native ABI | C++ 标准 |
 |---|---|---|---|
 | 2.13.0+xpu | 2026.0 | 2026.0.0 / 3.11.2 | C++17 |
 | 2.14.0+xpu | 2026.1（DLE 2026.1.2） | v3.12.3 源码构建 + BF16/INT4 补丁 / 3.12.3 | C++20 |
 
-2.14 的 compiler/runtime 系列来自[官方 Windows wheel](https://download.pytorch.org/whl/xpu/torch-2.14.0%2Bxpu-cp313-cp313-win_amd64.whl)
-的 runtime metadata 和 Intel DLE 2026.1.2；oneDNN 版本来自 PyTorch 2.14 的 XPU 构建配置。
-`setup.py` 通过 `DNNLROOT` 查找 oneDNN，并校验 headers/runtime DLL 的 native ABI。
+这些 oneDNN 版本不与 Torch minor 强制绑定。可使用其他配套的 oneDNN 安装；
+`setup.py` 校验实际选中的 headers/runtime DLL，不因其版本不在表中而拒绝构建。
 
-Torch 2.14 的 oneDNN 在第 6 节同一个构建 shell 中生成，`DNNLROOT` 指向安装目录：
+需要采用 v3.12.3 参考配方时，在第 6 节同一个构建 shell 中生成，
+`DNNLROOT` 指向安装目录：
 
 ```bat
 git clone --filter=blob:none --no-checkout https://github.com/uxlfoundation/oneDNN.git "%BUILD_ROOT%\onednn-src"

@@ -32,43 +32,6 @@ from setuptools.command.build_ext import build_ext
 IS_WINDOWS = platform.system() == "Windows"
 LINUX_ONEDNN_PACKAGE_VERSION = "2026.0.0"
 LINUX_VALIDATED_ONEDNN_VERSION = (3, 11, 2)
-WINDOWS_ONEDNN_CONTRACTS = {
-    "2.10": ("2025.3.0", (3, 9, 1), "2025.3"),
-    "2.11": ("2025.3.0", (3, 9, 1), "2025.3"),
-    "2.12": ("2025.3.0", (3, 9, 1), "2025.3"),
-    "2.13": ("2026.0.0", (3, 11, 2), "2026.0"),
-    # PyTorch 2.14 builds its XPU oneDNN from v3.12.3, which no Intel Windows
-    # package ships: build it from source and point DNNLROOT at the install.
-    "2.14": ("3.12.3", (3, 12, 3), "2026.1"),
-}
-
-
-def get_windows_onednn_contract(torch_version):
-    """Return the package, native ABI, and oneAPI series for a Torch build."""
-    public_version = str(torch_version).split("+", 1)[0]
-    torch_minor = ".".join(public_version.split(".")[:2])
-    try:
-        return WINDOWS_ONEDNN_CONTRACTS[torch_minor]
-    except KeyError as error:
-        supported = ", ".join(WINDOWS_ONEDNN_CONTRACTS)
-        raise RuntimeError(
-            f"No Windows oneDNN contract for Torch {torch_version!r}; "
-            f"supported minors: {supported}"
-        ) from error
-
-
-def get_validated_onednn_version():
-    """Return the platform-specific native oneDNN ABI contract."""
-    if IS_WINDOWS:
-        return get_windows_onednn_contract(BUILD_TORCH_VERSION)[1]
-    return LINUX_VALIDATED_ONEDNN_VERSION
-
-
-def get_onednn_package_version():
-    """Return the package release paired with the selected native ABI."""
-    if IS_WINDOWS:
-        return get_windows_onednn_contract(BUILD_TORCH_VERSION)[0]
-    return LINUX_ONEDNN_PACKAGE_VERSION
 
 
 VERSION_NAMESPACE = run_path(str(Path(__file__).parent / "omni_xpu_kernel" / "_version.py"))
@@ -544,28 +507,30 @@ def get_onednn_paths():
         # onednn-devel and onednn install into the active Python prefix.
         pip_include = Path(sysconfig.get_path("data")) / "include"
         pip_lib = get_runtime_library_dir()
+    if IS_WINDOWS:
+        for variable in ("DNNLROOT", "ONEDNNROOT"):
+            value = os.environ.get(variable)
+            if value:
+                root = Path(value)
+                candidates.append((root / "include", root / "lib", "", "oneAPI"))
+
     candidates.append((pip_include, pip_lib, "", "pip"))
 
     if IS_WINDOWS:
         oneapi_roots = []
-        for variable in ("DNNLROOT", "ONEDNNROOT"):
-            value = os.environ.get(variable)
-            if value:
-                oneapi_roots.append(Path(value))
-
         program_roots = (
             Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")),
             Path(os.environ.get("ProgramFiles", r"C:\Program Files")),
         )
-        install_series = get_windows_onednn_contract(BUILD_TORCH_VERSION)[2]
         for program_root in program_roots:
             dnnl_root = program_root / "Intel" / "oneAPI" / "dnnl"
-            oneapi_roots.extend(
-                [
-                    dnnl_root / install_series,
-                    dnnl_root / "latest",
-                ]
-            )
+            oneapi_roots.append(dnnl_root / "latest")
+            if dnnl_root.is_dir():
+                oneapi_roots.extend(sorted(
+                    (path for path in dnnl_root.iterdir() if path.is_dir()),
+                    key=lambda path: tuple(map(int, re.findall(r"\d+", path.name))),
+                    reverse=True,
+                ))
 
         seen_roots = set()
         for root in oneapi_roots:
@@ -589,14 +554,12 @@ def get_onednn_paths():
             continue
 
         header_version = get_onednn_header_version(include_dir)
-        validated_version = get_validated_onednn_version()
-        if header_version != validated_version:
-            expected = ".".join(map(str, validated_version))
+        if not IS_WINDOWS and header_version != LINUX_VALIDATED_ONEDNN_VERSION:
+            expected = ".".join(map(str, LINUX_VALIDATED_ONEDNN_VERSION))
             actual = ".".join(map(str, header_version))
-            package = get_onednn_package_version()
             raise RuntimeError(
                 f"Unsupported oneDNN headers {actual} from {include_dir}; "
-                f"expected {expected} to match onednn=={package}"
+                f"expected {expected} to match onednn=={LINUX_ONEDNN_PACKAGE_VERSION}"
             )
         library_version = get_onednn_library_version(runtime_library)
         if library_version is not None and library_version != header_version:
@@ -615,18 +578,16 @@ def get_onednn_paths():
         )
 
     if IS_WINDOWS:
-        expected = ".".join(map(str, get_validated_onednn_version()))
         raise RuntimeError(
-            f"A matched oneDNN {expected} development installation was not found. "
-            "Set DNNLROOT to a complete oneAPI installation, or set "
+            "A complete oneDNN development installation was not found. "
+            "Set DNNLROOT to an installation with matching headers and runtime, or set "
             "ONEDNN_INCLUDE, ONEDNN_LIB, and ONEDNN_RUNTIME to matched files."
         )
-    expected = ".".join(map(str, get_validated_onednn_version()))
-    package = get_onednn_package_version()
+    expected = ".".join(map(str, LINUX_VALIDATED_ONEDNN_VERSION))
     raise RuntimeError(
         f"oneDNN {expected} headers and runtime were not found in the active "
-        f"Python prefix. Install onednn=={package} and "
-        f"onednn-devel=={package}. For an explicit non-pip build, set both "
+        f"Python prefix. Install onednn=={LINUX_ONEDNN_PACKAGE_VERSION} and "
+        f"onednn-devel=={LINUX_ONEDNN_PACKAGE_VERSION}. For an explicit non-pip build, set both "
         "ONEDNN_INCLUDE and ONEDNN_LIB."
     )
 
@@ -678,7 +639,7 @@ def bundle_windows_onednn_runtime(
         shutil.copy2(notice_dir / name, notice_target / name)
 
     digest = hashlib.sha256(runtime_target.read_bytes()).hexdigest()
-    version = ".".join(map(str, get_validated_onednn_version()))
+    version = ".".join(map(str, get_onednn_library_version(runtime_library)))
     (notice_target / "VERSION").write_text(
         f"oneDNN={version}\ndnnl.dll.sha256={digest}\n",
         encoding="utf-8",
