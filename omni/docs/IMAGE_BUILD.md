@@ -27,7 +27,7 @@ The supported environment overrides are:
 |---|---|---|
 | `XPU_TARGET` | Native GPU build target | `bmg` |
 | `OMNI_IMAGE_REPOSITORY` | Local image repository | `intel/llm-scaler-omni` |
-| `OMNI_BASE_IMAGE` | OMIX development base | `intel/omix:0.4.0-devel-ubuntu24.04` at the digest pinned in `build.sh` |
+| `OMNI_BASE_IMAGE` | OMIX development base | `intel/omix:0.4.1-devel-ubuntu24.04` at the digest pinned in `build.sh` |
 | `OMNI_TORCH_VERSION` | PyTorch XPU wheel | `2.14.0+xpu` |
 | `OMNI_TORCHVISION_VERSION` | torchvision XPU wheel | `0.29.0+xpu` |
 | `OMNI_TORCHAUDIO_VERSION` | ComfyUI audio compatibility wheel | `2.11.0+xpu` |
@@ -61,19 +61,20 @@ ComfyUI repository, commit, and version must be updated together. Kitchen and
 AIMDO official dependency versions are separate from the versions of their
 pinned provider source wheels. The provider manifests declare which official
 versions each source wheel accepts, and image validation checks both identities.
-For the ComfyUI 0.42.1 candidate, official Kitchen 0.2.39 uses the matching
-0.2.39 provider source at `xiangyuT/comfy-kitchen-xpu`
-(`3c9c495f3c648166ec4b0c69b676904f09b53267`). This provider includes the native XPU LLM
+
+For the default ComfyUI 0.43.0 source build, official Kitchen 0.2.40 uses the matching
+0.2.40 provider source at `xiangyuT/comfy-kitchen-xpu`
+(`3a5728c21038c03a62e6cd74d3ffff740856b755`). This provider includes the native XPU LLM
 decode/cache and deferred-state adapters paired with the Omni kernels in this
-checkout. Official AIMDO 0.5.6 uses
-the matching 0.5.6 provider source at `xiangyuT/comfy-aimdo-xpu`
-(`96e6503c01124ce62bc4f5215458371a650c539f`). Both provider manifests
-accept their matching official 0.2.39 and 0.5.6 versions. AIMDO provider metadata
+checkout. Official AIMDO 0.6.0 uses
+the matching 0.6.0 provider source at `xiangyuT/comfy-aimdo-xpu`
+(`0f86ae803d741319c86cc8f978a540de4d99f991`). Both provider manifests
+accept their matching official 0.2.40 and 0.6.0 versions. AIMDO provider metadata
 comes from its source wheel; its builder has no manual release allowlist or
 version-to-upstream-commit table. This image selects the version combination and
 validates it at integration time. The ComfyUI release
-requirements also pin embedded docs to 0.5.14; frontend and workflow templates
-are selected as 1.55.18 and 0.11.89 by the build inputs.
+requirements also pin embedded docs to 0.5.15; frontend and workflow templates
+are selected as 1.57.4 and 0.11.97 by the build inputs.
 GGUF repository and commit must be updated together.
 The private sidecar build requires the Torch release supported by llm-scaler
 (currently `2.14.0+xpu`) and an explicitly selected AIMDO revision that contains
@@ -161,7 +162,7 @@ downgrade the rest of the Torch/oneAPI stack. The build records source,
 patch, and installed-library identities in
 `/llm/manifests/onednn-runtime.env`.
 
-OMIX 0.4 supplies the newer build toolchain, while Torch 2.14 pins its
+OMIX 0.4.1 supplies the build toolchain, while Torch 2.14 pins its
 packaged SYCL and Unified Runtime libraries to 2026.1. The final image keeps
 OMIX initialization for compiler and tool discovery, then restores
 `/opt/venv/lib` and the discovered Torch library directory to the front of

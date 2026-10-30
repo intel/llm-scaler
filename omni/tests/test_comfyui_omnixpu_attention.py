@@ -28,8 +28,13 @@ def _pinned_comfy_attention_namespace():
     if not source.is_file():
         pytest.fail(f"explicit pinned Comfy source is missing: {source}")
     contents = source.read_bytes()
-    if hashlib.sha256(contents).hexdigest() != "bc0a142275a9b1ebacd42d75d674ac6ce74e1c6bbdedeb8fc52706599d4ad498":
-        pytest.fail("explicit Comfy attention.py is not pinned b0b74356 source")
+    pinned_sources = {
+        "bc0a142275a9b1ebacd42d75d674ac6ce74e1c6bbdedeb8fc52706599d4ad498": "b0b74356",
+        "2e688c4c96ba10915c7ca847ea692faea3be4b9c2605d74d785b7abb23ee2502":
+            "426f5eea52a7ece1dd599fff4cb6cd1f352ddd24 (0.43.0)",
+    }
+    if hashlib.sha256(contents).hexdigest() not in pinned_sources:
+        pytest.fail("explicit Comfy attention.py is not a pinned source")
     module = ast.parse(contents.decode("utf-8"), filename=str(source))
     definitions = [node for node in module.body if
                    (isinstance(node, ast.FunctionDef) and node.name == "wrap_attn") or

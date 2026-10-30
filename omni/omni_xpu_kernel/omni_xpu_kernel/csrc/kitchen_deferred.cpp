@@ -3,7 +3,7 @@
 // Copyright (c) 2026 Niko1221 and the Strata contributors.
 // verify_kernels.dp.cpp @3052aef22aea8067b056e9d0ed2332d0d0639ea6.
 // Kitchen has contiguous [B,Hv,DK,DV] FP32 state, contiguous GQA groups,
-// dtype-rounded gates/SiLU and device {pending,parity}, adapted here explicitly.
+// dtype-rounded gates/SiLU and device-side accepted-slot/tree programs.
 #include <ATen/ops/linear.h>
 #include <torch/extension.h>
 #include <sycl/sycl.hpp>
@@ -13,13 +13,15 @@
 namespace omni_xpu::kitchen {
 namespace {
 constexpr int SLOT=8, D=128, RG=4, RPG=D/RG;
+constexpr int CTL_INTS=2+3*SLOT;
 template<typename T> class DeferredConv;
 template<typename T> class DeferredGates;
 template<typename T> class DeferredSums;
 template<typename T> class DeferredDelta;
 void ctl_check(const torch::Tensor& ctl,const torch::Tensor& ref) {
     TORCH_CHECK(ctl.device()==ref.device() && ctl.scalar_type()==at::kInt
-        && ctl.sizes()==at::IntArrayRef({2}) && ctl.is_contiguous(),"ctl must be contiguous XPU int32 [2]");
+        && ctl.dim()==1 && ctl.numel()==CTL_INTS && ctl.is_contiguous(),
+        "ctl must be contiguous XPU int32 [26]");
 }
 void tensor_check(const torch::Tensor& t,const torch::Tensor& ref,
                   at::ScalarType dtype,at::IntArrayRef shape,const char* label) {
@@ -41,13 +43,22 @@ void conv_launch(torch::Tensor proj,torch::Tensor state,torch::Tensor weight,
             const int64_t current=int64_t(p)*B*SLOT*C,previous=int64_t(1-p)*B*SLOT*C;
             T* history=st+(int64_t(batch)*C+c)*W;
             // Forward traversal is safe: each old source index is >= its destination.
-            for(int r=0;r<W;++r) history[r]=n+r<W?history[n+r]:pb[previous+(int64_t(batch)*SLOT+n+r-W)*C+c];
+            for(int r=0;r<W;++r) {
+                const int accepted=n+r-W;
+                const int slot=accepted>=0 ? control[2+accepted] : 0;
+                history[r]=n+r<W?history[n+r]:pb[previous+(int64_t(batch)*SLOT+slot)*C+c];
+            }
             for(int t=0;t<S;++t) {
                 float sum=b?float(b[c]):0.f;
-                for(int tap=0;tap<=W;++tap) {
-                    const int r=t+tap;
-                    const float v=r<W?float(history[r]):float(x[(int64_t(batch)*S+r-W)*C+c]);
-                    sum+=v*float(w[int64_t(c)*(W+1)+tap]);
+                int ancestor=t,missing=0;
+                for(int distance=0;distance<=W;++distance) {
+                    if(distance) {
+                        ancestor=ancestor>=0 ? control[2+SLOT+ancestor] : -1;
+                        if(ancestor<0) ++missing;
+                    }
+                    const float value=ancestor>=0
+                        ?float(x[(int64_t(batch)*S+ancestor)*C+c]):float(history[W-missing]);
+                    sum+=value*float(w[int64_t(c)*(W+1)+W-distance]);
                 }
                 // Kitchen rounds the convolution before applying SiLU.
                 const float y=float(T(sum));
@@ -122,7 +133,13 @@ torch::Tensor delta_launch(torch::Tensor x,torch::Tensor wa,torch::Tensor wb,
                 // replay and current read-only verification; commit exactly once.
                 for(int phase=0;phase<2;++phase) {
                     const int parity=phase?p:1-p,count=phase?S:pending;
-                    for(int t=0;t<count;++t) {
+                    for(int entry=0;entry<count;++entry) {
+                        const int instruction=phase?control[2+2*SLOT+entry]:0;
+                        const int t=phase?(instruction&15):control[2+entry];
+                        const bool commit=!phase || (instruction&32);
+                        if(t<0 || t>=SLOT || (phase && t>=S)) return;
+                        float saved[RPG];
+                        for(int r=0;r<RPG;++r) saved[r]=st[r];
                         const int64_t qbbase=(int64_t(parity)*B+batch)*C*SLOT;
                         const int64_t ss=((int64_t(parity)*B+batch)*SLOT+t)*HK+kh;
                         if(rg==0) {
@@ -158,6 +175,7 @@ torch::Tensor delta_launch(torch::Tensor x,torch::Tensor wa,torch::Tensor wb,
                                 out[dst]=T(normed*gate_z);
                             }
                         }
+                        if(!commit) for(int r=0;r<RPG;++r) st[r]=saved[r];
                         it.barrier(sycl::access::fence_space::local_space);
                     }
                     if(!phase && pending>0) for(int r=0;r<RPG;++r) sp[base+r*D]=st[r];

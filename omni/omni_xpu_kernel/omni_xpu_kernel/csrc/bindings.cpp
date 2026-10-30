@@ -38,7 +38,8 @@ namespace kitchen {
         torch::Tensor input, std::optional<torch::Tensor> weight,
         std::optional<torch::Tensor> bias, int64_t groups, double eps,
         std::vector<int64_t> pad, bool silu, bool zero_pad,
-        std::optional<torch::Tensor> out);
+        std::optional<torch::Tensor> out, std::optional<torch::Tensor> stats);
+    torch::Tensor group_norm_stats3d(torch::Tensor input, int64_t groups, double eps);
     torch::Tensor fp16_linear(
         torch::Tensor input, torch::Tensor weight,
         std::optional<torch::Tensor> bias,
@@ -941,6 +942,8 @@ PYBIND11_MODULE(_C, m) {
         py::arg("q"), py::arg("k"), py::arg("v"), py::arg("lengths"), py::arg("causal")=true);
     kitchen.def("decode_step_merge", &omni_xpu::kitchen::decode_step_merge,
         py::arg("out"), py::arg("lse"), py::arg("q"), py::arg("k"), py::arg("v"), py::arg("merged"));
+    kitchen.def("decode_tree_merge", &omni_xpu::kitchen::decode_tree_merge);
+    kitchen.attr("gated_delta_ctl_ints") = 26;
     kitchen.def("int8_decode_update", &omni_xpu::kitchen::int8_decode_update);
     kitchen.def("int8_decode", &omni_xpu::kitchen::int8_decode);
     kitchen.def("deltanet_conv_deferred", &omni_xpu::kitchen::deltanet_conv_deferred);
@@ -976,14 +979,16 @@ PYBIND11_MODULE(_C, m) {
         py::arg("eps") = 1e-6,
         py::arg("pad") = std::vector<int64_t>{0, 0, 0, 0, 0},
         py::arg("silu") = true, py::arg("zero_pad") = false,
-        py::arg("out") = py::none());
+        py::arg("out") = py::none(), py::arg("stats") = py::none());
+    kitchen.def("group_norm_stats3d", &omni_xpu::kitchen::group_norm_stats3d,
+        py::arg("input"), py::arg("groups")=32, py::arg("eps")=1e-6);
     kitchen.def(
         "group_norm_silu_pad3d_out",
         &omni_xpu::kitchen::group_norm_silu_pad3d,
         "Write per-frame GroupNorm, SiLU and padding to an XPU output view",
         py::arg("input"), py::arg("weight"), py::arg("bias"),
         py::arg("groups"), py::arg("eps"), py::arg("pad"),
-        py::arg("silu"), py::arg("zero_pad"), py::arg("out"));
+        py::arg("silu"), py::arg("zero_pad"), py::arg("out"), py::arg("stats")=py::none());
     kitchen.def(
         "fp16_linear", &omni_xpu::kitchen::fp16_linear,
         "FP16 XPU linear with native bias and scaled-residual epilogue",

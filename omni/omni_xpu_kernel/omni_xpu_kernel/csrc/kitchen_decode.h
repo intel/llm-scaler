@@ -8,6 +8,8 @@ std::vector<torch::Tensor> decode_attention(
     torch::Tensor lengths, bool causal);
 void decode_step_merge(torch::Tensor out, torch::Tensor lse,
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor merged);
+void decode_tree_merge(torch::Tensor out, torch::Tensor lse,
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor mask, torch::Tensor merged);
 std::vector<torch::Tensor> decode_quantized(torch::Tensor q,torch::Tensor qi,torch::Tensor qs,
     torch::Tensor k,torch::Tensor v,torch::Tensor ks,torch::Tensor vs,
     torch::Tensor length,int64_t capacity);

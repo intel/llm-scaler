@@ -29,6 +29,7 @@ class Config:
         self.lora_memory = (
             master and os.environ.get("OMNIXPU_LORA_MEMORY", "1") != "0"
         )
+        self.writable_weights = master
         self.qwen_image21_cache = (
             master and os.environ.get("OMNIXPU_QWEN_IMAGE21_CACHE", "1") != "0"
         )
@@ -40,10 +41,6 @@ class Config:
             master
             and os.environ.get("OMNIXPU_SEEDVR_CAPACITY", "1") != "0"
         )
-        self.seedvr_cat_pad = (
-            master
-            and os.environ.get("OMNIXPU_SEEDVR_CAT_PAD", "1") != "0"
-        )
         self.large_video_preprocess = (
             master
             and os.environ.get("OMNIXPU_LARGE_VIDEO_PREPROCESS", "1") != "0"
@@ -51,6 +48,9 @@ class Config:
         self.dynamic_vram_boundary_trim = (
             master
             and os.environ.get("OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM", "1") != "0"
+        )
+        self.xpu_ram_staging = (
+            master and os.environ.get("OMNIXPU_XPU_RAM_STAGING", "1") != "0"
         )
         self.interpolate_fix = (
             master and os.environ.get("OMNIXPU_INTERPOLATE_FIX", "0") != "0"

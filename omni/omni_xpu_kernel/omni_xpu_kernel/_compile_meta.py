@@ -59,10 +59,14 @@ def kitchen_gated_quantize(input, input_act, group_size=0):
 
 def kitchen_group_norm_pad(input, weight=None, bias=None, groups=32,
                            eps=1e-6, pad=(0, 0, 0, 0, 0), silu=True,
-                           zero_pad=False):
+                           zero_pad=False, stats=None):
     n, c, t, h, w = input.shape
     return input.new_empty((n, t + pad[4], h + pad[2] + pad[3],
                             w + pad[0] + pad[1], c)).permute(0, 4, 1, 2, 3)
+
+
+def kitchen_group_norm_stats(input, groups=32, eps=1e-6):
+    return input.new_empty((input.shape[0]*input.shape[2], groups, 2), dtype=torch.float32)
 
 
 def kitchen_awq(input, packed, scales, zeros, bias=None, group_size=64):
@@ -71,7 +75,7 @@ def kitchen_awq(input, packed, scales, zeros, bias=None, group_size=64):
 
 
 def kitchen_group_norm_pad_out(input, weight, bias, groups, eps, pad, silu,
-                               zero_pad, out):
+                               zero_pad, out, stats=None):
     return None
 
 

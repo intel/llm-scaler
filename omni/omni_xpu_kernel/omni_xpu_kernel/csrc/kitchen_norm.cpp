@@ -18,60 +18,18 @@ template <typename T>
 class GroupNormSiluPad3dKernel;
 
 template <typename T>
-torch::Tensor launch_group_norm_silu_pad3d(
-    const torch::Tensor& input,
-    const std::optional<torch::Tensor>& weight,
-    const std::optional<torch::Tensor>& bias,
-    int64_t groups,
-    double eps,
-    const std::vector<int64_t>& pad,
-    bool silu,
-    bool zero_pad,
-    const std::optional<torch::Tensor>& out) {
-    const int64_t batch = input.size(0);
-    const int64_t channels = input.size(1);
-    const int64_t frames = input.size(2);
-    const int64_t height = input.size(3);
-    const int64_t width = input.size(4);
-    const int64_t left = pad[0], right = pad[1];
-    const int64_t top = pad[2], bottom = pad[3], front = pad[4];
-    const int64_t output_frames = frames + front;
-    const int64_t output_height = height + top + bottom;
-    const int64_t output_width = width + left + right;
-    const int64_t channels_per_group = channels / groups;
-    const int64_t group_elements = channels_per_group * height * width;
-    const int64_t stride_b = input.stride(0);
-    const int64_t stride_c = input.stride(1);
-    const int64_t stride_t = input.stride(2);
-    const int64_t stride_h = input.stride(3);
-    const int64_t stride_w = input.stride(4);
-    auto output = out.has_value() ? *out : torch::empty(
-        {batch, output_frames, output_height, output_width, channels},
-        input.options()).permute({0, 4, 1, 2, 3});
-    const int64_t output_stride_b = output.stride(0);
-    const int64_t output_stride_c = output.stride(1);
-    const int64_t output_stride_t = output.stride(2);
-    const int64_t output_stride_h = output.stride(3);
-    const int64_t output_stride_w = output.stride(4);
-    auto moments = torch::empty(
-        {batch * frames * groups, 2},
-        input.options().dtype(torch::kFloat32));
-
-    const T* input_ptr = static_cast<const T*>(input.data_ptr());
-    const T* weight_ptr = weight.has_value() && weight->scalar_type() == input.scalar_type()
-        ? static_cast<const T*>(weight->data_ptr()) : nullptr;
-    const float* weight_f32 = weight.has_value() && weight->scalar_type() == at::kFloat
-        ? weight->data_ptr<float>() : nullptr;
-    const T* bias_ptr = bias.has_value() && bias->scalar_type() == input.scalar_type()
-        ? static_cast<const T*>(bias->data_ptr()) : nullptr;
-    const float* bias_f32 = bias.has_value() && bias->scalar_type() == at::kFloat
-        ? bias->data_ptr<float>() : nullptr;
-    float* moment_ptr = moments.data_ptr<float>();
-    T* output_ptr = static_cast<T*>(output.data_ptr());
-    const bool normalize = weight.has_value();
-    const float eps_f32 = static_cast<float>(eps);
-
-    if (normalize) {
+torch::Tensor launch_group_norm_stats3d(const torch::Tensor& input,
+                                       int64_t groups, double eps) {
+    const int64_t batch=input.size(0), channels=input.size(1), frames=input.size(2);
+    const int64_t height=input.size(3), width=input.size(4);
+    const int64_t channels_per_group=channels/groups;
+    const int64_t group_elements=channels_per_group*height*width;
+    const int64_t stride_b=input.stride(0), stride_c=input.stride(1), stride_t=input.stride(2);
+    const int64_t stride_h=input.stride(3), stride_w=input.stride(4);
+    auto moments=torch::empty({batch*frames,groups,2},input.options().dtype(at::kFloat));
+    const T* input_ptr=static_cast<const T*>(input.data_ptr());
+    float* moment_ptr=moments.data_ptr<float>();
+    const float eps_f32=static_cast<float>(eps);
         auto moments_cgf = [&](sycl::handler& handler) {
             handler.parallel_for<GroupNormFrameMomentsKernel<T>>(
                 sycl::range<1>(static_cast<size_t>(batch * frames * groups)),
@@ -109,7 +67,65 @@ torch::Tensor launch_group_norm_silu_pad3d(
         };
         utils::submit_kernel(
             moments_cgf, input.device(), "kitchen_group_norm_moments");
-    }
+    return moments;
+}
+
+template <typename T>
+torch::Tensor launch_group_norm_silu_pad3d(
+    const torch::Tensor& input,
+    const std::optional<torch::Tensor>& weight,
+    const std::optional<torch::Tensor>& bias,
+    int64_t groups,
+    double eps,
+    const std::vector<int64_t>& pad,
+    bool silu,
+    bool zero_pad,
+    const std::optional<torch::Tensor>& out,
+    const std::optional<torch::Tensor>& stats) {
+    const int64_t batch = input.size(0);
+    const int64_t channels = input.size(1);
+    const int64_t frames = input.size(2);
+    const int64_t height = input.size(3);
+    const int64_t width = input.size(4);
+    const int64_t left = pad[0], right = pad[1];
+    const int64_t top = pad[2], bottom = pad[3], front = pad[4];
+    const int64_t output_frames = frames + front;
+    const int64_t output_height = height + top + bottom;
+    const int64_t output_width = width + left + right;
+    const int64_t channels_per_group = channels / groups;
+    const int64_t group_elements = channels_per_group * height * width;
+    const int64_t stride_b = input.stride(0);
+    const int64_t stride_c = input.stride(1);
+    const int64_t stride_t = input.stride(2);
+    const int64_t stride_h = input.stride(3);
+    const int64_t stride_w = input.stride(4);
+    auto output = out.has_value() ? *out : torch::empty(
+        {batch, output_frames, output_height, output_width, channels},
+        input.options()).permute({0, 4, 1, 2, 3});
+    const int64_t output_stride_b = output.stride(0);
+    const int64_t output_stride_c = output.stride(1);
+    const int64_t output_stride_t = output.stride(2);
+    const int64_t output_stride_h = output.stride(3);
+    const int64_t output_stride_w = output.stride(4);
+    auto moments = stats.has_value() ? *stats : weight.has_value()
+        ? launch_group_norm_stats3d<T>(input, groups, eps)
+        : torch::empty({0}, input.options().dtype(at::kFloat));
+
+    const T* input_ptr = static_cast<const T*>(input.data_ptr());
+    const T* weight_ptr = weight.has_value() && weight->scalar_type() == input.scalar_type()
+        ? static_cast<const T*>(weight->data_ptr()) : nullptr;
+    const float* weight_f32 = weight.has_value() && weight->scalar_type() == at::kFloat
+        ? weight->data_ptr<float>() : nullptr;
+    const T* bias_ptr = bias.has_value() && bias->scalar_type() == input.scalar_type()
+        ? static_cast<const T*>(bias->data_ptr()) : nullptr;
+    const float* bias_f32 = bias.has_value() && bias->scalar_type() == at::kFloat
+        ? bias->data_ptr<float>() : nullptr;
+    float* moment_ptr = moments.template data_ptr<float>();
+    T* output_ptr = static_cast<T*>(output.data_ptr());
+    const bool normalize = weight.has_value();
+    const bool supplied_stats = stats.has_value();
+    const float eps_f32 = static_cast<float>(eps);
+
 
     const int64_t output_count = batch * output_frames * output_height *
                                  output_width * channels;
@@ -151,14 +167,21 @@ torch::Tensor launch_group_norm_silu_pad3d(
                     const int64_t group = c / channels_per_group;
                     const int64_t moment_index =
                         (b * frames + input_t) * groups + group;
-                    value = (value - moment_ptr[2 * moment_index]) *
-                            moment_ptr[2 * moment_index + 1];
+                    const float mean=moment_ptr[2 * moment_index];
+                    const float rstd=moment_ptr[2 * moment_index + 1];
                     const float gamma = weight_ptr
                         ? static_cast<float>(weight_ptr[c]) : weight_f32[c];
                     const float beta = bias_ptr
                         ? static_cast<float>(bias_ptr[c])
                         : (bias_f32 ? bias_f32[c] : 0.0f);
-                    value = value * gamma + beta;
+                    if (supplied_stats) {
+                        const float scale=rstd*gamma;
+                        const float shift=-mean*scale+beta;
+                        value=sycl::fma(value,scale,shift);
+                    } else {
+                        value=(value-mean)*rstd;
+                        value=value*gamma+beta;
+                    }
                     value = static_cast<float>(static_cast<T>(value));
                 }
                 if (silu) {
@@ -183,7 +206,8 @@ torch::Tensor group_norm_silu_pad3d(
     std::vector<int64_t> pad,
     bool silu,
     bool zero_pad,
-    std::optional<torch::Tensor> out) {
+    std::optional<torch::Tensor> out,
+    std::optional<torch::Tensor> stats) {
     TORCH_CHECK(input.device().is_xpu() && input.dim() == 5,
                 "input must be an XPU [B,C,T,H,W] tensor");
     TORCH_CHECK(input.size(0) > 0 && input.size(1) > 0 &&
@@ -211,6 +235,12 @@ torch::Tensor group_norm_silu_pad3d(
                             input.size(4) + pad[0] + pad[1]}),
                     "out must have the padded shape, input dtype and device");
     }
+    if (stats.has_value()) {
+        TORCH_CHECK(stats->device()==input.device() && stats->scalar_type()==at::kFloat
+                    && stats->is_contiguous() && stats->sizes()==at::IntArrayRef({
+                        input.size(0)*input.size(2),groups,2}),
+                    "stats must be contiguous XPU FP32 [B*T, groups, 2]");
+    }
     if (weight.has_value()) {
         TORCH_CHECK(weight->device() == input.device() &&
                         weight->dim() == 1 && weight->numel() == input.size(1) &&
@@ -230,16 +260,29 @@ torch::Tensor group_norm_silu_pad3d(
     switch (input.scalar_type()) {
         case at::kHalf:
             return launch_group_norm_silu_pad3d<sycl::half>(
-                input, weight, bias, groups, eps, pad, silu, zero_pad, out);
+                input, weight, bias, groups, eps, pad, silu, zero_pad, out, stats);
         case at::kBFloat16:
             return launch_group_norm_silu_pad3d<sycl::ext::oneapi::bfloat16>(
-                input, weight, bias, groups, eps, pad, silu, zero_pad, out);
+                input, weight, bias, groups, eps, pad, silu, zero_pad, out, stats);
         case at::kFloat:
             return launch_group_norm_silu_pad3d<float>(
-                input, weight, bias, groups, eps, pad, silu, zero_pad, out);
+                input, weight, bias, groups, eps, pad, silu, zero_pad, out, stats);
         default:
             TORCH_CHECK(false,
                         "group_norm_silu_pad3d requires fp16, bf16 or fp32");
+    }
+}
+
+torch::Tensor group_norm_stats3d(torch::Tensor input, int64_t groups, double eps) {
+    TORCH_CHECK(input.is_xpu() && input.dim()==5 && input.numel()>0,
+                "stats input must be nonempty XPU [B,C,T,H,W]");
+    TORCH_CHECK(groups>0 && input.size(1)%groups==0 && std::isfinite(eps) && eps>=0,
+                "invalid GroupNorm groups or eps");
+    switch(input.scalar_type()) {
+        case at::kHalf: return launch_group_norm_stats3d<sycl::half>(input,groups,eps);
+        case at::kBFloat16: return launch_group_norm_stats3d<sycl::ext::oneapi::bfloat16>(input,groups,eps);
+        case at::kFloat: return launch_group_norm_stats3d<float>(input,groups,eps);
+        default: TORCH_CHECK(false,"GroupNorm stats requires FP16/BF16/FP32");
     }
 }
 

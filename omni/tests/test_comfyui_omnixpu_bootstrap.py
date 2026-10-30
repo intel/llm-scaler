@@ -101,11 +101,11 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
         "OMNIXPU_FP8_GEMM",
         "OMNIXPU_INT8_FFN",
         "OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM",
+        "OMNIXPU_XPU_RAM_STAGING",
         "OMNIXPU_LORA_MEMORY",
         "OMNIXPU_QWEN_IMAGE21_CACHE",
         "OMNIXPU_SEEDVR_ADA_RESHAPE",
         "OMNIXPU_SEEDVR_CAPACITY",
-        "OMNIXPU_SEEDVR_CAT_PAD",
         "OMNIXPU_LARGE_VIDEO_PREPROCESS",
         "OMNIXPU_INTERPOLATE_FIX",
         "OMNIXPU_MEDIAN_FIX",
@@ -120,11 +120,12 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     assert config.fp8_gemm
     assert config.int8_ffn
     assert config.dynamic_vram_boundary_trim
+    assert config.xpu_ram_staging
     assert config.lora_memory
     assert config.qwen_image21_cache
+    assert config.writable_weights
     assert config.seedvr_ada_reshape
     assert config.seedvr_capacity
-    assert config.seedvr_cat_pad
     assert config.large_video_preprocess
     assert not config.interpolate_fix
     assert not config.median_fix
@@ -146,12 +147,13 @@ def test_disabled_components_are_reported_without_importing_modules(monkeypatch)
         fp8_gemm=False,
         int8_ffn=False,
         dynamic_vram_boundary_trim=False,
+        xpu_ram_staging=False,
         lora_memory=False,
         qwen_image21_cache=False,
+        writable_weights=False,
         quantized_matmul=False,
         seedvr_ada_reshape=False,
         seedvr_capacity=False,
-        seedvr_cat_pad=False,
         large_video_preprocess=False,
         interpolate_fix=False,
         median_fix=False,

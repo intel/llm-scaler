@@ -131,3 +131,39 @@ def test_group_norm_out_frame_view_preserves_other_frames():
     )
     torch.testing.assert_close(view, expected, rtol=0, atol=0)
     assert bool((full[:, :, :2] == 7).all())
+
+
+@pytest.mark.parametrize("dtype", [torch.float16,torch.bfloat16,torch.float32])
+def test_group_norm_stats_and_full_frame_override_on_strips(dtype):
+    torch.manual_seed(329)
+    x=torch.randn(1,32,2,7,9,device="xpu",dtype=dtype).contiguous(memory_format=torch.channels_last_3d)
+    frames=x.permute(0,2,1,3,4).reshape(2,8,-1).float()
+    var,mean=torch.var_mean(frames,dim=-1,unbiased=False)
+    stats=torch.stack([mean,torch.rsqrt(var+1e-6)],-1)
+    actual_stats=kitchen.group_norm_stats3d(x,8,1e-6)
+    torch.testing.assert_close(actual_stats,stats,rtol=2e-5,atol=2e-5)
+    weight=torch.randn(32,device="xpu",dtype=dtype)
+    bias=torch.randn_like(weight)
+    strip=x[:,:,:,2:5,1::2]
+    scale=stats[...,1].repeat_interleave(4,dim=1)*weight.float()
+    shift=-stats[...,0].repeat_interleave(4,dim=1)*scale+bias.float()
+    y=strip.permute(0,2,1,3,4).reshape(2,32,3,4)
+    expected=functional.silu(torch.addcmul(shift[:,:,None,None],y.float(),scale[:,:,None,None]).to(dtype))
+    expected=expected.reshape(1,2,32,3,4).permute(0,2,1,3,4)
+    expected=functional.pad(expected,(1,1,1,1,0,0)).contiguous(memory_format=torch.channels_last_3d)
+    actual=kitchen.group_norm_silu_pad3d(strip,weight,bias,8,1e-6,[1,1,1,1,0],True,True,stats)
+    tol=2e-5 if dtype==torch.float32 else .01
+    torch.testing.assert_close(actual,expected,rtol=tol,atol=tol)
+    output=torch.full((1,32,3,5,6),7.,device="xpu",dtype=dtype).contiguous(memory_format=torch.channels_last_3d)
+    kitchen.group_norm_silu_pad3d_out(strip,weight,bias,8,1e-6,[1,1,1,1,0],True,True,output[:,:,1:],stats)
+    torch.testing.assert_close(output[:,:,1:],actual,rtol=0,atol=0)
+    assert (output[:,:,:1]==7).all()
+
+
+def test_group_norm_stats_compile_and_invalid_shape():
+    x=torch.randn(1,16,2,3,5,device="xpu",dtype=torch.bfloat16)
+    compiled=torch.compile(kitchen.group_norm_stats3d,backend="eager",fullgraph=True)
+    torch.testing.assert_close(compiled(x,4),kitchen.group_norm_stats3d(x,4),rtol=0,atol=0)
+    with pytest.raises(RuntimeError,match="stats"):
+        kitchen.group_norm_silu_pad3d(x,torch.ones(16,device="xpu",dtype=x.dtype),groups=4,
+                                      stats=torch.ones(1,4,2,device="xpu"))

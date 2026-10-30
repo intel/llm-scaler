@@ -93,11 +93,25 @@ COMPONENTS = (
         "adapters/dynamic_vram.py",
     ),
     Component(
+        "xpu_ram_staging_adapter",
+        "xpu_ram_staging",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/xpu_ram_staging.py",
+    ),
+    Component(
         "lora_memory_adapter",
         "lora_memory",
         "adapter",
         "ComfyUI-OmniXPU",
         "adapters/lora_memory.py",
+    ),
+    Component(
+        "writable_weight_adapter",
+        "writable_weights",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/writable_weights.py",
     ),
     Component(
         "qwen_image21_cache_adapter",
@@ -119,13 +133,6 @@ COMPONENTS = (
         "adapter",
         "ComfyUI-OmniXPU",
         "adapters/seedvr_capacity.py",
-    ),
-    Component(
-        "seedvr_cat_pad_adapter",
-        "seedvr_cat_pad",
-        "adapter",
-        "ComfyUI-OmniXPU",
-        "adapters/seedvr_cat_pad.py",
     ),
     Component(
         "large_video_preprocess_adapter",

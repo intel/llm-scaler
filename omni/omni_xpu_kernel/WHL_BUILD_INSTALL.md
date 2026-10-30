@@ -6,27 +6,57 @@
 > SHA 和验收记录保留为历史身份；从当前源码构建时，应按实际 Torch/target
 > 选择 b3 wheel。Windows b3 wheel 尚未完成构建与安装态验收。
 
+> **Windows oneDNN 选择说明 — 2026-10-30。** 下列版本组合和 v3.12.3 源码构建
+> 步骤供配置环境时参考，不是构建版本白名单。使用 `DNNLROOT` 或显式路径选择
+> 配套的 oneDNN 头文件、import library 和 runtime DLL；构建检查头文件与 DLL 的
+> 版本匹配，并记录实际 DLL 版本与 SHA256。compiler 和 SYCL runtime 仍需与
+> 所用 Torch XPU 环境兼容。
+
 > **Windows Torch 2.14 构建合同更新 — 2026-10-09。** 构建代码允许
-> `2.14.0+xpu`，使用 oneAPI 2026.1、oneDNN package 2026.1.0 /
-> native ABI 3.12.0，并将三组 Windows 扩展的语言标准切换为 C++20。
+> `2.14.0+xpu`，使用 oneAPI 2026.1（compiler 与 oneDNN 已于 2026-10-29 修订，见上），
+> 并将三组 Windows 扩展的语言标准切换为 C++20。
 > Torch 2.14 的 wheel 身份按现有规则生成 `0.2.0b2+torch214.bmg`；
 > Python ABI、target、DLL/header ABI 检查和 CUTE 双重 opt-in 均保留。
 > 本轮只完成构建合同测试，尚未执行 Windows wheel build/安装态验收。
 > 以下 Torch 2.13 配方和 artifact SHA 保留为最近一次实测的历史身份；
 > 用 2.14 构建时，Torch 安装/断言和 wheel 选择必须一致改为
-> `2.14.0+xpu` / `torch214`；compiler、oneDNN 和 ocloc 的安装目录必须
-> 对齐 `2026.1`，不能复用下列 Torch 2.13 wheel。
+> `2.14.0+xpu` / `torch214`；compiler 和 ocloc 的安装目录必须对齐 `2026.1`，
+> oneDNN 可参考下文 v3.12.3 源码配方，不能复用下列 Torch 2.13 wheel。
 
-Windows 依赖按 Torch minor 选择：
+以下是可参考的 Windows 构建组合：
 
 | Torch | oneAPI 安装系列 | oneDNN package / native ABI | C++ 标准 |
 |---|---|---|---|
 | 2.13.0+xpu | 2026.0 | 2026.0.0 / 3.11.2 | C++17 |
-| 2.14.0+xpu | 2026.1 | 2026.1.0 / 3.12.0 | C++20 |
+| 2.14.0+xpu | 2026.1（DLE 2026.1.2） | v3.12.3 源码构建 + BF16/INT4 补丁 / 3.12.3 | C++20 |
 
-2.14 的依赖来自[官方 Windows wheel](https://download.pytorch.org/whl/xpu/torch-2.14.0%2Bxpu-cp313-cp313-win_amd64.whl)
-的 runtime metadata 和 bundled `oneapi/dnnl/dnnl_version.h`。
-`setup.py` 自动查找对应 oneAPI 系列，并校验 headers/runtime DLL 的 native ABI。
+这些 oneDNN 版本不与 Torch minor 强制绑定。可使用其他配套的 oneDNN 安装；
+`setup.py` 校验实际选中的 headers/runtime DLL，不因其版本不在表中而拒绝构建。
+
+需要采用 v3.12.3 参考配方时，在第 6 节同一个构建 shell 中生成，
+`DNNLROOT` 指向安装目录：
+
+```bat
+git clone --filter=blob:none --no-checkout https://github.com/uxlfoundation/oneDNN.git "%BUILD_ROOT%\onednn-src"
+git -C "%BUILD_ROOT%\onednn-src" fetch --depth 1 origin tag v3.12.3
+git -C "%BUILD_ROOT%\onednn-src" checkout --detach v3.12.3
+git -C "%BUILD_ROOT%\onednn-src" apply "%REPO_ROOT%\omni\patches\onednn-v3.11.2-enable-bf16-int4-dequantization.patch"
+
+set "DNNLROOT=%BUILD_ROOT%\onednn-3.12.3"
+cmake -S "%BUILD_ROOT%\onednn-src" -B "%BUILD_ROOT%\onednn-build" -G Ninja ^
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="%DNNLROOT%" ^
+  -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx ^
+  -DDNNL_CPU_RUNTIME=NONE -DDNNL_GPU_RUNTIME=SYCL -DDNNL_GPU_VENDOR=INTEL ^
+  -DDNNL_BUILD_DOC=OFF -DDNNL_BUILD_EXAMPLES=OFF -DDNNL_BUILD_TESTS=OFF ^
+  -DONEDNN_BUILD_GRAPH=OFF
+cmake --build "%BUILD_ROOT%\onednn-build" --parallel %MAX_JOBS%
+cmake --install "%BUILD_ROOT%\onednn-build"
+```
+
+v3.12.3 对应 commit `6db5f1ba860ca8f65c3f65c4498ad867e9642447`。补丁以 LF 行尾计算的
+SHA256 为 `0a7afff4134f115b4bc53f46301ca3d62b1c11dc02e32c64635c469769fcdaeb`。
+安装目录包含 `include`、`lib\dnnl.lib`、`bin\dnnl.dll` 和
+`share\doc\dnnl\{LICENSE,THIRD-PARTY-PROGRAMS}`，满足 wheel 打包检查。
 Torch 2.14 Portable 对应 torchvision 0.29.0+xpu；现有 torchaudio 2.11.0+xpu
 例外保留。Python ABI、sycl-tla revision、BMG target 和版本命名规则沿用下列配方。
 
