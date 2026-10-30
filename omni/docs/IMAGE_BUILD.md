@@ -68,7 +68,7 @@ AIMDO 0.5.6 defaults on 2026-10-28. The historical provider revisions were
 bound to those sources and their original image. Source selection alone does
 not establish acceptance of the new image.
 
-For the ComfyUI 0.43.0 candidate, official Kitchen 0.2.40 uses the matching
+For the default ComfyUI 0.43.0 source build, official Kitchen 0.2.40 uses the matching
 0.2.40 provider source at `xiangyuT/comfy-kitchen-xpu`
 (`3a5728c21038c03a62e6cd74d3ffff740856b755`). This provider includes the native XPU LLM
 decode/cache and deferred-state adapters paired with the Omni kernels in this
@@ -168,7 +168,7 @@ downgrade the rest of the Torch/oneAPI stack. The build records source,
 patch, and installed-library identities in
 `/llm/manifests/onednn-runtime.env`.
 
-OMIX 0.4 supplies the newer build toolchain, while Torch 2.14 pins its
+OMIX 0.4.1 supplies the build toolchain, while Torch 2.14 pins its
 packaged SYCL and Unified Runtime libraries to 2026.1. The final image keeps
 OMIX initialization for compiler and tool discovery, then restores
 `/opt/venv/lib` and the discovered Torch library directory to the front of
@@ -253,6 +253,15 @@ lifecycle checks. The legacy Sol custom node, its source pins and experimental
 gate are retired; see [migration and usage](SPARSE_ATTENTION.md).
 
 This source-built image supports BMG.
+
+The OMIX 0.4.1 / ComfyUI 0.43.0 configuration completed clean-build and
+installed-image validation on Linux / Arc Pro B70 on 2026-10-30. Current-template
+functional lifecycles cover Qwen Image 2.1, its Turbo text-to-image and
+single-reference editing variants, MOSS Image, Flux 3 Klein INT8, Qwen 3.5,
+MiniMax H3 and Krea2 Turbo INT8. They check cold execution, resident caching,
+profiling and forced text re-encoding, including prompt enhancement when enabled
+by the official template. H3 uses its default template for functional validation;
+performance comparisons remain separate from these lifecycle checks.
 
 Run the upgrade lifecycle check in a disposable container, passing an exact
 official ComfyUI revision accepted for the milestone:
