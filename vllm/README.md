@@ -24,6 +24,7 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    2.8 [Multi-Modal Webui](#28-multi-modal-webui)  
    2.9 [Multi-node Distributed Deployment (PP/TP)](#29-multi-node-distributed-deployment-pptp)  
    2.10 [BPE-Qwen Tokenizer](#210-bpe-qwen-tokenizer)  
+   2.11 [Graph Mode](#211-graph-mode)  
 3. [Supported Models](#3-supported-models)<br>
    3.1 [How to use Hunyuan-7B-Instruct](#31-how-to-use-hunyuan-7b-instruct)<br>
    3.2 [Reference commands for Qwen3.5/3.6 models](#32-reference-commands-for-running-the-supported-qwen3536-models)<br>
@@ -1051,6 +1052,41 @@ To enable it when launching the API server, add:
 --tokenizer-mode bpe-qwen
 ```
 
+### 2.11 Graph Mode
+
+Qwen3.6-27B, Qwen3.6-35B-A3B, Qwen3.8-27B, gemma-4-26B-A4B-it and
+gemma-4-31B-it serve faster with decode graphs than with `--enforce-eager`.
+Replace `--enforce-eager` with:
+
+```bash
+--compilation-config '{"mode":3,"backend":"inductor","splitting_ops":[],"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8,16,32]}'
+```
+
+With MTP (`num_speculative_tokens` 4), each request decodes 5 tokens per step,
+so use these capture sizes instead:
+
+```text
+"cudagraph_capture_sizes":[1,2,4,5,8,10,15,16,20,24,25,30,32,40,48,64,80,96,128,160]
+```
+
+For gemma-4-26B-A4B-it, add the MoE decode fusion pass to the same JSON:
+
+```text
+"pass_config":{"fuse_xpu_gemma_moe":true}
+```
+
+The capture sizes cover up to 32 concurrent decode requests; larger decode
+batches run without graphs. The first start compiles and captures graphs, so
+startup takes longer than in eager mode.
+
+Qwen3.5-family models (including Qwen3.6 and Qwen3.8) automatically use
+breakable graphs with native fused MoE decode on XPU; the log shows
+`Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1`. The capture sizes and
+`cudagraph_mode` above still apply.
+
+Keep `--enforce-eager` for Gemma 4 LoRA adapters with fused 3D expert weights
+(see [KNOWN_ISSUES](KNOWN_ISSUES.md)).
+
 ---
 
 
@@ -1203,8 +1239,11 @@ vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 \
   --dtype float16 --mamba-ssm-cache-dtype float16 \
   --model /llm/models/Qwen3.6-35B-A3B/ \
   --served-model-name Qwen3.6-35B-A3B --tensor-parallel-size 2 \
-  --quantization fp8 --enforce-eager --trust-remote-code
+  --quantization fp8 --trust-remote-code \
+  --compilation-config '{"mode":3,"backend":"inductor","splitting_ops":[],"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8,16,32]}'
 ```
+
+See [Graph Mode](#211-graph-mode) for the capture sizes to use with MTP.
 
 For Int4, please use 
 ```export VLLM_QUANTIZE_Q40_LIB="/usr/local/lib/python3.12/dist-packages/vllm_int4_for_multi_arc.so"```, and ```--quantization sym_int4``` when starting the vllm server.
@@ -1317,10 +1356,14 @@ Key LoRA parameters:
 - `--lora-modules <name>=<path> ...`: Register regular LoRA adapters using the short `name=path` format
 - `--lora-modules '{"name":"adapter1","path":"/path/to/adapter","is_3d_lora_weight":false}'`: Register an adapter using the explicit JSON format
 - `is_3d_lora_weight=true`: Mark a model-specific 3D expert adapter
-- `--lora-target-modules`: List every module targeted by the adapter; expert adapters must include the matching expert modules
+- `--lora-target-modules`: List every module targeted by the adapter; expert adapters must include the matching expert modules. If omitted, LoRA buffers are also allocated for the MoE experts, which can exhaust GPU memory for high-rank adapters on Qwen3.6-35B-A3B
 - `--max-loras`: Maximum number of LoRA adapters to serve concurrently
 - `--max-lora-rank`: Maximum LoRA rank supported (set to the highest rank among your adapters)
 - `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True`: Enable runtime adapter load/unload
+
+Qwen3.6 LoRA serving also works in graph mode: replace `--enforce-eager` with
+the `--compilation-config` from [Graph Mode](#211-graph-mode). Keep
+`--enforce-eager` for Gemma 4 adapters with fused 3D expert weights.
 
 #### Sending requests to LoRA adapters
 
@@ -1446,6 +1489,8 @@ Use `"method": "gemma4_mtp"` when serving Gemma 4 with an assistant checkpoint:
 
 
 You can profile performance by tuning `num_speculative_tokens` from 2 to 5. Adjust this based on your workload.
+
+In graph mode, use the MTP capture sizes from [Graph Mode](#211-graph-mode).
 
 
 ### 3.7 How to Run Muse Glimmer 30B
@@ -1741,6 +1786,27 @@ settings and restart with a separate cache directory.
 
 Only Attention is compressed in this example; linear/Conv/SSM groups remain
 RAW. Keep Conv/SSM quantization disabled for this model.
+
+#### Qwen3.6-35B-A3B
+
+Qwen3.6-35B-A3B uses the same LMCache command and RAW or filesystem L2
+profile. Mount its weights instead of Qwen3.8-27B and start vLLM with:
+
+```bash
+vllm serve /llm/models/Qwen3.6-35B-A3B \
+  --served-model-name Qwen3.6-35B-A3B --host 0.0.0.0 --port 8000 \
+  --dtype float16 --quantization fp8 --tensor-parallel-size 2 \
+  --mamba-ssm-cache-dtype float16 --language-model-only \
+  --block-size 1024 --max-num-batched-tokens 1024 \
+  --max-model-len 18432 --max-num-seqs 4 --gpu-memory-utilization 0.85 \
+  --enable-prefix-caching --enforce-eager --trust-remote-code \
+  --mamba-cache-mode align \
+  --kv-transfer-config '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"tcp://127.0.0.1","lmcache.mp.port":55577,"lmcache.mp.mq_timeout":30.0,"lmcache.mp.heartbeat_interval":5.0}}'
+```
+
+To use graph mode, replace `--enforce-eager` with the `--compilation-config`
+from [Graph Mode](#211-graph-mode). Do not use the Attention8 compression
+profile with this model; it changes outputs noticeably.
 
 ### 3.11 Qwen3.8-Flash-Next and MiniCPM-V 4.7
 
