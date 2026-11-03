@@ -107,7 +107,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get install -y --no-install-recommends --fix-missing git ca-certificates
 
 # vLLM v0.31.0 + XPU downstream patch (Qwen3.8-Flash-Next, MiniCPM-V 4.7, MoE
-# decode fusion, LoRA fixes), Transformers 5.18 and compiled GDN patches.
+# decode fusion, LoRA fixes), Transformers 5.19 and compiled GDN patches.
 FROM source-base AS vllm-source
 ARG VLLM_VERSION
 COPY ./patches/v0.31.0/0001-vllm-downstream.patch \
@@ -414,7 +414,7 @@ RUN --mount=type=bind,from=wheels,target=/wheels \
     python -c 'import vllm_xpu_kernels._C, vllm_xpu_kernels._moe_C, vllm_xpu_kernels._qwen38_C; print(vllm_xpu_kernels._qwen38_C.__file__)' && \
     python -c 'import lmcache.xpu_ops, kvweave.kvweave_quant; print(lmcache.xpu_ops.__file__); print(kvweave.kvweave_quant.__file__)' && \
     python -c 'from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_mp_connector import LMCacheMPConnector; assert LMCacheMPConnector.__module__ == "lmcache.integration.vllm.lmcache_mp_connector"; print(LMCacheMPConnector)' && \
-    python -c 'import importlib.metadata as m; assert m.version("vllm") == "0.31.0+xpu.llmscaler"; assert m.version("vllm-xpu-kernels") == "0.1.15.4+llmscaler.1"; assert m.version("torch") == "2.14.0+xpu"; assert m.version("triton") == "3.8.0+xpu"; assert m.version("triton-xpu") == "3.8.0"; assert m.version("transformers") == "5.18.0"; assert m.version("oneccl") == m.version("oneccl-devel") == "2022.1.2"' && \
+    python -c 'import importlib.metadata as m; assert m.version("vllm") == "0.31.0+xpu.llmscaler"; assert m.version("vllm-xpu-kernels") == "0.1.15.4+llmscaler.1"; assert m.version("torch") == "2.14.0+xpu"; assert m.version("triton") == "3.8.0+xpu"; assert m.version("triton-xpu") == "3.8.0"; assert m.version("transformers") == "5.19.0"; assert m.version("oneccl") == m.version("oneccl-devel") == "2022.1.2"' && \
     python /opt/runtime-checks/check_runtime_dependencies.py \
         --constraints /opt/runtime-xpu.constraints.txt \
         --constraints /opt/runtime-requirements.txt && \

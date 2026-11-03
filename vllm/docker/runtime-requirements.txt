@@ -4785,9 +4785,9 @@ tqdm==4.70.1 \
     #   modelscope
     #   modelscope-hub
     #   transformers
-transformers==5.18.0 \
-    --hash=sha256:d79e5a515a572ee3deb33eb0d578be47d91e70c75d54cf21bf6eede6edef14a9 \
-    --hash=sha256:d89c206e42e841af7cd314b3d2b21c03e977d819cdb4aef65ada048769a644df
+transformers==5.19.0 \
+    --hash=sha256:87f38dd25e4521151b97e94520ac457f44a0ae8a8358a5b112daff6c64a822d6 \
+    --hash=sha256:afcd2dd5f603ed28c1e1fcb00a338ccbb4ef5f878ed289635df8b58187afb518
     # via
     #   -c /opt/xpu.constraints.txt
     #   -r runtime_requirements.in
