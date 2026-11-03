@@ -106,35 +106,34 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update -y && \
     apt-get install -y --no-install-recommends --fix-missing git ca-certificates
 
-# vLLM v0.31.0 + Qwen3.8-Flash-Next, MiniCPM-V 4.7, Transformers 5.18 and
-# compiled GDN patches.
+# vLLM v0.31.0 + XPU downstream patch (Qwen3.8-Flash-Next, MiniCPM-V 4.7, MoE
+# decode fusion, LoRA fixes), Transformers 5.18 and compiled GDN patches.
 FROM source-base AS vllm-source
 ARG VLLM_VERSION
-COPY ./patches/v0.31.0/0001-vllm-qwen38.patch ./patches/v0.31.0/0003-vllm-minicpmv47.patch \
+COPY ./patches/v0.31.0/0001-vllm-downstream.patch \
      ./patches/v0.31.0/0005-vllm-runtime-compat.patch ./patches/v0.31.0/0008-vllm-gdn-compile.patch \
      /tmp/patches/
 RUN --mount=type=secret,id=build-ca,target=/etc/ssl/certs/ca-certificates.crt \
     set -eo pipefail && \
     git clone --depth 1 -b "${VLLM_VERSION}" https://github.com/vllm-project/vllm.git /src/vllm && \
     cd /src/vllm && \
-    for patch in 0001-vllm-qwen38 0003-vllm-minicpmv47 0005-vllm-runtime-compat \
-                 0008-vllm-gdn-compile; do \
+    for patch in 0001-vllm-downstream 0005-vllm-runtime-compat 0008-vllm-gdn-compile; do \
         git apply --check "/tmp/patches/${patch}.patch" && \
         git apply "/tmp/patches/${patch}.patch" || exit 1; \
     done && \
     git diff --check
 
-# vllm-xpu-kernels (pinned commit + Qwen3.8 and MiniCPM-V 4.7 kernels).
+# vllm-xpu-kernels (pinned commit + XPU downstream kernels: Qwen3.8,
+# MiniCPM-V 4.7 and MoE decode fusion).
 FROM source-base AS xpu-kernels-source
 ARG VLLM_XPU_KERNELS_COMMIT
-COPY ./patches/v0.31.0/0002-kernels-qwen38.patch ./patches/v0.31.0/0004-kernels-minicpmv47.patch \
-     /tmp/patches/
+COPY ./patches/v0.31.0/0002-kernels-downstream.patch /tmp/patches/
 RUN --mount=type=secret,id=build-ca,target=/etc/ssl/certs/ca-certificates.crt \
     set -eo pipefail && \
     git clone https://github.com/vllm-project/vllm-xpu-kernels.git /src/vllm-xpu-kernels && \
     cd /src/vllm-xpu-kernels && \
     git checkout ${VLLM_XPU_KERNELS_COMMIT} && \
-    for patch in 0002-kernels-qwen38 0004-kernels-minicpmv47; do \
+    for patch in 0002-kernels-downstream; do \
         git apply --check "/tmp/patches/${patch}.patch" && \
         git apply "/tmp/patches/${patch}.patch" || exit 1; \
     done && \
