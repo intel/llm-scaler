@@ -3897,6 +3897,89 @@ index 06be86d388..a844064243 100644
      def apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
          merged_cls = maybe_get_oot_by_class(MergedColumnParallelLinear)
          base_forward = getattr(type(self.base_layer), "forward", None)
+diff --git a/vllm/lora/layers/fused_moe.py b/vllm/lora/layers/fused_moe.py
+index c58c18e71f..aa20290330 100644
+--- a/vllm/lora/layers/fused_moe.py
++++ b/vllm/lora/layers/fused_moe.py
+@@ -3,6 +3,7 @@
+ 
+ import torch
+ import torch.nn as nn
++import torch.nn.functional as F
+ from transformers import PreTrainedConfig
+ 
+ from vllm import envs
+@@ -110,6 +111,15 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+     def intermediate_size_per_partition(self) -> int:
+         return self.moe_config.intermediate_size_per_partition
+ 
++    @property
++    def _tp_shard_size(self) -> int:
++        """Per-rank stride of an adapter along the expert intermediate dim: the
++        base weights are sharded by the unpadded size even when a backend pads."""
++        unpadded = self.moe_config.intermediate_size_per_partition_unpadded
++        if unpadded is None:
++            return self.intermediate_size_per_partition
++        return unpadded
++
+     def _init_lora_stream_context(self) -> None:
+         self._lora_stream: torch.cuda.Stream | None = None
+         self._events: tuple[torch.cuda.Event, ...] | None = None
+@@ -223,6 +233,15 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+ 
+     def _ep_check(self):
+         if self.use_ep:
++            placement = self.base_layer.expert_placement_strategy
++            if placement != "linear":
++                raise ValueError(
++                    "Fused MoE LoRA with EP requires linear expert placement: "
++                    "adapter loading assumes a contiguous range of experts "
++                    f"on each rank, got '{placement}'. "
++                    "Set expert_placement_strategy='linear' to use MoE LoRA "
++                    "with expert parallelism."
++                )
+             moe_config = self.moe_config
+             all2all_backend = moe_config.moe_parallel_config.all2all_backend
+             assert all2all_backend == "allgather_reducescatter", (
+@@ -311,7 +330,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+             return w13_lora_b
+ 
+         # w13_lora_b shape (num_experts,output_size,rank)
+-        shard_size = self.intermediate_size_per_partition
++        shard_size = self._tp_shard_size
+         start_idx = self.tp_rank * shard_size
+         end_idx = (self.tp_rank + 1) * shard_size
+ 
+@@ -322,7 +341,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+         if self.tp_size == 1:
+             return w2_lora_a
+         # w2_lora_a shape (num_experts,rank,input_size)
+-        shard_size = self.intermediate_size_per_partition
++        shard_size = self._tp_shard_size
+         start_idx = self.tp_rank * shard_size
+         end_idx = (self.tp_rank + 1) * shard_size
+ 
+@@ -536,7 +555,7 @@ class FusedMoE3DWithLoRA(FusedMoEWithLoRA):
+             return w13_lora_b
+ 
+         # w13_lora_b shape (num_experts,output_size,rank)
+-        shard_size = self.intermediate_size_per_partition
++        shard_size = self._tp_shard_size
+         start_idx = self.tp_rank * shard_size
+         end_idx = (self.tp_rank + 1) * shard_size
+         # HACK: Currently, only GPT-OSS is in interleaved order
+@@ -557,6 +576,11 @@ class FusedMoE3DWithLoRA(FusedMoEWithLoRA):
+             w3_lora_b = w13_lora_b[:, slice_size:, :]
+             sliced_w1_lora_b = w1_lora_b[:, start_idx:end_idx, :]
+             sliced_w3_lora_b = w3_lora_b[:, start_idx:end_idx, :]
++            # w3 starts at the allocated (possibly padded) per-rank size, as
++            # in the base w13 weight.
++            pad = self.intermediate_size_per_partition - sliced_w1_lora_b.shape[1]
++            if pad > 0:
++                sliced_w1_lora_b = F.pad(sliced_w1_lora_b, (0, 0, 0, pad))
+ 
+             return torch.cat([sliced_w1_lora_b, sliced_w3_lora_b], dim=1)
+ 
 diff --git a/vllm/lora/layers/logits_processor.py b/vllm/lora/layers/logits_processor.py
 index 6259fd7817..f3e6756e18 100644
 --- a/vllm/lora/layers/logits_processor.py
@@ -4071,6 +4154,236 @@ index adc2353b3e..f97ccd5928 100644
      def _get_module_to_save_weights(
          self, lora_model: LoRAModel, module_name: str
      ) -> LoRAFullModuleWeights | None:
+diff --git a/vllm/lora/ops/triton_ops/fused_moe_lora_op.py b/vllm/lora/ops/triton_ops/fused_moe_lora_op.py
+index 703f766889..a27dd5a34c 100644
+--- a/vllm/lora/ops/triton_ops/fused_moe_lora_op.py
++++ b/vllm/lora/ops/triton_ops/fused_moe_lora_op.py
+@@ -13,7 +13,7 @@ from vllm.triton_utils.allocation import set_triton_allocator
+ from vllm.utils.mem_utils import get_max_shared_memory_bytes
+ from vllm.utils.torch_utils import async_tensor_h2d, direct_register_custom_op
+ 
+-from .utils import supports_pdl, supports_tma
++from .utils import FUSED_MOE_LORA_TWO_KERNEL_MAX_TOKENS, supports_pdl, supports_tma
+ 
+ 
+ @triton.jit
+@@ -106,14 +106,18 @@ def _get_c_ptrs(
+ 
+ _LORA_PTR_DICT: dict[tuple[int, ...], torch.tensor] = {}
+ 
++# The one-shot kernel keeps the rank-dimension intermediate in registers.
++# Larger ranks require rank tiling, so route them through the two-kernel path.
++_FUSED_MOE_LORA_ONE_SHOT_MAX_RANK = 128
++
+ 
+ # ---------------------------------------------------------------------------
+ # Fully-fused MoE-LoRA kernel (one-shot): shrink + expand combined into a single
+ # launch with the rank-dim intermediate kept in registers. Used by the fast
+-# path of `_fused_moe_lora` for `fully_sharded=False`. The legacy two-kernel
+-# path (`_fused_moe_lora_kernel` above) is retained for `fully_sharded=True`
+-# because that path needs to materialise the intermediate cache for an
+-# all_reduce / all_gather between shrink and expand.
++# path of `_fused_moe_lora` for supported ranks with `fully_sharded=False`.
++# The legacy two-kernel path (`_fused_moe_lora_kernel` above) is retained for
++# larger ranks and for `fully_sharded=True`, where the intermediate cache must
++# be materialised for an all_reduce / all_gather between shrink and expand.
+ # ---------------------------------------------------------------------------
+ 
+ 
+@@ -349,8 +353,9 @@ def _run_fused_moe_lora_one_shot(
+     # regressed across all M (+8 to +40%): the (64,32) fp32 accumulator +
+     # widened B tile pushed register count past spill threshold, lowering
+     # occupancy by more than the MMA gain saved.
+-    assert rank <= 128, (
+-        f"fused_moe_lora_one_shot supports max_lora_rank<=128; got rank={rank}"
++    assert rank <= _FUSED_MOE_LORA_ONE_SHOT_MAX_RANK, (
++        "fused_moe_lora_one_shot supports "
++        f"max_lora_rank<={_FUSED_MOE_LORA_ONE_SHOT_MAX_RANK}; got rank={rank}"
+     )
+     BLOCK_R = max(triton.next_power_of_2(rank), 16)
+ 
+@@ -958,6 +963,7 @@ def _fused_moe_lora_kernel(
+     USE_GDC: tl.constexpr,
+     launch_pdl: tl.constexpr,
+     IS_PRIMARY: tl.constexpr,
++    FP32_ADD_INPUTS: tl.constexpr,
+     USE_TMA: tl.constexpr,
+     # sort_c determines whether tokens are stored in C in the order determined
+     # by sorted_token_ids to enable later TMA loads from this tensor.
+@@ -1126,16 +1132,19 @@ def _fused_moe_lora_kernel(
+             )
+             a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
+ 
+-        # Cast operands to matching dtype for tl.dot. On ROCm, Triton's
+-        # compiler may infer different types for a and b when merging
+-        # if/else branches (TMA desc path returns fp32, tl.load returns
+-        # the pointer's element type).
+-        accumulator += tl.dot(a.to(tl.bfloat16), b.to(tl.bfloat16))
++        # Cast operands to the input dtype for tl.dot. On ROCm, Triton's
++        # compiler may infer different types for a and b when merging if/else
++        # branches (TMA desc path returns fp32, tl.load returns the pointer's
++        # element type). Casting to bfloat16 here silently changes fp16 LoRA
++        # operands and can produce incorrect results.
++        dot_dtype = a_ptr.dtype.element_ty
++        accumulator += tl.dot(a.to(dot_dtype), b.to(dot_dtype))
+ 
+     if MUL_ROUTED_WEIGHT:
+         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
+         accumulator = accumulator * moe_weight[:, None]
+-    accumulator = accumulator.to(c_ptr.dtype.element_ty)
++    if not FP32_ADD_INPUTS:
++        accumulator = accumulator.to(c_ptr.dtype.element_ty)
+     # Write back the block of the output
+     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+     c_ptrs = _get_c_ptrs(
+@@ -1156,6 +1165,8 @@ def _fused_moe_lora_kernel(
+     if SPLIT_K == 1:
+         if ADD_INPUTS:
+             prev = tl.load(c_ptrs, mask=c_mask, other=0.0)
++            if FP32_ADD_INPUTS:
++                prev = prev.to(tl.float32)
+             tl.store(c_ptrs, prev + accumulator, mask=c_mask)
+         else:
+             tl.store(c_ptrs, accumulator, mask=c_mask)
+@@ -1211,6 +1222,7 @@ def _fused_moe_lora_shrink(
+         "SPLIT_K": split_k,
+         "USE_GDC": use_gdc,
+         "launch_pdl": use_gdc,  # triton kernel metadata
++        "FP32_ADD_INPUTS": False,
+         "USE_TMA": use_tma,
+     }
+ 
+@@ -1219,6 +1231,8 @@ def _fused_moe_lora_shrink(
+     grid_lora_dim, stride_tl, stride_el = _adjust_kernel_inputs(
+         num_active_loras, sorted_token_ids, expert_ids
+     )
++    if grid_lora_dim == 0:
++        return
+     grid = lambda META: (
+         split_k
+         * triton.cdiv(EM, META["BLOCK_SIZE_M"])
+@@ -1230,7 +1244,9 @@ def _fused_moe_lora_shrink(
+     a_desc = None
+     b_desc = None
+     if use_tma and num_slices == 1:
+-        b_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
++        from triton.tools.tensor_descriptor import TensorDescriptor
++
++        b_desc = TensorDescriptor.from_tensor(
+             lora_a_stacked[0],
+             [1, 1, shrink_config["BLOCK_SIZE_N"], shrink_config["BLOCK_SIZE_K"]],
+         )
+@@ -1318,6 +1334,7 @@ def _fused_moe_lora_expand(
+     offset: int = 0,
+     use_gdc: bool = False,
+     use_tma: bool = False,
++    add_inputs: bool = True,
+ ) -> None:
+     b_ptr = _get_ptr(lora_b_stacked, device)
+     K = max_lora_rank
+@@ -1339,12 +1356,15 @@ def _fused_moe_lora_expand(
+         "SPLIT_K": 1,  # Set split_k = 1 for expand calls
+         "USE_GDC": use_gdc,
+         "launch_pdl": use_gdc,  # triton kernel metadata
++        "FP32_ADD_INPUTS": device.type == "xpu",
+         "USE_TMA": use_tma,
+     }
+ 
+     grid_lora_dim, stride_tl, stride_el = _adjust_kernel_inputs(
+         num_active_loras, sorted_token_ids, expert_ids
+     )
++    if grid_lora_dim == 0:
++        return
+ 
+     grid = lambda META: (
+         triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+@@ -1358,13 +1378,15 @@ def _fused_moe_lora_expand(
+     a_desc = None
+     b_desc = None
+     if use_tma:
++        from triton.tools.tensor_descriptor import TensorDescriptor
++
+         if sorted_token_ids is not None:
+-            a_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
++            a_desc = TensorDescriptor.from_tensor(
+                 a_intermediate_cache1,
+                 [expand_config["BLOCK_SIZE_M"], expand_config["BLOCK_SIZE_K"]],
+             )
+         if num_slices == 1:
+-            b_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
++            b_desc = TensorDescriptor.from_tensor(
+                 lora_b_stacked[0],
+                 [1, 1, expand_config["BLOCK_SIZE_N"], expand_config["BLOCK_SIZE_K"]],
+             )
+@@ -1408,7 +1430,7 @@ def _fused_moe_lora_expand(
+         token_mapping_factor=1,
+         naive_block_assignment=sorted_token_ids is None,
+         MUL_ROUTED_WEIGHT=mul_routed_weight,
+-        ADD_INPUTS=True,
++        ADD_INPUTS=add_inputs,
+         USE_B_L2_CACHE=True,
+         sort_c=False,
+         IS_PRIMARY=False,
+@@ -1478,7 +1500,11 @@ def _fused_moe_lora(
+     assert top_k_num == topk_weights.shape[1]
+ 
+     # Fast path: single fused kernel
+-    if not fully_sharded:
++    if (
++        not fully_sharded
++        and max_lora_rank <= _FUSED_MOE_LORA_ONE_SHOT_MAX_RANK
++        and topk_weights.shape[0] > FUSED_MOE_LORA_TWO_KERNEL_MAX_TOKENS
++    ):
+         M_pairs = topk_weights.numel()
+         if (
+             sorted_token_ids is None
+@@ -1524,9 +1550,8 @@ def _fused_moe_lora(
+         )
+         return
+ 
+-    assert add_inputs, (
+-        "fused_moe_lora(add_inputs=False) is only supported on the "
+-        "fully_sharded=False fast path"
++    assert add_inputs or not fully_sharded, (
++        "fused_moe_lora(add_inputs=False) is not supported with fully_sharded=True"
+     )
+ 
+     device = qcurr_hidden_states.device
+@@ -1547,7 +1572,11 @@ def _fused_moe_lora(
+ 
+     # TMA is not currently compatiple with fully_sharded due to the non-determinism
+     # of token id sorting across ranks.
+-    use_tma = supports_tma(device) and not fully_sharded
++    use_tma = (
++        supports_tma(device)
++        and not fully_sharded
++        and max_lora_rank * output.element_size() % 16 == 0
++    )
+ 
+     intermediate_cache_shape = (
+         num_slices,
+@@ -1660,6 +1689,7 @@ def _fused_moe_lora(
+         offset,
+         use_gdc=use_gdc,
+         use_tma=use_tma,
++        add_inputs=add_inputs,
+     )
+ 
+ 
+diff --git a/vllm/lora/ops/triton_ops/utils.py b/vllm/lora/ops/triton_ops/utils.py
+index fbcef91002..143d502ce5 100644
+--- a/vllm/lora/ops/triton_ops/utils.py
++++ b/vllm/lora/ops/triton_ops/utils.py
+@@ -312,6 +312,9 @@ def get_lora_op_configs(
+     return config_data
+ 
+ 
++FUSED_MOE_LORA_TWO_KERNEL_MAX_TOKENS = 64
++
++
+ @lru_cache
+ def supports_pdl(device: torch.device | None = None) -> bool:
+     """Refer to: https://github.com/triton-lang/triton/blob/v3.5.0/python/tutorials/11-programmatic-dependent-launch.py."""
 diff --git a/vllm/lora/punica_wrapper/punica_base.py b/vllm/lora/punica_wrapper/punica_base.py
 index a0e7751e6d..f909b5cb6b 100644
 --- a/vllm/lora/punica_wrapper/punica_base.py
@@ -5622,6 +5935,63 @@ index 120fbd1526..937da05ba0 100644
          "XPUExpertsFp8",
          "XPUExpertsBlockFp8",
          "XPUExpertsMxFp8",
+diff --git a/vllm/model_executor/layers/fused_moe/experts/lora_experts_mixin.py b/vllm/model_executor/layers/fused_moe/experts/lora_experts_mixin.py
+index ac75e7bc79..5d552a8894 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/lora_experts_mixin.py
++++ b/vllm/model_executor/layers/fused_moe/experts/lora_experts_mixin.py
+@@ -3,6 +3,8 @@
+ 
+ import torch
+ 
++from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+ from vllm.model_executor.layers.fused_moe.experts.lora_context import MoELoRAContext
+ 
+ 
+@@ -22,6 +24,7 @@ class LoRAExpertsMixin:
+     state is on lora_context or passed as arguments.
+     """
+ 
++    moe_config: FusedMoEConfig
+     _lora_context: MoELoRAContext | None = None
+ 
+     def set_lora_context(self, ctx: MoELoRAContext) -> None:
+@@ -70,8 +73,13 @@ class LoRAExpertsMixin:
+             # concat swap afterwards.
+             w13_lora_a_stacked = w13_lora_a_stacked[::-1]
+             w13_lora_b_stacked = w13_lora_b_stacked[::-1]
+-        return lora_context.punica_wrapper.add_lora_w13(
+-            y,
++        interleave_w13 = (
++            lora_context.w13_num_slices == 2
++            and self.moe_config.activation == MoEActivation.SWIGLUOAI
++        )
++        lora_output = torch.zeros_like(y) if interleave_w13 else y
++        result = lora_context.punica_wrapper.add_lora_w13(
++            lora_output,
+             x,
+             w13_lora_a_stacked,
+             w13_lora_b_stacked,
+@@ -89,9 +97,18 @@ class LoRAExpertsMixin:
+             lora_context.w13_num_slices,
+             lora_context.fully_sharded,
+             lora_context.use_tuned_config,
+-            add_inputs=add_inputs,
++            add_inputs=add_inputs or interleave_w13,
+             token_lora_mapping=lora_context.local_token_lora_mapping,
+         )
++        if interleave_w13:
++            # Map gate/up slices onto even/odd output channels without a copy.
++            gate_up_delta = lora_output.unflatten(-1, (2, -1))
++            gate_up_output = y.unflatten(-1, (-1, 2)).transpose(-1, -2)
++            if add_inputs:
++                gate_up_output.add_(gate_up_delta)
++            else:
++                gate_up_output.copy_(gate_up_delta)
++        return result
+ 
+     def apply_w2_lora(
+         self,
 diff --git a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
 index ddd891b1c0..f09a701a84 100644
 --- a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py

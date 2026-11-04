@@ -12,12 +12,7 @@ Workaround: Change the PCIe slot configuration in BIOS from Auto/x16 to x8/x8.
 With this change, over 40 GB/s bi-directional P2P bandwidth can be achieved.
 Root cause analysis is still in progress.
 
-# 03. Gemma 4 LoRA Adapters with Fused 3D Expert Weights Return Wrong Output in Graph Mode
-With gemma-4-26B-A4B-it and an adapter that uses fused 3D expert weights (`is_3d_lora_weight=true`), graph mode returns incorrect output for every request once more than one request is batched. Regular adapters are not affected.
+# 03. Slow First Request for Gemma 4 26B-A4B LoRA in Eager Mode
+With `--enable-lora` and `--enforce-eager`, the first request to gemma-4-26B-A4B-it can take about five minutes. If it takes longer than `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` (default 300), the engine stops and all requests fail.
 
-Workaround: Serve these adapters with `--enforce-eager`.
-
-# 04. Qwen3.6-35B-A3B Expert LoRA Not Applied in Mixed Batches
-For an adapter that also trains the routed experts, the expert part of the adapter may not be applied when its requests are batched with requests for the base model or other adapters. The output can then match the base model. Adapters that do not train the experts are not affected.
-
-Root cause analysis is in progress.
+Workaround: Serve the model in graph mode (see [Graph Mode](README.md#211-graph-mode)), where this delay moves to server startup, or set `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800`.

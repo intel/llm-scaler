@@ -1084,9 +1084,6 @@ breakable graphs with native fused MoE decode on XPU; the log shows
 `Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1`. The capture sizes and
 `cudagraph_mode` above still apply.
 
-Keep `--enforce-eager` for Gemma 4 LoRA adapters with fused 3D expert weights
-(see [KNOWN_ISSUES](KNOWN_ISSUES.md)).
-
 ---
 
 
@@ -1361,9 +1358,9 @@ Key LoRA parameters:
 - `--max-lora-rank`: Maximum LoRA rank supported (set to the highest rank among your adapters)
 - `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True`: Enable runtime adapter load/unload
 
-Qwen3.6 LoRA serving also works in graph mode: replace `--enforce-eager` with
-the `--compilation-config` from [Graph Mode](#211-graph-mode). Keep
-`--enforce-eager` for Gemma 4 adapters with fused 3D expert weights.
+Qwen3.6 and Gemma 4 26B-A4B LoRA serving, including 3D expert adapters, also
+works in graph mode: replace `--enforce-eager` with the `--compilation-config`
+from [Graph Mode](#211-graph-mode).
 
 #### Sending requests to LoRA adapters
 
