@@ -496,6 +496,13 @@ if rotary.kitchen_rope_fast_supported(x, freqs_cis):
 Callers should use the capability query before selecting a specialized native
 route and preserve the established PyTorch fallback.
 
+On physical B70, the paired RMS/RoPE API also specializes contiguous BF16
+`[1, L, 32, 128]` Q/K with FP32 frequencies, full interleaved rotation and
+out-of-place output. It reuses each row's loaded values while preserving the
+generic reduction tree and BF16 normalized intermediate. In-place, split-half,
+other dtype/layout/device contracts and explicit SKU overrides retain the
+existing routes.
+
 ### Comfy Kitchen INT8 activation
 
 `kitchen.rms_norm_quantize_int8` returns INT8 rows and FP32 row scales in one

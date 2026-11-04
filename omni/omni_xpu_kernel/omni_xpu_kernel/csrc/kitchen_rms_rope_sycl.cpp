@@ -459,6 +459,115 @@ bool use_b580_h3_rms_rope(const torch::Tensor& q) {
     return selection.physical_sku == device::BmgSku::b580 &&
         !selection.forced;
 }
+
+bool use_qwen_d128_rms_rope(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& freqs,
+    int64_t rot_dim,
+    bool split_half,
+    bool inplace) {
+    if (split_half || inplace || rot_dim != 128 ||
+        q.scalar_type() != torch::kBFloat16 ||
+        freqs.scalar_type() != torch::kFloat32 ||
+        q.sizes() != k.sizes() || q.size(0) != 1 ||
+        q.size(2) != 32 || q.size(3) != 128 ||
+        !q.is_contiguous() || !k.is_contiguous()) {
+        return false;
+    }
+    const auto selection = device::get_bmg_selection(
+        utils::get_queue(q.device()));
+    return selection.physical_sku == device::BmgSku::b70 &&
+        !selection.forced;
+}
+
+void launch_qwen_d128_rms_rope(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& freqs,
+    const torch::Tensor& q_scale,
+    const torch::Tensor& k_scale,
+    torch::Tensor& q_out,
+    torch::Tensor& k_out,
+    float epsilon) {
+    constexpr int64_t heads = 32;
+    constexpr int64_t dim = 128;
+    constexpr int subgroup_size = 32;
+    constexpr int rows_per_workgroup = 4;
+    constexpr int workgroup_size = subgroup_size * rows_per_workgroup;
+    const int64_t rows = q.size(1) * heads;
+    if (rows == 0) return;
+    const auto fm = freq_meta(freqs);
+    const auto* qp = reinterpret_cast<const bf16*>(q.data_ptr());
+    const auto* kp = reinterpret_cast<const bf16*>(k.data_ptr());
+    auto* qop = reinterpret_cast<bf16*>(q_out.data_ptr());
+    auto* kop = reinterpret_cast<bf16*>(k_out.data_ptr());
+    const auto* qsp = q_scale.data_ptr<float>();
+    const auto* ksp = k_scale.data_ptr<float>();
+    const auto* fp = freqs.data_ptr<float>();
+    const size_t global_size = static_cast<size_t>(
+        (2 * rows + rows_per_workgroup - 1) / rows_per_workgroup * workgroup_size);
+    utils::submit_kernel([&](sycl::handler& handler) {
+        handler.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(global_size),
+                              sycl::range<1>(workgroup_size)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(subgroup_size)]] {
+                const int64_t global_row = item.get_global_id(0) / subgroup_size;
+                if (global_row >= 2 * rows) return;
+                const auto sg = item.get_sub_group();
+                const int lane = sg.get_local_linear_id();
+                const bool key = global_row >= rows;
+                const int64_t row = key ? global_row - rows : global_row;
+                const auto* x = (key ? kp : qp) + row * dim;
+                auto* y = (key ? kop : qop) + row * dim;
+                const auto* scale = key ? ksp : qsp;
+                const float a = static_cast<float>(x[2 * lane]);
+                const float b = static_cast<float>(x[2 * lane + 1]);
+                const float c = static_cast<float>(x[2 * lane + 64]);
+                const float d = static_cast<float>(x[2 * lane + 65]);
+
+                // Match the generic WG64 tree, whose lanes initially sum
+                // x[lane]^2 + x[lane+64]^2. Keep its even/odd branches separate
+                // until the final addition, and reuse the original row values.
+                float even = 0.0f;
+                even += a * a;
+                even += c * c;
+                float odd = 0.0f;
+                odd += b * b;
+                odd += d * d;
+                for (int mask = 16; mask; mask /= 2) {
+                    even += sycl::permute_group_by_xor(sg, even, mask);
+                    odd += sycl::permute_group_by_xor(sg, odd, mask);
+                }
+                const float total = sycl::group_broadcast(sg, even, 0) +
+                    sycl::group_broadcast(sg, odd, 0);
+                const float inverse_rms = sycl::rsqrt(total / dim + epsilon);
+                const float values[4] = {a, b, c, d};
+                for (int part = 0; part < 2; ++part) {
+                    const int pair = lane + 32 * part;
+                    const int col = 2 * pair;
+                    // The BF16 normalized intermediate is model-observable.
+                    const bf16 normalized0 = static_cast<bf16>(
+                        values[2 * part] * inverse_rms * scale[col]);
+                    const bf16 normalized1 = static_cast<bf16>(
+                        values[2 * part + 1] * inverse_rms * scale[col + 1]);
+                    const float v0 = static_cast<float>(normalized0);
+                    const float v1 = static_cast<float>(normalized1);
+                    const int64_t token = row / heads;
+                    const int64_t head = row % heads;
+                    const int64_t fi = (fm.n1 == 1 ? 0 : token) * fm.stride1 +
+                        (fm.n2 == 1 ? 0 : head) * fm.stride2 +
+                        (fm.pairs == 1 ? 0 : pair) * fm.stride3;
+                    const float f00 = fp[fi];
+                    const float f01 = fp[fi + fm.stride5];
+                    const float f10 = fp[fi + fm.stride4];
+                    const float f11 = fp[fi + fm.stride4 + fm.stride5];
+                    y[col] = static_cast<bf16>(f00 * v0 + f01 * v1);
+                    y[col + 1] = static_cast<bf16>(f10 * v0 + f11 * v1);
+                }
+            });
+    }, q.device(), "kitchen_rms_rope_qwen_d128_b70");
+}
 #endif
 
 template <typename InputT, typename FreqT, bool SplitHalf, bool Pair>
@@ -725,6 +834,14 @@ std::tuple<torch::Tensor, torch::Tensor> rms_kitchen_rope(
 #endif
     q_scale = q_scale.to(torch::kFloat32).contiguous();
     k_scale = k_scale.to(torch::kFloat32).contiguous();
+#if defined(OMNI_XPU_ARCH_BMG)
+    if (use_qwen_d128_rms_rope(q, k, freqs_cis, rot_dim, split_half, inplace)) {
+        launch_qwen_d128_rms_rope(
+            q, k, freqs_cis, q_scale, k_scale, q_out, k_out,
+            static_cast<float>(epsilon));
+        return {q_out, k_out};
+    }
+#endif
     if (split_half) {
         dispatch_input<true, true>(
             q, k, freqs_cis, q_scale, k_scale, q_out, k_out,
