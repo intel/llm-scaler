@@ -139,7 +139,7 @@ def test_preparation_is_shared_only_within_one_call(runtime):
 
 
 @pytest.mark.parametrize("case", ["cpu", "dtype", "strided", "grad", "training",
-                                  "compiling", "other_device", "missing_native"])
+                                  "compiling", "missing_native"])
 def test_unsupported_input_retains_original_projections(runtime, case):
     r = runtime
     if case == "cpu":
@@ -154,12 +154,58 @@ def test_unsupported_input_retains_original_projections(runtime, case):
         r.mm.in_training = True
     elif case == "compiling":
         r.torch.compiler.is_compiling = lambda: True
-    elif case == "other_device":
-        r.torch.xpu.get_device_properties = lambda device: SimpleNamespace(device_id=0xE210)
     else:
         r.int8._get_native = lambda: None
     assert r.adapter.project_qkv(r.module, r.x) == ("q:original", "k:original", "v:original")
     assert [layer.calls for layer in r.layers] == [[r.x]] * 3
+    assert not r.events
+
+
+def test_shared_preparation_does_not_query_a_physical_device_id(runtime):
+    r = runtime
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("shared QKV must select APIs, not a physical SKU")
+
+    r.torch.xpu.get_device_properties = forbidden
+    assert r.adapter.project_qkv(r.module, r.x) == ("q:shared", "k:shared", "v:shared")
+
+
+@pytest.mark.parametrize("shape,widths", [
+    ((1, 17, 256), (128, 256, 512)),
+    ((2, 5, 1024), (1024, 512, 256)),
+    ((1, 9, 6144), (6144, 4096, 2048)),
+])
+def test_dimensions_come_from_the_input_and_each_projection(runtime, shape, widths):
+    r = runtime
+    r.x.shape = shape
+    for layer, width in zip(r.layers, widths):
+        layer.weight.shape = (width, shape[-1])
+    assert r.adapter.project_qkv(r.module, r.x) == ("q:shared", "k:shared", "v:shared")
+    assert r.events.count("rotate") == r.events.count("quantize") == 1
+
+
+@pytest.mark.parametrize("case", ["nondivisible", "empty_width", "weight_rank", "weight_k"])
+def test_incompatible_dimensions_fall_back_before_preparation(runtime, case):
+    r = runtime
+    if case == "nondivisible":
+        r.x.shape = (1, 17, 300)
+    elif case == "empty_width":
+        r.x.shape = (1, 17, 0)
+    elif case == "weight_rank":
+        r.layers[1].weight.shape = (4096,)
+    else:
+        r.layers[1].weight.shape = (4096, 1024)
+    assert r.adapter.project_qkv(r.module, r.x) == ("q:original", "k:original", "v:original")
+    assert not r.events
+
+
+@pytest.mark.parametrize("name", ["rotate_convrot", "quantize_int8_rowwise_fused",
+                                  "int8_linear_prequantized"])
+def test_each_required_native_api_is_checked(runtime, name):
+    r = runtime
+    delattr(r.int8._get_native(), name)
+    assert r.adapter.project_qkv(r.module, r.x) == ("q:original", "k:original", "v:original")
     assert not r.events
 
 

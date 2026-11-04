@@ -1,18 +1,23 @@
-"""B70 Qwen row reuse preserves the existing native RMS/RoPE contract."""
+"""Capability-selected Qwen row reuse preserves the native RMS/RoPE contract."""
 import pytest
 import torch
 
-import omni_xpu_kernel
 from omni_xpu_kernel import rotary
 
 
 @pytest.fixture(autouse=True)
-def b70(monkeypatch):
+def xpu_runtime(monkeypatch):
     if not torch.xpu.is_available():
         pytest.skip("XPU unavailable")
-    if omni_xpu_kernel.__xpu_target__ != "bmg" or torch.xpu.get_device_properties(0).device_id != 0xE223:
-        pytest.skip("Qwen row-cache regression requires physical B70")
     monkeypatch.delenv("OMNI_XPU_FORCE_SKU", raising=False)
+
+
+@pytest.fixture
+def row_reuse_device():
+    properties = torch.xpu.get_device_properties()
+    if (32 not in properties.sub_group_sizes or properties.max_work_group_size < 128
+            or properties.max_num_sub_groups < 4):
+        pytest.skip("Qwen row reuse requires four 32-wide subgroups")
 
 
 def inputs(sequence=17, freq_layout="normal", dtype=torch.bfloat16, heads=32):
@@ -110,7 +115,7 @@ def test_qwen_forced_policy_uses_original_kernel(monkeypatch, sku):
 
 
 @torch.inference_mode()
-def test_qwen_default_kernel_compile_and_nondefault_stream(monkeypatch):
+def test_qwen_default_kernel_compile_and_nondefault_stream(monkeypatch, row_reuse_device):
     tensors = inputs()
     expected = generic(monkeypatch, tensors)
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.XPU]) as profile:

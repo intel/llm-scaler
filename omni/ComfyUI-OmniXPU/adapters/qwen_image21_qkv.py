@@ -1,6 +1,6 @@
 """Share Qwen 2.1 INT8 activation preparation within one attention call.
 
-Share ConvRot and rowwise quantization on the admitted B70 inference route.
+Share ConvRot and rowwise quantization when the native APIs are available.
 Keep ComfyUI's per-projection dynamic-weight context and never cache activations
 between calls. Enable explicitly with OMNIXPU_QWEN_IMAGE21_QKV=1.
 """
@@ -34,12 +34,10 @@ def project_qkv(module, x):
 
     if (not isinstance(x, torch.Tensor) or x.device.type != "xpu"
             or x.dtype != torch.bfloat16 or x.ndim != 3
-            or x.shape[0] != 1 or x.shape[-1] != 4096 or not x.is_contiguous()
+            or x.shape[-1] <= 0 or x.shape[-1] % 256 != 0 or not x.is_contiguous()
             or x.requires_grad or torch.is_grad_enabled() or mm.in_training
             or torch.compiler.is_compiling()):
         return fallback("input")
-    if torch.xpu.get_device_properties(x.device).device_id != 0xE223:
-        return fallback("device")
     native = int8._get_native()
     if native is None or not all(hasattr(native, name) for name in (
             "rotate_convrot", "quantize_int8_rowwise_fused",
@@ -53,7 +51,7 @@ def project_qkv(module, x):
         if (getattr(layer, "quant_format", None) != "int8_tensorwise"
                 or getattr(layer, "layout_type", None) != "TensorWiseINT8Layout"
                 or getattr(weight, "_layout_cls", None) != "TensorWiseINT8Layout"
-                or tuple(weight.shape) != (4096, 4096)
+                or len(weight.shape) != 2 or weight.shape[1] != x.shape[-1]
                 or getattr(layer, "bias", None) is not None
                 or getattr(layer, "_full_precision_mm", False)
                 or getattr(layer, "comfy_force_cast_weights", False)

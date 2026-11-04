@@ -1,6 +1,8 @@
 #include <torch/extension.h>
+#include <ATen/xpu/XPUContext.h>
 #include <sycl/sycl.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <type_traits>
 
@@ -459,6 +461,7 @@ bool use_b580_h3_rms_rope(const torch::Tensor& q) {
     return selection.physical_sku == device::BmgSku::b580 &&
         !selection.forced;
 }
+#endif
 
 bool use_qwen_d128_rms_rope(
     const torch::Tensor& q,
@@ -475,10 +478,20 @@ bool use_qwen_d128_rms_rope(
         !q.is_contiguous() || !k.is_contiguous()) {
         return false;
     }
-    const auto selection = device::get_bmg_selection(
-        utils::get_queue(q.device()));
-    return selection.physical_sku == device::BmgSku::b70 &&
-        !selection.forced;
+    // Explicit profile overrides remain a way to exercise the generic route.
+    if (device::get_bmg_selection(utils::get_queue(q.device())).forced) {
+        return false;
+    }
+    // Reuse Torch's per-device property cache. This kernel needs four
+    // 32-wide subgroups, not a particular PCI Device ID or build target.
+    const auto* properties = at::xpu::getDeviceProperties(q.device().index());
+    const auto& sizes = properties->sub_group_sizes;
+    if (properties->max_work_group_size < 128 ||
+        properties->max_num_sub_groups < 4 ||
+        std::find(sizes.begin(), sizes.end(), 32) == sizes.end()) {
+        return false;
+    }
+    return true;
 }
 
 void launch_qwen_d128_rms_rope(
@@ -566,9 +579,8 @@ void launch_qwen_d128_rms_rope(
                     y[col + 1] = static_cast<bf16>(f10 * v0 + f11 * v1);
                 }
             });
-    }, q.device(), "kitchen_rms_rope_qwen_d128_b70");
+    }, q.device(), "kitchen_rms_rope_qwen_d128");
 }
-#endif
 
 template <typename InputT, typename FreqT, bool SplitHalf, bool Pair>
 void launch_rms_rope(
@@ -834,14 +846,12 @@ std::tuple<torch::Tensor, torch::Tensor> rms_kitchen_rope(
 #endif
     q_scale = q_scale.to(torch::kFloat32).contiguous();
     k_scale = k_scale.to(torch::kFloat32).contiguous();
-#if defined(OMNI_XPU_ARCH_BMG)
     if (use_qwen_d128_rms_rope(q, k, freqs_cis, rot_dim, split_half, inplace)) {
         launch_qwen_d128_rms_rope(
             q, k, freqs_cis, q_scale, k_scale, q_out, k_out,
             static_cast<float>(epsilon));
         return {q_out, k_out};
     }
-#endif
     if (split_half) {
         dispatch_input<true, true>(
             q, k, freqs_cis, q_scale, k_scale, q_out, k_out,

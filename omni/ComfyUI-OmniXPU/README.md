@@ -269,12 +269,14 @@ Set `OMNIXPU_QWEN_IMAGE21_QKV=1` before startup to share ConvRot and rowwise
 INT8 quantization across Q, K and V within one attention call. This adapter is
 disabled by default and is also disabled by `OMNIXPU_ENABLE=0`.
 
-The admitted route uses physical B70, contiguous BF16 `[1, N, 4096]` input,
-and three bias-free `4096 × 4096` tensorwise INT8 projections with 256-channel
-ConvRot. Each projection retains its own ComfyUI cast/offload context; prepared
+The route requires native ConvRot, rowwise INT8 quantization and prequantized
+GEMM APIs, contiguous BF16 `[B, N, K]` input, and three bias-free tensorwise
+INT8 projections whose input dimensions match `K`, with 256-channel ConvRot.
+`K` must be positive and divisible by 256; projection output widths can differ.
+Each projection retains its own ComfyUI cast/offload context; prepared
 activations are released after that call. Training, compilation, per-instance
 forward overrides, hooks, weight patches, unsupported input/weight contracts,
-and other devices retain the original projection calls. An incompatible attention source is
+and unavailable native APIs retain the original projection calls. An incompatible attention source is
 reported through the existing component status instead of being patched.
 
 ## Native compiled inference
