@@ -20,6 +20,7 @@ No workflow or model-pipeline replacement is required.
 | ComfyUI adapter | Attention routing, LayerNorm/RMSNorm class integration, the remaining FP8 model/factory bridge, and fused Lumina/Z-Image INT8 FFN wiring |
 | Memory adapter | Cached whole-LoRA model budgets, optional DynamicVRAM per-layer XPU staging measurements, and DynamicVRAM host RAM weight staging on discrete XPU |
 | Qwen Image 2.1 cache | XPU slot selection, patch-safe prefix reuse, and pinned host cache data |
+| Qwen Image 2.1 QKV | Opt-in sharing of ConvRot and INT8 activation quantization across the three attention projections |
 | SeedVR2 capacity | Byte-bounded window-attention materialization; ComfyUI owns MLP chunking and the causal-prefix VAE padding |
 | SeedVR2 native adapters | Validated BMG FP16 GroupNorm routing |
 | Large-video preprocessing | Source-guarded, bounded CPU materialization for PIL Lanczos resize, SeedVR input padding, and XPU VAE input staging |
@@ -261,6 +262,20 @@ Normal caching resumes with empty slots after that path, including exceptions.
 Non-XPU calls retain upstream behavior. Missing or incompatible Qwen Image 2.1
 interfaces leave the adapter unapplied and are reported in OmniXPU Status.
 This adapter does not add the model, its weights, or a ComfyUI version upgrade.
+
+## Qwen Image 2.1 shared INT8 preparation
+
+Set `OMNIXPU_QWEN_IMAGE21_QKV=1` before startup to share ConvRot and rowwise
+INT8 quantization across Q, K and V within one attention call. This adapter is
+disabled by default and is also disabled by `OMNIXPU_ENABLE=0`.
+
+The admitted route uses physical B70, contiguous BF16 `[1, N, 4096]` input,
+and three bias-free `4096 × 4096` tensorwise INT8 projections with 256-channel
+ConvRot. Each projection retains its own ComfyUI cast/offload context; prepared
+activations are released after that call. Training, compilation, per-instance
+forward overrides, hooks, weight patches, unsupported input/weight contracts,
+and other devices retain the original projection calls. An incompatible attention source is
+reported through the existing component status instead of being patched.
 
 ## Native compiled inference
 

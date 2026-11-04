@@ -24,6 +24,8 @@ def _load_module(name: str, path: Path, *, package_path: Path | None = None):
 
 
 def _load_registry(monkeypatch):
+    # Ownership checks do not execute tensor/debug operations or need Torch.
+    monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
     package_name = "omnixpu_bootstrap_test"
     package = types.ModuleType(package_name)
     package.__path__ = [str(_PLUGIN)]
@@ -104,6 +106,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
         "OMNIXPU_XPU_RAM_STAGING",
         "OMNIXPU_LORA_MEMORY",
         "OMNIXPU_QWEN_IMAGE21_CACHE",
+        "OMNIXPU_QWEN_IMAGE21_QKV",
         "OMNIXPU_SEEDVR_ADA_RESHAPE",
         "OMNIXPU_SEEDVR_CAPACITY",
         "OMNIXPU_LARGE_VIDEO_PREPROCESS",
@@ -123,6 +126,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     assert config.xpu_ram_staging
     assert config.lora_memory
     assert config.qwen_image21_cache
+    assert not config.qwen_image21_qkv
     assert config.writable_weights
     assert config.seedvr_ada_reshape
     assert config.seedvr_capacity
@@ -150,6 +154,7 @@ def test_disabled_components_are_reported_without_importing_modules(monkeypatch)
         xpu_ram_staging=False,
         lora_memory=False,
         qwen_image21_cache=False,
+        qwen_image21_qkv=False,
         writable_weights=False,
         quantized_matmul=False,
         seedvr_ada_reshape=False,

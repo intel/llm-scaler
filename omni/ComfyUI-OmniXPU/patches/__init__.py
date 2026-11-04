@@ -114,6 +114,13 @@ COMPONENTS = (
         "adapters/writable_weights.py",
     ),
     Component(
+        "qwen_image21_qkv_adapter",
+        "qwen_image21_qkv",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/qwen_image21_qkv.py",
+    ),
+    Component(
         "qwen_image21_cache_adapter",
         "qwen_image21_cache",
         "adapter",
