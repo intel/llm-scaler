@@ -11,3 +11,8 @@ When using a single GPU card over a x16 PCIe connection without a PCIe switch, t
 Workaround: Change the PCIe slot configuration in BIOS from Auto/x16 to x8/x8.
 With this change, over 40 GB/s bi-directional P2P bandwidth can be achieved.
 Root cause analysis is still in progress.
+
+# 03. Slow First Request for Gemma 4 26B-A4B LoRA in Eager Mode
+With `--enable-lora` and `--enforce-eager`, the first request to gemma-4-26B-A4B-it can take about five minutes. If it takes longer than `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` (default 300), the engine stops and all requests fail.
+
+Workaround: Serve the model in graph mode (see [Graph Mode](README.md#211-graph-mode)), where this delay moves to server startup, or set `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800`.

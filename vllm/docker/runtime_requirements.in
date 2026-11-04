@@ -23,7 +23,7 @@ triton-xpu
 -r vllm-requirements/xpu.txt
 
 # Serving extras.
-transformers==5.18.0
+transformers==5.19.0
 accelerate
 hf_transfer
 modelscope!=1.15.0
