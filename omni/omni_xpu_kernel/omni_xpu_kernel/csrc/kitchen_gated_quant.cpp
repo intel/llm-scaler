@@ -80,8 +80,12 @@ void launch(const torch::Tensor& input, torch::Tensor& output,
                     item.get_group(), maximum, sycl::maximum<float>());
                 const float scale = sycl::fmax(row_max / 127.0f, 1e-30f);
                 if (lane == 0) scale_out[row] = scale;
+                // One reciprocal per work-item replaces width/kThreads exact
+                // divides. The quantizer contract allows one code of rounding
+                // error against the independent dense FP64 reference.
+                const float inverse_scale = 1.0f / scale;
                 for (int64_t col = lane; col < width; col += kThreads) {
-                    const float value = sycl::ext::intel::math::fdiv_rn(values[col], scale);
+                    const float value = values[col] * inverse_scale;
                     codes[row * width + col] = static_cast<int8_t>(
                         sycl::clamp(sycl::rint(value), -128.0f, 127.0f));
                 }
