@@ -32,7 +32,9 @@ override Kitchen's constraints and fallback policy.
 
 ComfyUI's quantized-format eligibility recognizes `int8_tensorwise` when the
 active Kitchen XPU backend provides its native INT8 and ConvRot operations.
-Model requests for full-precision matrix multiplication still apply. Other
+It also recognizes `asym_w4a8_int8` when Kitchen selects its XPU W4A8 backend
+and the companion exports packed W4A8 decode. Model requests for full-precision
+matrix multiplication still apply. Other
 quantized formats retain ComfyUI's own eligibility decisions.
 
 ## Install

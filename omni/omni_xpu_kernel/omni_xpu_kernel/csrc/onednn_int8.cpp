@@ -34,6 +34,9 @@
 namespace omni_xpu {
 namespace int8_ops {
 
+torch::Tensor mm_w4a8(torch::Tensor input, torch::Tensor packed,
+    torch::Tensor relative_scale, std::optional<torch::Tensor> codebook, int64_t group_size);
+
 torch::Tensor dequantize_int8_fused(
     torch::Tensor input,
     torch::Tensor scale,
@@ -1200,6 +1203,47 @@ torch::Tensor dequantize_int8_simple_dtype(
     }
     return dequantize_int8_fused(q, scale, out_dtype);
 }
+
+torch::Tensor w4a8_linear_prequantized(
+    torch::Tensor input, torch::Tensor x_scale, torch::Tensor packed,
+    torch::Tensor relative_scale, torch::Tensor channel_scale,
+    std::optional<torch::Tensor> codebook, std::optional<torch::Tensor> bias,
+    int64_t group_size, int64_t out_dtype_code) {
+    TORCH_CHECK(input.dim() >= 1 && input.size(-1) > 0,
+                "W4A8 activation must have shape [..., K] with positive K");
+    TORCH_CHECK(input.is_contiguous(), "W4A8 activation must be contiguous");
+    TORCH_CHECK(x_scale.device() == input.device() && channel_scale.device() == input.device(),
+                "W4A8 activation/channel scales must share the activation device");
+    TORCH_CHECK(out_dtype_code >= 0 && out_dtype_code <= 2,
+                "W4A8 output dtype must be FP32, FP16 or BF16");
+    const int64_t width = input.size(-1);
+    const int64_t rows = input.numel() / width;
+    TORCH_CHECK(packed.dim() == 2, "W4A8 packed weight must be 2D");
+    TORCH_CHECK(x_scale.numel() == rows,
+                "W4A8 activation scale must contain one value per flattened row");
+    TORCH_CHECK(channel_scale.numel() == 1 || channel_scale.numel() == packed.size(0),
+                "W4A8 channel scale must be scalar or contain N values");
+    if (bias.has_value()) {
+        TORCH_CHECK(bias->device() == input.device() && bias->numel() == packed.size(0),
+                    "W4A8 bias must contain N values on the activation device");
+    }
+    auto result = mm_w4a8(input.reshape({input.numel() / width, width}), packed,
+                         relative_scale, codebook, group_size);
+    auto sizes = input.sizes().vec();
+    sizes.back() = packed.size(0);
+    if (result.numel() == 0) {
+        const auto dtype = out_dtype_code == 0 ? at::kFloat :
+                           out_dtype_code == 1 ? at::kHalf : at::kBFloat16;
+        return torch::empty(sizes, input.options().dtype(dtype));
+    }
+    // Existing INT8 linear applies scales and bias in FP32 before the final
+    // output cast. Keep FP32 bias precision even when its dtype differs from
+    // the output, and reuse the established scale-back/stream implementation.
+    const auto dtype = out_dtype_code == 0 ? at::kFloat :
+                       out_dtype_code == 1 ? at::kHalf : at::kBFloat16;
+    return fused_scaleback(result, x_scale, channel_scale, bias, 0).to(dtype).reshape(sizes);
+}
+
 
 }  // namespace int8_ops
 }  // namespace omni_xpu

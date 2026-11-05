@@ -48,7 +48,7 @@ from .. import _compile_meta as _meta
 from .._compile_ops import (
     compile_op, fake_rowwise, fake_silu_mul, fake_silu_mul_rowwise,
     fake_swiglu_rowwise, fake_gelu_rowwise, fake_int8_linear,
-    fake_prequantized, fake_shared_input, fake_rotate_convrot,
+    fake_prequantized, fake_w4a8_prequantized, fake_shared_input, fake_rotate_convrot,
 )
 
 from ._reference import (
@@ -1391,6 +1391,49 @@ def int8_linear_prequantized(
     )
 
 
+def supports_w4a8_linear_prequantized() -> bool:
+    """Whether the loaded core can consume grouped packed W4 weights directly."""
+    native = _get_native()
+    return native is not None and hasattr(native, "w4a8_linear_prequantized")
+
+
+@compile_op("w4a8_linear_prequantized", fake_w4a8_prequantized)
+def w4a8_linear_prequantized(
+    x_int8: torch.Tensor,
+    x_scale: torch.Tensor,
+    packed: torch.Tensor,
+    relative_scale: torch.Tensor,
+    channel_scale: torch.Tensor,
+    codebook: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    group_size: int = 16,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Compute a grouped W4A8 linear without materializing the decoded weight.
+
+    Each nibble is decoded, multiplied by its group scale, rounded ties-to-even
+    and clamped to [-127, 127] before the integer dot product. The existing INT8
+    scale-back path supplies output scaling, dtype conversion and bias.
+    """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.w4a8_linear_prequantized(
+            x_int8, x_scale, packed, relative_scale, channel_scale,
+            codebook, bias, group_size, out_dtype,
+        )
+    dtype_code = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}.get(out_dtype)
+    if dtype_code is None:
+        raise ValueError(f"Unsupported W4A8 output dtype: {out_dtype}")
+    native = _get_native()
+    if native is None or not hasattr(native, "w4a8_linear_prequantized"):
+        raise RuntimeError("native packed W4A8 linear is unavailable")
+    _clear_krea2_activation_cache()
+    _clear_bmg_qkv_activation_cache()
+    return native.w4a8_linear_prequantized(
+        x_int8, x_scale, packed, relative_scale, channel_scale,
+        codebook, bias, group_size, dtype_code,
+    )
+
+
 @compile_op("int8_linear_shared_input", fake_shared_input)
 def int8_linear_shared_input(
     x: torch.Tensor,
@@ -1614,6 +1657,8 @@ __all__ = [
     "mm_int8",
     "int8_linear",
     "int8_linear_prequantized",
+    "w4a8_linear_prequantized",
+    "supports_w4a8_linear_prequantized",
     "int8_linear_shared_input",
     "rotate_convrot",
     "prepare_convrot_hadamard",

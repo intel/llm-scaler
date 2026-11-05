@@ -84,6 +84,12 @@ def fake_prequantized(x_int8, x_scale, weight, weight_scale, bias=None,
     return x_int8.new_empty((*x_int8.shape[:-1], weight.shape[0]), dtype=out_dtype)
 
 
+def fake_w4a8_prequantized(x_int8, x_scale, packed, relative_scale, channel_scale,
+                          codebook=None, bias=None, group_size=16,
+                          out_dtype=torch.bfloat16):
+    return x_int8.new_empty((*x_int8.shape[:-1], packed.shape[0]), dtype=out_dtype)
+
+
 def fake_shared_input(x, weight1, weight_scale1, weight2, weight_scale2,
                       bias1=None, bias2=None, out_dtype=None, convrot=False,
                       convrot_groupsize=256):
