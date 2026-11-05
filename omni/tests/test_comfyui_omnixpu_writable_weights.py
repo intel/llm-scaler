@@ -9,7 +9,6 @@ import threading
 from types import SimpleNamespace
 
 import pytest
-import torch
 
 PLUGIN = Path(__file__).parents[1] / "ComfyUI-OmniXPU"
 
@@ -33,6 +32,9 @@ def installed():
         state = bootstrap.bootstrap(dynamic_vram_override=True)
     assert state["providers"]["comfy_aimdo.xpu"]["status"] == "active", state
     assert state["providers"]["comfy_kitchen.xpu"]["status"] == "active", state
+    # Linux allocator takeover must finish before importing Torch, as in the
+    # real ComfyUI prestartup flow.
+    import torch
     from comfy_aimdo import control
     assert control.init_devices([0])
     with pytest.MonkeyPatch.context() as patch:
@@ -41,7 +43,7 @@ def installed():
         import comfy.memory_management as memory
         import comfy.model_management as management
         yield SimpleNamespace(ops=ops, memory=memory, management=management,
-                              device=management.get_torch_device())
+                              device=management.get_torch_device(), torch=torch)
     gc.collect()
     torch.xpu.synchronize()
     torch.xpu.empty_cache()
@@ -74,6 +76,7 @@ def test_installs_atomically_and_is_idempotent(runtime):
 
 
 def test_file_write_read_explicit_xpu_stream_and_bounds(runtime):
+    torch = runtime.torch
     assert runtime.adapter.apply()[0]
     size, offset = 1048579, 13
     target = torch.empty(size, dtype=torch.uint8)
@@ -100,6 +103,7 @@ def test_file_write_read_explicit_xpu_stream_and_bounds(runtime):
 
 @pytest.mark.parametrize("pinned", [True, False])
 def test_writable_weight_pinned_or_file_writeback(runtime, monkeypatch, pinned):
+    torch = runtime.torch
     assert runtime.adapter.apply()[0]
     layer = runtime.ops.WritableWeight((257,), torch.float32, device="cpu")
     layer._pin_state = {"fast_disk": False}
