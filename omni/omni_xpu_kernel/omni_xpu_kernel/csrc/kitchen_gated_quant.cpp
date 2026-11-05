@@ -56,9 +56,12 @@ void launch(const torch::Tensor& input, torch::Tensor& output,
 
                 // Each work-item owns all four outputs of its butterfly, so
                 // the in-place stage has disjoint reads/writes until its fence.
-                for (int stride = 1; stride < group_size; stride *= 4) {
+                for (int shift = 0; (1 << shift) < group_size; shift += 2) {
+                    const int stride = 1 << shift;
                     for (int64_t pair = lane; pair < width / 4; pair += kThreads) {
-                        const int64_t pos = (pair / stride) * 4 * stride + pair % stride;
+                        // pair is nonnegative and stride is a power of four.
+                        const int64_t pos = ((pair >> shift) << (shift + 2)) +
+                                            (pair & (stride - 1));
                         const float a = values[pos];
                         const float b = values[pos + stride];
                         const float c = values[pos + 2 * stride];
