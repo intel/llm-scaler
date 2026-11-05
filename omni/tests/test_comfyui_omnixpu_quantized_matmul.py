@@ -88,7 +88,9 @@ def comfy_ops():
     providers, errors = runtime.discover_providers()
     assert not errors, errors
     if providers:
-        state = runtime.bootstrap(dynamic_vram_override=True, providers_override=providers)
+        # This suite owns Kitchen integration. AIMDO allocator takeover must
+        # precede Torch and is covered by the image validator and real server.
+        state = runtime.bootstrap(dynamic_vram_override=False, providers_override=providers)
         assert state['providers']['comfy_kitchen.xpu']['status'] == 'active', state
     ops = importlib.import_module('comfy.ops')
     import comfy_kitchen as ck
