@@ -64,7 +64,7 @@ versions each source wheel accepts, and image validation checks both identities.
 
 For the default ComfyUI 0.43.0 source build, official Kitchen 0.2.40 uses the matching
 0.2.40 provider source at `xiangyuT/comfy-kitchen-xpu`
-(`35e7980909b58ae59131bcaa3fcf3c4df15f14ae`). This provider includes packed W4A8
+(`ddd4a4eb93f45477761a154512564ac6781e0ea5`). This provider includes packed W4A8
 decode for one to eight rows, with explicit errors for incompatible decode
 contracts or a missing native companion, alongside the native XPU LLM
 decode/cache and deferred-state adapters paired with the Omni kernels in this
