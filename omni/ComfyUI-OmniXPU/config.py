@@ -33,6 +33,9 @@ class Config:
         self.qwen_image21_cache = (
             master and os.environ.get("OMNIXPU_QWEN_IMAGE21_CACHE", "1") != "0"
         )
+        self.qwen_image21_qkv = (
+            master and os.environ.get("OMNIXPU_QWEN_IMAGE21_QKV", "0") == "1"
+        )
         self.seedvr_ada_reshape = (
             master
             and os.environ.get("OMNIXPU_SEEDVR_ADA_RESHAPE", "1") != "0"

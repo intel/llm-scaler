@@ -425,6 +425,18 @@ output = int8.int8_linear_prequantized(
 )
 ```
 
+### Grouped W4A8 decode
+
+`int8.w4a8_linear_prequantized` consumes contiguous rowwise INT8 activations,
+canonical packed INT4 weights `[N, K/2]`, FP32 or FP8 E4M3 group scales
+`[N, K/group_size]`, channel scales and an optional FP32 codebook of 16 values.
+It rounds decoded weights onto the INT8 grid inside the integer dot product,
+then applies output scales and bias without materializing an INT8 weight matrix.
+The output retains the activation's leading dimensions and supports FP32,
+FP16 and BF16. Query `int8.supports_w4a8_linear_prequantized()` for the loaded
+core's availability. Kitchen selects this decode path for one to eight rows;
+prefill and other formats retain their existing routes.
+
 ### FP8 and GGUF
 
 ```python
@@ -495,6 +507,16 @@ if rotary.kitchen_rope_fast_supported(x, freqs_cis):
 
 Callers should use the capability query before selecting a specialized native
 route and preserve the established PyTorch fallback.
+
+The paired RMS/RoPE API also specializes BF16 `[B, L, H, 128]` Q/K with
+contiguous heads, FP32 frequencies, full interleaved or split-half rotation and
+out-of-place output. Contiguous tensors and packed QKV views are supported;
+source and frequency indexing uses their actual batch, token and head strides.
+The route requires 32-wide subgroups, at least four subgroups per workgroup
+and at least 128 work-items per workgroup. It reuses each row's loaded values
+while preserving the generic reduction tree and BF16 normalized intermediate.
+In-place, partial rotation, other dtype/layout contracts, insufficient device
+capabilities and explicit SKU overrides retain the existing routes.
 
 ### Comfy Kitchen INT8 activation
 

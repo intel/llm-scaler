@@ -23,7 +23,7 @@ APIS = {
              "fused_rms_norm_linear", "fused_adaln", "fused_rms_adaln"),
     "int8": ("quantize_int8_tensorwise", "quantize_int8_rowwise", "dequantize_int8_simple",
              "dequantize_int8_simple_dtype", "mm_int8", "int8_linear", "int8_linear_prequantized",
-             "int8_linear_shared_input", "fused_silu_mul", "fused_silu_mul_quantize_rowwise",
+             "int8_linear_shared_input", "w4a8_linear_prequantized", "fused_silu_mul", "fused_silu_mul_quantize_rowwise",
              "fused_swiglu_quantize_rowwise", "fused_gelu_tanh_quantize_rowwise",
              "rotate_convrot", "quantize_int8_convrot_weight", "dequantize_int8_convrot_weight"),
     "fp8": ("quantize_per_tensor", "dequantize_per_tensor", "stochastic_rounding"),
@@ -317,6 +317,13 @@ def case(api, *, dtype=torch.bfloat16, rows=3):
         if name == "int8_linear_prequantized":
             q, s = int8.quantize_int8_rowwise(x)
             return function, (q, s, weight, scale), {"out_dtype": dtype}
+        if name == "w4a8_linear_prequantized":
+            q, s = int8.quantize_int8_rowwise(x)
+            relative = torch.full((32, 8), 0.5, device="xpu")
+            codebook = torch.linspace(-7, 7, 16, device="xpu")
+            return function, (q, s, _packed(32, 128).view(torch.int8), relative, scale, codebook), {
+                "bias": _rand((32,), dtype), "group_size": 16, "out_dtype": dtype,
+            }
         if name == "int8_linear_shared_input":return function, (x, weight, scale, weight.clone(), scale.clone()), {"out_dtype": dtype}
         if name in ("rotate_convrot", "quantize_int8_convrot_weight"):return function, (x, 64), {}
         if name == "dequantize_int8_convrot_weight":return function, (weight, scale, 64), {}
@@ -389,7 +396,7 @@ def test_public_tensor_inventory_has_no_unclassified_api():
     assert controls == RUNTIME_CONTROLS
     assert not controls.intersection(API_NAMES)
     assert actual == set(API_NAMES)
-    assert len(actual) == 96
+    assert len(actual) == 97
 
 
 @pytest.mark.parametrize("api", API_NAMES)

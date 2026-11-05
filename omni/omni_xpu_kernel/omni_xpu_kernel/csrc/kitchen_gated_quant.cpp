@@ -56,9 +56,12 @@ void launch(const torch::Tensor& input, torch::Tensor& output,
 
                 // Each work-item owns all four outputs of its butterfly, so
                 // the in-place stage has disjoint reads/writes until its fence.
-                for (int stride = 1; stride < group_size; stride *= 4) {
+                for (int shift = 0; (1 << shift) < group_size; shift += 2) {
+                    const int stride = 1 << shift;
                     for (int64_t pair = lane; pair < width / 4; pair += kThreads) {
-                        const int64_t pos = (pair / stride) * 4 * stride + pair % stride;
+                        // pair is nonnegative and stride is a power of four.
+                        const int64_t pos = ((pair >> shift) << (shift + 2)) +
+                                            (pair & (stride - 1));
                         const float a = values[pos];
                         const float b = values[pos + stride];
                         const float c = values[pos + 2 * stride];
@@ -80,8 +83,12 @@ void launch(const torch::Tensor& input, torch::Tensor& output,
                     item.get_group(), maximum, sycl::maximum<float>());
                 const float scale = sycl::fmax(row_max / 127.0f, 1e-30f);
                 if (lane == 0) scale_out[row] = scale;
+                // One reciprocal per work-item replaces width/kThreads exact
+                // divides. The quantizer contract allows one code of rounding
+                // error against the independent dense FP64 reference.
+                const float inverse_scale = 1.0f / scale;
                 for (int64_t col = lane; col < width; col += kThreads) {
-                    const float value = sycl::ext::intel::math::fdiv_rn(values[col], scale);
+                    const float value = values[col] * inverse_scale;
                     codes[row * width + col] = static_cast<int8_t>(
                         sycl::clamp(sycl::rint(value), -128.0f, 127.0f));
                 }

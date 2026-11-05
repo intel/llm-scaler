@@ -1,4 +1,4 @@
-"""Expose Kitchen's native INT8 format to ComfyUI's model eligibility check."""
+"""Expose available Kitchen INT8 formats to ComfyUI's model eligibility check."""
 from functools import wraps
 import inspect
 
@@ -12,7 +12,7 @@ _INT8_OPERATIONS = (
 )
 
 
-def _wrap(original, default_device, registry, backend_error):
+def _wrap(original, default_device, registry, backend_error, packed_w4_available=lambda: False):
     @wraps(original)
     def disabled_formats(device=None):
         disabled = set(original(device))
@@ -28,6 +28,13 @@ def _wrap(original, default_device, registry, backend_error):
             # This format includes scalar/per-channel weights and ConvRot.
             # Kernel dispatch and input constraints remain owned by Kitchen.
             disabled.discard('int8_tensorwise')
+        if packed_w4_available():
+            try:
+                w4_native = registry.get_capable_backend('w4a8_int8_linear') == 'xpu'
+            except backend_error:
+                w4_native = False
+            if w4_native:
+                disabled.discard('asym_w4a8_int8')
         return disabled
 
     setattr(disabled_formats, _MARKER, original)
@@ -53,5 +60,13 @@ def apply():
     except (ImportError, AttributeError, TypeError, ValueError) as error:
         return False, f'quantized-format eligibility is unavailable: {error}'
     ops.get_disabled_quant_formats = _wrap(
-        original, management.get_torch_device, registry, BackendError)
+        original, management.get_torch_device, registry, BackendError,
+        _packed_w4_available)
     return True, ''
+
+
+def _packed_w4_available():
+    from omni_xpu_kernel import int8
+
+    available = getattr(int8, 'supports_w4a8_linear_prequantized', None)
+    return callable(available) and available()
