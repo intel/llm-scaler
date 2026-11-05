@@ -24,13 +24,21 @@ class Tensor:
         return self.contiguous
 
 
+class TensorData:
+    def __init__(self, device):
+        self.device = device
+
+    def contiguous(self):
+        return self
+
+
 class Layer:
     def __init__(self, name, device):
         self.name = name
         self.calls = []
         self.weight = SimpleNamespace(
             shape=(4096, 4096), dtype="int8", _layout_cls="TensorWiseINT8Layout",
-            _qdata=SimpleNamespace(device=device),
+            _qdata=TensorData(device),
             _params=SimpleNamespace(convrot=True, convrot_groupsize=256,
                                     transposed=False, orig_dtype="bf16",
                                     scale=SimpleNamespace(device=device)),
@@ -43,6 +51,12 @@ class Layer:
 
     def forward(self, x):
         self.calls.append(x)
+        return self.name + ":original"
+
+    def forward_comfy_cast_weights(self, x):
+        return self._forward(x)
+
+    def _forward(self, x):
         return self.name + ":original"
 
     def __call__(self, x):
@@ -86,11 +100,16 @@ def runtime(monkeypatch):
             events.append("exit:" + layer.name)
             active.pop()
 
+    canonical_methods = {name: getattr(Layer, name) for name in (
+        "forward", "forward_comfy_cast_weights", "_forward")}
+    ops.mixed_precision_ops = lambda: SimpleNamespace(
+        Linear=type("FreshLinear", (Layer,), dict(canonical_methods)))
     ops.CastBiasWeightContext = cast
     ops.run_every_op = lambda: events.append("run_every_op")
 
     def rotate(value, group_size):
-        assert value is x and group_size == 256
+        assert value is x
+        assert all(layer.weight._params.convrot_groupsize == group_size for layer in layers)
         events.append("rotate")
         return object()
 
@@ -109,17 +128,55 @@ def runtime(monkeypatch):
     int8 = SimpleNamespace(_get_native=lambda: native, rotate_convrot=rotate,
                            quantize_int8_rowwise=quantize,
                            int8_linear_prequantized=gemm)
+    kitchen = ModuleType("comfy_kitchen")
+    kitchen.__path__ = []
+    backends = ModuleType("comfy_kitchen.backends")
+    backends.__path__ = []
+    xpu_backend = ModuleType("comfy_kitchen.backends.xpu")
+    xpu_backend.int8_linear = lambda **kwargs: None
+    exceptions = ModuleType("comfy_kitchen.exceptions")
+    exceptions.NoCapableBackendError = type("NoCapableBackendError", (RuntimeError,), {})
+    registry_module = ModuleType("comfy_kitchen.registry")
+    queries = []
+
+    class Registry:
+        selected = "xpu"
+        rejected_weight = None
+
+        def get_capable_backend(self, name):
+            assert name == "int8_linear"
+            return self.selected
+
+        def get_implementation(self, name, *, kwargs):
+            assert name == "int8_linear"
+            assert kwargs["weight"].device == x.device
+            assert kwargs["weight_scale"].device == x.device
+            queries.append(kwargs)
+            if kwargs["weight"] is self.rejected_weight:
+                return lambda **kw: "constraint:fallback"
+            return xpu_backend.int8_linear
+
+    registry = Registry()
+    registry_module.registry = registry
+    kitchen.registry = registry
+    kitchen.backends = backends
+    backends.xpu = xpu_backend
     omni = ModuleType("omni_xpu_kernel")
     omni.int8 = int8
     for name, value in (("torch", torch), ("comfy", comfy),
                         ("comfy.model_management", mm), ("comfy.ops", ops),
-                        ("omni_xpu_kernel", omni)):
+                        ("omni_xpu_kernel", omni), ("comfy_kitchen", kitchen),
+                        ("comfy_kitchen.backends", backends),
+                        ("comfy_kitchen.backends.xpu", xpu_backend),
+                        ("comfy_kitchen.exceptions", exceptions),
+                        ("comfy_kitchen.registry", registry_module)):
         monkeypatch.setitem(sys.modules, name, value)
     comfy.model_management, comfy.ops = mm, ops
     adapter = load("omnixpu_qkv_host_test", PLUGIN / "adapters/qwen_image21_qkv.py")
     module = SimpleNamespace(**dict(zip(("to_q", "to_k", "to_v"), layers)))
     return SimpleNamespace(adapter=adapter, module=module, x=x, layers=layers,
-                           torch=torch, mm=mm, int8=int8, events=events, gemms=gemms)
+                           torch=torch, mm=mm, int8=int8, events=events, gemms=gemms,
+                           registry=registry, queries=queries)
 
 
 def test_preparation_is_shared_only_within_one_call(runtime):
@@ -127,9 +184,12 @@ def test_preparation_is_shared_only_within_one_call(runtime):
     for _ in range(2):
         assert r.adapter.project_qkv(r.module, r.x) == (
             "q:shared", "k:shared", "v:shared")
-    one_call = ["rotate", "quantize"]
+    one_call = []
     for name in ("q", "k", "v"):
-        one_call += ["run_every_op", "enter:" + name, "gemm:" + name, "exit:" + name]
+        one_call += ["run_every_op", "enter:" + name]
+        if name == "q":
+            one_call += ["rotate", "quantize"]
+        one_call += ["gemm:" + name, "exit:" + name]
     assert r.events == one_call * 2
     for offset in (0, 3):
         assert all(row[0] is r.gemms[offset][0] and row[1] is r.gemms[offset][1]
@@ -239,7 +299,8 @@ def test_cast_context_releases_weight_on_native_failure(runtime):
     r.int8.int8_linear_prequantized = fail
     with pytest.raises(RuntimeError, match="native failure"):
         r.adapter.project_qkv(r.module, r.x)
-    assert r.events[-2:] == ["enter:q", "exit:q"]
+    assert r.events[0:2] == ["run_every_op", "enter:q"]
+    assert r.events[-1] == "exit:q"
     assert not any(event == "enter:k" for event in r.events)
 
 
@@ -251,6 +312,84 @@ def test_feature_switch_is_opt_in_and_obeys_master(monkeypatch):
     assert load("qkv_enabled", PLUGIN / "config.py").config.qwen_image21_qkv
     monkeypatch.setenv("OMNIXPU_ENABLE", "0")
     assert not load("qkv_master_disabled", PLUGIN / "config.py").config.qwen_image21_qkv
+
+
+@pytest.mark.parametrize("method", ["forward", "forward_comfy_cast_weights", "_forward"])
+@pytest.mark.parametrize("kind", ["subclass", "class_patch", "instance"])
+def test_overridden_projection_methods_are_not_bypassed(runtime, monkeypatch, method, kind):
+    r = runtime
+    original = getattr(Layer, method)
+
+    def custom(self, *args, **kwargs):
+        return original(self, *args, **kwargs)
+
+    layer = r.layers[1]
+    if kind == "subclass":
+        layer.__class__ = type("CustomProjection", (Layer,), {method: custom})
+    elif kind == "class_patch":
+        monkeypatch.setattr(Layer, method, custom)
+    else:
+        monkeypatch.setattr(layer, method, custom.__get__(layer, type(layer)))
+    assert r.adapter.project_qkv(r.module, r.x) == ("q:original", "k:original", "v:original")
+    assert not r.events
+    assert r.adapter.get_stats()["fallback:module_contract"] == 1
+
+
+def test_inherited_default_projection_is_supported(runtime):
+    r = runtime
+    r.layers[1].__class__ = type("InheritedProjection", (Layer,), {})
+    assert r.adapter.project_qkv(r.module, r.x) == ("q:shared", "k:shared", "v:shared")
+
+
+@pytest.mark.parametrize("group,width", [(4, 128), (16, 128), (64, 128),
+                                         (64, 1024), (256, 1024), (1024, 1024)])
+def test_common_convrot_group_comes_from_metadata(runtime, group, width):
+    r = runtime
+    r.x.shape = (2, 5, width)
+    for layer in r.layers:
+        layer.weight.shape = (128, width)
+        layer.weight._params.convrot_groupsize = group
+    assert r.adapter.project_qkv(r.module, r.x) == ("q:shared", "k:shared", "v:shared")
+    assert r.events.count("rotate") == r.events.count("quantize") == 1
+    assert all(query["convrot_groupsize"] == group for query in r.queries)
+
+
+@pytest.mark.parametrize("group", [None, 0, 1, 2, 8, 32, -64, 64.0, True, 16384])
+def test_invalid_or_nondividing_group_falls_back(runtime, group):
+    r = runtime
+    for layer in r.layers:
+        layer.weight._params.convrot_groupsize = group
+    assert r.adapter.project_qkv(r.module, r.x) == ("q:original", "k:original", "v:original")
+    assert not r.events
+
+
+def test_mixed_convrot_groups_fall_back_before_cast(runtime):
+    r = runtime
+    r.layers[1].weight._params.convrot_groupsize = 64
+    assert r.adapter.project_qkv(r.module, r.x) == ("q:original", "k:original", "v:original")
+    assert not r.events
+
+
+@pytest.mark.parametrize("backend", ["eager", "custom"])
+def test_non_xpu_selection_retains_original_calls(runtime, backend):
+    r = runtime
+    r.registry.selected = backend
+    assert r.adapter.project_qkv(r.module, r.x) == ("q:original", "k:original", "v:original")
+    assert not r.events
+    assert not r.queries
+
+
+@pytest.mark.parametrize("projection", [0, 1, 2])
+def test_constraints_on_actual_cast_weight_are_respected(runtime, projection):
+    r = runtime
+    r.registry.rejected_weight = r.layers[projection].weight._qdata
+    expected = ["q:shared", "k:shared", "v:shared"]
+    expected[projection] = "constraint:fallback"
+    assert r.adapter.project_qkv(r.module, r.x) == tuple(expected)
+    assert len(r.gemms) == 2
+    assert len(r.queries) == 3
+    assert r.events.count("rotate") == r.events.count("quantize") == 1
+    assert r.adapter.get_stats()["fallback:backend_projection"] == 1
 
 
 class Attention:

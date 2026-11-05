@@ -271,11 +271,16 @@ disabled by default and is also disabled by `OMNIXPU_ENABLE=0`.
 
 The route requires native ConvRot, rowwise INT8 quantization and prequantized
 GEMM APIs, contiguous BF16 `[B, N, K]` input, and three bias-free tensorwise
-INT8 projections whose input dimensions match `K`, with 256-channel ConvRot.
-`K` must be positive and divisible by 256; projection output widths can differ.
-Each projection retains its own ComfyUI cast/offload context; prepared
-activations are released after that call. Training, compilation, per-instance
-forward overrides, hooks, weight patches, unsupported input/weight contracts,
+INT8 projections whose input dimensions match `K`, with a common ConvRot group
+read from their weight parameters. The group must be a power of four of at least
+four and divide positive `K`; projection output widths can differ.
+Each projection retains its own ComfyUI cast/offload context. Kitchen backend
+overrides, disabled backends, priorities and constraints are respected; shared
+preparation is created lazily only for projections selecting the native XPU
+implementation. Other selected implementations receive the original activation.
+Prepared activations are released after that call. Training, compilation,
+instance or class overrides of the default projection methods, hooks, weight
+patches, unsupported input/weight contracts,
 and unavailable native APIs retain the original projection calls. An incompatible attention source is
 reported through the existing component status instead of being patched.
 
