@@ -1,6 +1,9 @@
 #include <torch/extension.h>
 #include <ATen/xpu/XPUContext.h>
 #include <sycl/sycl.hpp>
+#if __has_include(<ATen/native/xpu/sycl/IntegerDivider.h>)
+#include <ATen/native/xpu/sycl/IntegerDivider.h>
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -18,6 +21,23 @@ namespace rotary {
 namespace {
 
 constexpr int64_t RMS_ROPE_WG = 64;
+
+#if __has_include(<ATen/native/xpu/sycl/IntegerDivider.h>)
+template <typename Index>
+using RmsRowDivider = at::detail::IntDivider<Index>;
+#else
+// Older Torch wheels may omit this native XPU header. Keep exact indexing.
+template <typename Index>
+struct RmsRowDivider {
+    explicit RmsRowDivider(Index value) : divisor(value) {}
+    struct Coordinates { Index div; Index mod; };
+    Coordinates divmod(Index value) const {
+        return {value / divisor, value % divisor};
+    }
+    Index divisor;
+};
+#endif
+
 
 #if defined(OMNI_XPU_ARCH_BMG)
 static_assert(
@@ -470,12 +490,15 @@ bool use_qwen_d128_rms_rope(
     int64_t rot_dim,
     bool split_half,
     bool inplace) {
-    if (split_half || inplace || rot_dim != 128 ||
+    if (inplace || rot_dim != 128 ||
         q.scalar_type() != torch::kBFloat16 ||
         freqs.scalar_type() != torch::kFloat32 ||
-        q.sizes() != k.sizes() || q.size(0) != 1 ||
-        q.size(2) != 32 || q.size(3) != 128 ||
-        !q.is_contiguous() || !k.is_contiguous()) {
+        q.sizes() != k.sizes() || q.size(3) != 128 ||
+        q.stride(3) != 1 || k.stride(3) != 1 ||
+        q.stride(2) != 128 || k.stride(2) != 128 ||
+        q.stride(1) < q.size(2) * 128 ||
+        k.stride(1) < k.size(2) * 128 ||
+        q.stride(0) <= 0 || k.stride(0) <= 0) {
         return false;
     }
     // Explicit profile overrides remain a way to exercise the generic route.
@@ -494,7 +517,8 @@ bool use_qwen_d128_rms_rope(
     return true;
 }
 
-void launch_qwen_d128_rms_rope(
+template <typename Index, bool SinglePowerOfTwoBatch, bool SplitHalf>
+void launch_qwen_d128_rms_rope_indexed(
     const torch::Tensor& q,
     const torch::Tensor& k,
     const torch::Tensor& freqs,
@@ -503,14 +527,24 @@ void launch_qwen_d128_rms_rope(
     torch::Tensor& q_out,
     torch::Tensor& k_out,
     float epsilon) {
-    constexpr int64_t heads = 32;
+    const int64_t sequence = q.size(1);
+    const int64_t heads = q.size(2);
     constexpr int64_t dim = 128;
     constexpr int subgroup_size = 32;
     constexpr int rows_per_workgroup = 4;
     constexpr int workgroup_size = subgroup_size * rows_per_workgroup;
-    const int64_t rows = q.size(1) * heads;
+    const int64_t rows = q.size(0) * sequence * heads;
     if (rows == 0) return;
     const auto fm = freq_meta(freqs);
+    const auto qm = tensor_meta(q, q_out);
+    const auto km = tensor_meta(k, k_out);
+    const bool contiguous_sources = q.is_contiguous() && k.is_contiguous();
+    int head_shift = 0;
+    for (int64_t value = heads; value > 1; value >>= 1) ++head_shift;
+    // Reuse Torch's exact host-precomputed divider for bounded row indices.
+    // uint64_t retains ordinary division for tensors outside its uint32 range.
+    const RmsRowDivider<Index> head_divider(static_cast<Index>(heads));
+    const RmsRowDivider<Index> sequence_divider(static_cast<Index>(sequence));
     const auto* qp = reinterpret_cast<const bf16*>(q.data_ptr());
     const auto* kp = reinterpret_cast<const bf16*>(k.data_ptr());
     auto* qop = reinterpret_cast<bf16*>(q_out.data_ptr());
@@ -531,55 +565,123 @@ void launch_qwen_d128_rms_rope(
                 const int lane = sg.get_local_linear_id();
                 const bool key = global_row >= rows;
                 const int64_t row = key ? global_row - rows : global_row;
-                const auto* x = (key ? kp : qp) + row * dim;
+                int64_t batch, token, head;
+                if constexpr (SinglePowerOfTwoBatch) {
+                    const Index index = static_cast<Index>(row);
+                    batch = 0;
+                    head = index & static_cast<Index>(heads - 1);
+                    token = index >> head_shift;
+                } else {
+                    const auto head_index = head_divider.divmod(static_cast<Index>(row));
+                    const auto token_index = sequence_divider.divmod(head_index.div);
+                    batch = static_cast<int64_t>(token_index.div);
+                    token = static_cast<int64_t>(token_index.mod);
+                    head = static_cast<int64_t>(head_index.mod);
+                }
+                const auto meta = key ? km : qm;
+                const int64_t source_base = contiguous_sources ? row * dim :
+                    batch * meta.stride0 + token * meta.stride1 + head * meta.stride2;
+                const auto* x = (key ? kp : qp) + source_base;
                 auto* y = (key ? kop : qop) + row * dim;
                 const auto* scale = key ? ksp : qsp;
-                const float a = static_cast<float>(x[2 * lane]);
-                const float b = static_cast<float>(x[2 * lane + 1]);
-                const float c = static_cast<float>(x[2 * lane + 64]);
-                const float d = static_cast<float>(x[2 * lane + 65]);
-
-                // Match the generic WG64 tree, whose lanes initially sum
-                // x[lane]^2 + x[lane+64]^2. Keep its even/odd branches separate
-                // until the final addition, and reuse the original row values.
-                float even = 0.0f;
-                even += a * a;
-                even += c * c;
-                float odd = 0.0f;
-                odd += b * b;
-                odd += d * d;
-                for (int mask = 16; mask; mask /= 2) {
-                    even += sycl::permute_group_by_xor(sg, even, mask);
-                    odd += sycl::permute_group_by_xor(sg, odd, mask);
+                const int first_col = SplitHalf ? lane : 2 * lane;
+                const int second_col = SplitHalf ? lane + 32 : 2 * lane + 1;
+                const float a = static_cast<float>(x[first_col]);
+                const float b = static_cast<float>(x[second_col]);
+                const float c = static_cast<float>(x[first_col + 64]);
+                const float d = static_cast<float>(x[second_col + 64]);
+                float total;
+                if constexpr (SplitHalf) {
+                    // Generic WG64 first merges partial[lane] with lane+32,
+                    // then its 32 remaining lanes reduce distances 16..1.
+                    float low = 0.0f;
+                    low += a * a;
+                    low += c * c;
+                    float high = 0.0f;
+                    high += b * b;
+                    high += d * d;
+                    low += high;
+                    for (int mask = 16; mask; mask /= 2)
+                        low += sycl::permute_group_by_xor(sg, low, mask);
+                    total = sycl::group_broadcast(sg, low, 0);
+                } else {
+                    // Preserve the existing interleaved even/odd tree.
+                    float even = 0.0f;
+                    even += a * a;
+                    even += c * c;
+                    float odd = 0.0f;
+                    odd += b * b;
+                    odd += d * d;
+                    for (int mask = 16; mask; mask /= 2) {
+                        even += sycl::permute_group_by_xor(sg, even, mask);
+                        odd += sycl::permute_group_by_xor(sg, odd, mask);
+                    }
+                    total = sycl::group_broadcast(sg, even, 0) +
+                        sycl::group_broadcast(sg, odd, 0);
                 }
-                const float total = sycl::group_broadcast(sg, even, 0) +
-                    sycl::group_broadcast(sg, odd, 0);
                 const float inverse_rms = sycl::rsqrt(total / dim + epsilon);
+                const int64_t frequency_base =
+                    (fm.n0 == 1 ? 0 : batch) * fm.stride0 +
+                    (fm.n1 == 1 ? 0 : token) * fm.stride1 +
+                    (fm.n2 == 1 ? 0 : head) * fm.stride2;
                 const float values[4] = {a, b, c, d};
                 for (int part = 0; part < 2; ++part) {
                     const int pair = lane + 32 * part;
-                    const int col = 2 * pair;
+                    const int col0 = SplitHalf ? pair : 2 * pair;
+                    const int col1 = SplitHalf ? pair + 64 : col0 + 1;
                     // The BF16 normalized intermediate is model-observable.
                     const bf16 normalized0 = static_cast<bf16>(
-                        values[2 * part] * inverse_rms * scale[col]);
+                        values[SplitHalf ? part : 2 * part] * inverse_rms * scale[col0]);
                     const bf16 normalized1 = static_cast<bf16>(
-                        values[2 * part + 1] * inverse_rms * scale[col + 1]);
+                        values[SplitHalf ? part + 2 : 2 * part + 1] * inverse_rms * scale[col1]);
                     const float v0 = static_cast<float>(normalized0);
                     const float v1 = static_cast<float>(normalized1);
-                    const int64_t token = row / heads;
-                    const int64_t head = row % heads;
-                    const int64_t fi = (fm.n1 == 1 ? 0 : token) * fm.stride1 +
-                        (fm.n2 == 1 ? 0 : head) * fm.stride2 +
+                    const int64_t fi = frequency_base +
                         (fm.pairs == 1 ? 0 : pair) * fm.stride3;
                     const float f00 = fp[fi];
                     const float f01 = fp[fi + fm.stride5];
                     const float f10 = fp[fi + fm.stride4];
                     const float f11 = fp[fi + fm.stride4 + fm.stride5];
-                    y[col] = static_cast<bf16>(f00 * v0 + f01 * v1);
-                    y[col + 1] = static_cast<bf16>(f10 * v0 + f11 * v1);
+                    y[col0] = static_cast<bf16>(f00 * v0 + f01 * v1);
+                    y[col1] = static_cast<bf16>(f10 * v0 + f11 * v1);
                 }
             });
     }, q.device(), "kitchen_rms_rope_qwen_d128");
+}
+
+template <bool SplitHalf>
+void launch_qwen_d128_rms_rope(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& freqs,
+    const torch::Tensor& q_scale,
+    const torch::Tensor& k_scale,
+    torch::Tensor& q_out,
+    torch::Tensor& k_out,
+    float epsilon) {
+    const int64_t rows = q.size(0) * q.size(1) * q.size(2);
+    if (rows == 0) return;
+    // Torch's fast uint32 divider requires each dividend <= INT32_MAX.
+    // Select by that arithmetic range, without restricting B, L or H.
+    const int64_t heads = q.size(2);
+    // A single batch with any power-of-two head count needs only shifts/masks.
+    // This is an arithmetic specialization, not a whitelist of model shapes.
+    const bool shift_indexing = q.size(0) == 1 && (heads & (heads - 1)) == 0;
+    if (rows <= INT32_MAX) {
+        if (shift_indexing) {
+            launch_qwen_d128_rms_rope_indexed<uint32_t, true, SplitHalf>(
+                q, k, freqs, q_scale, k_scale, q_out, k_out, epsilon);
+        } else {
+            launch_qwen_d128_rms_rope_indexed<uint32_t, false, SplitHalf>(
+                q, k, freqs, q_scale, k_scale, q_out, k_out, epsilon);
+        }
+    } else if (shift_indexing) {
+        launch_qwen_d128_rms_rope_indexed<uint64_t, true, SplitHalf>(
+            q, k, freqs, q_scale, k_scale, q_out, k_out, epsilon);
+    } else {
+        launch_qwen_d128_rms_rope_indexed<uint64_t, false, SplitHalf>(
+            q, k, freqs, q_scale, k_scale, q_out, k_out, epsilon);
+    }
 }
 
 template <typename InputT, typename FreqT, bool SplitHalf, bool Pair>
@@ -847,9 +949,15 @@ std::tuple<torch::Tensor, torch::Tensor> rms_kitchen_rope(
     q_scale = q_scale.to(torch::kFloat32).contiguous();
     k_scale = k_scale.to(torch::kFloat32).contiguous();
     if (use_qwen_d128_rms_rope(q, k, freqs_cis, rot_dim, split_half, inplace)) {
-        launch_qwen_d128_rms_rope(
-            q, k, freqs_cis, q_scale, k_scale, q_out, k_out,
-            static_cast<float>(epsilon));
+        if (split_half) {
+            launch_qwen_d128_rms_rope<true>(
+                q, k, freqs_cis, q_scale, k_scale, q_out, k_out,
+                static_cast<float>(epsilon));
+        } else {
+            launch_qwen_d128_rms_rope<false>(
+                q, k, freqs_cis, q_scale, k_scale, q_out, k_out,
+                static_cast<float>(epsilon));
+        }
         return {q_out, k_out};
     }
     if (split_half) {

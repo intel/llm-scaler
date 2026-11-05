@@ -508,15 +508,15 @@ if rotary.kitchen_rope_fast_supported(x, freqs_cis):
 Callers should use the capability query before selecting a specialized native
 route and preserve the established PyTorch fallback.
 
-The paired RMS/RoPE API also specializes contiguous BF16
-`[1, L, 32, 128]` Q/K with FP32 frequencies, full interleaved rotation and
-out-of-place output on devices supporting 32-wide subgroups, at least four
-subgroups per workgroup and at least 128 work-items per workgroup. It reuses
-each row's loaded values while preserving the
-generic reduction tree and BF16 normalized intermediate. In-place, split-half,
-other dtype/layout contracts, insufficient device capabilities and explicit
-SKU overrides retain the
-existing routes.
+The paired RMS/RoPE API also specializes BF16 `[B, L, H, 128]` Q/K with
+contiguous heads, FP32 frequencies, full interleaved or split-half rotation and
+out-of-place output. Contiguous tensors and packed QKV views are supported;
+source and frequency indexing uses their actual batch, token and head strides.
+The route requires 32-wide subgroups, at least four subgroups per workgroup
+and at least 128 work-items per workgroup. It reuses each row's loaded values
+while preserving the generic reduction tree and BF16 normalized intermediate.
+In-place, partial rotation, other dtype/layout contracts, insufficient device
+capabilities and explicit SKU overrides retain the existing routes.
 
 ### Comfy Kitchen INT8 activation
 
