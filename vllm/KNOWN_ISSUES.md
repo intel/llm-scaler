@@ -16,3 +16,8 @@ Root cause analysis is still in progress.
 With `--enable-lora` and `--enforce-eager`, the first request to gemma-4-26B-A4B-it can take about five minutes. If it takes longer than `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` (default 300), the engine stops and all requests fail.
 
 Workaround: Serve the model in graph mode (see [Graph Mode](README.md#211-graph-mode)), where this delay moves to server startup, or set `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800`.
+
+# 04. MoE Expert LoRA Fails with `--max-lora-rank` Below 16
+When LoRA adapters target MoE expert layers (for example on Qwen3.6-35B-A3B or gemma-4-26B-A4B-it) and `--max-lora-rank` is set below 16, serving fails with a Triton compilation error (`N >= 16`).
+
+Workaround: Set `--max-lora-rank` to 16 or higher. Adapters with a lower rank still load and run.
