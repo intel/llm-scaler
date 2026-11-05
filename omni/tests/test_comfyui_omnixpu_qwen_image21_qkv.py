@@ -79,6 +79,8 @@ def runtime(monkeypatch):
     torch.Tensor, torch.bfloat16 = Tensor, "bf16"
     torch.is_grad_enabled = lambda: False
     torch.compiler = SimpleNamespace(is_compiling=lambda: False)
+    torch.nn = SimpleNamespace(modules=SimpleNamespace(module=SimpleNamespace(
+        _global_forward_hooks={}, _global_forward_pre_hooks={})))
     torch.xpu = SimpleNamespace(
         get_device_properties=lambda device: SimpleNamespace(device_id=0xE223))
     comfy = ModuleType("comfy")
@@ -302,6 +304,15 @@ def test_cast_context_releases_weight_on_native_failure(runtime):
     assert r.events[0:2] == ["run_every_op", "enter:q"]
     assert r.events[-1] == "exit:q"
     assert not any(event == "enter:k" for event in r.events)
+
+
+@pytest.mark.parametrize("name", ["_global_forward_hooks", "_global_forward_pre_hooks"])
+def test_global_module_hooks_retain_original_calls(runtime, name):
+    r = runtime
+    getattr(r.torch.nn.modules.module, name)[1] = object()
+    assert r.adapter.project_qkv(r.module, r.x) == ("q:original", "k:original", "v:original")
+    assert not r.events
+    assert r.adapter.get_stats()["fallback:module_contract"] == 1
 
 
 def test_feature_switch_is_opt_in_and_obeys_master(monkeypatch):

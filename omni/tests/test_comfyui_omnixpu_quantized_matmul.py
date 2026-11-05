@@ -177,11 +177,22 @@ def test_actual_comfy_w4_loader_and_packed_dispatch(comfy_bridge, monkeypatch, f
         expected = torch.nn.functional.linear(x, weight.dequantize())
     else:
         params = weight._params
-        with monkeypatch.context() as context:
-            context.setattr(int8, 'supports_w4a8_linear_prequantized', lambda: False)
-            expected = ck.w4a8_int8_linear(x, weight._qdata, params.scale, params.s_channel,
-                codebook=params.codebook, group_size=group, convrot_groupsize=rotation,
-                out_dtype=x.dtype)
+        from comfy_kitchen.backends.eager.quantization import quantize_and_rotate_rowwise
+        from comfy_kitchen.tensor.int8_utils import _build_hadamard
+
+        # A missing packed companion is an error for decode. Build the reference
+        # independently instead of disabling the capability to force a fallback.
+        h = _build_hadamard(rotation, device=x.device, dtype=x.dtype)
+        codes, scales = quantize_and_rotate_rowwise(x, h, rotation)
+        packed = weight._qdata.to(torch.int32)
+        indices = torch.stack((packed & 15, (packed >> 4) & 15), dim=-1).flatten(-2)
+        decoded = (params.codebook[indices.long()].float()
+                   * params.scale.float().repeat_interleave(group, dim=-1))
+        decoded = decoded.round().clamp(-127, 127)
+        # K=256 keeps every integer dot exact in FP32 for these INT8 operands.
+        accumulators = codes.reshape(-1, width).float() @ decoded.t()
+        expected = (accumulators * scales.reshape(-1, 1)
+                    * params.s_channel.float()).to(x.dtype).reshape(1, rows, output)
     original = int8.w4a8_linear_prequantized
     calls = []
 
@@ -302,3 +313,35 @@ def test_shared_qkv_respects_real_backend_registry(shared_qkv, monkeypatch, poli
         assert qkv.get_stats()["fallback:backend_projection"] == 3
     else:
         assert qkv.get_stats()["fallback:backend"] == 1
+
+
+@pytest.mark.parametrize("kind", ["forward", "pre"])
+@torch.inference_mode()
+def test_shared_qkv_preserves_global_module_hooks(shared_qkv, kind):
+    ops, qkv = shared_qkv
+    module, x, layers = qkv_inputs(ops)
+    calls = []
+
+    def forward_hook(layer, args, output):
+        if layer in layers:
+            calls.append(layer)
+            return output + 1
+
+    def pre_hook(layer, args):
+        if layer in layers:
+            calls.append(layer)
+            return (args[0] + 1,)
+
+    hooks = torch.nn.modules.module
+    handle = (hooks.register_module_forward_hook(forward_hook) if kind == "forward"
+              else hooks.register_module_forward_pre_hook(pre_hook))
+    try:
+        expected = tuple(layer(x) for layer in layers)
+        calls.clear()
+        actual = qkv.project_qkv(module, x)
+    finally:
+        handle.remove()
+    assert calls == layers
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+    assert qkv.get_stats()["fallback:module_contract"] == 1
+    assert not qkv.get_stats().get("shared_calls")

@@ -69,6 +69,11 @@ def project_qkv(module, x):
             or x.requires_grad or torch.is_grad_enabled() or mm.in_training
             or torch.compiler.is_compiling()):
         return fallback("input")
+    # Calling the native projections bypasses Module.__call__, including hooks
+    # registered globally rather than on the individual projection modules.
+    module_hooks = torch.nn.modules.module
+    if module_hooks._global_forward_hooks or module_hooks._global_forward_pre_hooks:
+        return fallback("module_contract")
     # Respect explicit overrides, disabled backends and priority before loading
     # native code or casting weights. Validate the actual cast operands below.
     try:

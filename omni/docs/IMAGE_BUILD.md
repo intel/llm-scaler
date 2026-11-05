@@ -64,7 +64,9 @@ versions each source wheel accepts, and image validation checks both identities.
 
 For the default ComfyUI 0.43.0 source build, official Kitchen 0.2.40 uses the matching
 0.2.40 provider source at `xiangyuT/comfy-kitchen-xpu`
-(`3a5728c21038c03a62e6cd74d3ffff740856b755`). This provider includes the native XPU LLM
+(`35e7980909b58ae59131bcaa3fcf3c4df15f14ae`). This provider includes packed W4A8
+decode for one to eight rows, with explicit errors for incompatible decode
+contracts or a missing native companion, alongside the native XPU LLM
 decode/cache and deferred-state adapters paired with the Omni kernels in this
 checkout. Official AIMDO 0.6.0 uses
 the matching 0.6.0 provider source at `xiangyuT/comfy-aimdo-xpu`
