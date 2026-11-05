@@ -2,6 +2,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -72,11 +73,32 @@ def test_w4_bridge_requires_packed_companion_and_selected_backend(device, backen
     assert 'asym_w4a8_int8' in upstream
 
 
-@pytest.fixture
-def comfy_bridge(monkeypatch):
-    ops = pytest.importorskip('comfy.ops')
+@pytest.fixture(scope='module')
+def comfy_ops():
+    pytest.importorskip('comfy')
+    # ComfyUI normally activates co-installed providers during prestartup,
+    # before comfy.ops imports Kitchen. Reproduce that public startup boundary
+    # rather than replacing the installed package with a source PYTHONPATH.
+    runtime_path = PATH.parents[1] / 'runtime_bootstrap.py'
+    runtime_spec = importlib.util.spec_from_file_location(
+        'quantized_matmul_runtime_bootstrap_test', runtime_path)
+    runtime = importlib.util.module_from_spec(runtime_spec)
+    sys.modules[runtime_spec.name] = runtime
+    runtime_spec.loader.exec_module(runtime)
+    providers, errors = runtime.discover_providers()
+    assert not errors, errors
+    if providers:
+        state = runtime.bootstrap(dynamic_vram_override=True, providers_override=providers)
+        assert state['providers']['comfy_kitchen.xpu']['status'] == 'active', state
+    ops = importlib.import_module('comfy.ops')
     import comfy_kitchen as ck
     assert torch.xpu.is_available() and ck.list_backends()['xpu']['available']
+    return ops
+
+
+@pytest.fixture
+def comfy_bridge(monkeypatch, comfy_ops):
+    ops = comfy_ops
     original = ops.get_disabled_quant_formats
     monkeypatch.setattr(ops, 'get_disabled_quant_formats', original)
     assert adapter.apply() == (True, '')
