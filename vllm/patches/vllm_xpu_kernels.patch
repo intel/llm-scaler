@@ -11,7 +11,7 @@ index 15ff1f8..f3b219d 100644
        "csrc/xpu/sycl/deepseek_scaling_rope.cpp"
        "csrc/xpu/sycl/deepseek_qnorm_rope_kv_insert.cpp"
 diff --git a/csrc/flash_attn/flash_api.cpp b/csrc/flash_attn/flash_api.cpp
-index a7a4e41..42c924f 100644
+index a7a4e41..1738de2 100644
 --- a/csrc/flash_attn/flash_api.cpp
 +++ b/csrc/flash_attn/flash_api.cpp
 @@ -121,7 +121,11 @@ std::vector<at::Tensor> mha_varlen_fwd(
@@ -27,7 +27,41 @@ index a7a4e41..42c924f 100644
    auto q_type = q.scalar_type();
    auto k_type = k.scalar_type();
    TORCH_CHECK(
-@@ -232,7 +236,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
+@@ -130,8 +134,9 @@ std::vector<at::Tensor> mha_varlen_fwd(
+ 
+   TORCH_CHECK(
+       v.scalar_type() == k_type, "key and value must have the same dtype");
++  const bool is_int8_kv = k_type == at::ScalarType::Char;
+   if (k_type != at::ScalarType::Float8_e5m2 &&
+-      k_type != at::ScalarType::Float8_e4m3fn) {
++      k_type != at::ScalarType::Float8_e4m3fn && !is_int8_kv) {
+     TORCH_CHECK(
+         k.scalar_type() == q_type, "query and key must have the same dtype");
+     TORCH_CHECK(
+@@ -164,8 +169,21 @@ std::vector<at::Tensor> mha_varlen_fwd(
+     TORCH_CHECK(
+         block_table.stride(-1) == 1,
+         "page_table must have contiguous last dimension");
+-    check_paged_kv_cache_strides(k, v);
++    if (is_int8_kv) {
++      // Split layout: block stride is not a multiple of the row stride.
++      check_int8_kv_cache(k, v, k_scale, v_scale);
++    } else {
++      check_paged_kv_cache_strides(k, v);
++    }
++  } else {
++    TORCH_CHECK(!is_int8_kv, "INT8 KV cache requires a paged KV cache");
+   }
++  // INT8 KV is implemented in the paged decode kernel only. Prefill / mixed
++  // batches should dequantize the referenced blocks and use the fp16/bf16 path.
++  TORCH_CHECK(
++      !is_int8_kv || max_seqlen_q == 1,
++      "INT8 KV cache is supported for decode (max_seqlen_q == 1) only; "
++      "dequantize the KV blocks for prefill");
+ 
+   CHECK_DEVICE(cu_seqlens_q);
+   CHECK_CONTIGUOUS(cu_seqlens_q);
+@@ -232,7 +250,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
          is_local,
          is_sink,
          softmax_lse_opt,
@@ -37,7 +71,7 @@ index a7a4e41..42c924f 100644
    } else if (max_seqlen_q > 1) {
      if (!out_.has_value()) {
        out = torch::empty_like(q);
-@@ -242,6 +247,16 @@ std::vector<at::Tensor> mha_varlen_fwd(
+@@ -242,6 +261,16 @@ std::vector<at::Tensor> mha_varlen_fwd(
                              cu_seqlens_q.slice(0, 0, batch_size);
      at::Tensor is_prefill_mask = seq_lens_q.gt(1);
      std::optional<const at::Tensor> is_prefill_opt = is_prefill_mask;
@@ -54,7 +88,7 @@ index a7a4e41..42c924f 100644
  
      cutlass_chunk_prefill_interface(
          queue,
-@@ -266,15 +281,18 @@ std::vector<at::Tensor> mha_varlen_fwd(
+@@ -266,15 +295,18 @@ std::vector<at::Tensor> mha_varlen_fwd(
          is_local,
          is_sink,
          softmax_lse_opt,
@@ -82,7 +116,7 @@ index a7a4e41..42c924f 100644
  
      int num_tokens = batch_size;
      int num_heads_q = q.size(1);
-@@ -320,6 +338,7 @@ std::vector<at::Tensor> mha_varlen_fwd(
+@@ -320,6 +352,7 @@ std::vector<at::Tensor> mha_varlen_fwd(
          is_prefill_opt,
          splits_per_seq,
          work_list);
@@ -90,7 +124,7 @@ index a7a4e41..42c924f 100644
    } else {
      // Normalize -1 (unbounded) to max_seqlen_k for kernel masking logic
      // In decode phase the window_size_right doesn't have effect
-@@ -448,11 +467,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+@@ -448,11 +481,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
        "bool is_causal, int window_size_left, int window_size_right, float "
        "softcap, bool return_softmax, "
        "Generator? gen, int? num_splits, bool mix_batch, Tensor? "
@@ -835,6 +869,67 @@ index 7e822d3..9b90ee7 100644
  
  void cutlass_paged_decode_interface(
      sycl::queue& queue,
+diff --git a/csrc/xpu/attn/paged_kv_utils.h b/csrc/xpu/attn/paged_kv_utils.h
+index e7e2d9e..14535ce 100644
+--- a/csrc/xpu/attn/paged_kv_utils.h
++++ b/csrc/xpu/attn/paged_kv_utils.h
+@@ -72,3 +72,56 @@ inline void check_paged_kv_cache_strides(
+           std::numeric_limits<int>::max(),
+       "effective_total exceeds int32 range");
+ }
++
++// INT8 per-token-head KV cache: int8 K/V views over the block-local split
++// layout
++// ([int8 K|V data for all (slot, head) | K scales fp32 | V scales fp32] per
++// block) plus fp32 scale caches [num_blocks, block_size, num_heads_kv] passed
++// as k_scale / v_scale. Validates everything the kernels rely on.
++inline void check_int8_kv_cache(
++    const at::Tensor& key_cache,
++    const at::Tensor& value_cache,
++    const std::optional<const at::Tensor>& k_scale,
++    const std::optional<const at::Tensor>& v_scale) {
++  TORCH_CHECK(
++      key_cache.scalar_type() == at::ScalarType::Char &&
++          value_cache.scalar_type() == at::ScalarType::Char,
++      "INT8 KV cache: key and value caches must both be int8");
++  TORCH_CHECK(
++      key_cache.dim() == 4 && value_cache.dim() == 4,
++      "INT8 KV cache must be paged: [num_blocks, block_size, num_heads_kv, "
++      "head_size]");
++  TORCH_CHECK(
++      k_scale.has_value() && v_scale.has_value(),
++      "INT8 KV cache requires per-token-head k_scale and v_scale caches");
++  for (const auto* s : {&*k_scale, &*v_scale}) {
++    TORCH_CHECK(
++        s->scalar_type() == at::ScalarType::Float && s->dim() == 3 &&
++            s->size(0) == key_cache.size(0) &&
++            s->size(1) == key_cache.size(1) && s->size(2) == key_cache.size(2),
++        "INT8 KV scale caches must be float32 [num_blocks, block_size, "
++        "num_heads_kv] matching the KV cache");
++  }
++  TORCH_CHECK(
++      k_scale->strides() == v_scale->strides(),
++      "INT8 KV k_scale and v_scale caches must have identical strides");
++  TORCH_CHECK(
++      key_cache.strides() == value_cache.strides(),
++      "INT8 KV key and value caches must have identical strides");
++  // Xe 2D block loads need 64-byte aligned surface bases; the kernels build one
++  // surface per (block, head) for K and for V.
++  auto addr = [](const at::Tensor& t) {
++    return reinterpret_cast<uintptr_t>(t.data_ptr());
++  };
++  TORCH_CHECK(
++      addr(key_cache) % 64 == 0 && addr(value_cache) % 64 == 0 &&
++          key_cache.stride(0) % 64 == 0 && key_cache.stride(2) % 64 == 0,
++      "INT8 KV cache: block, head and K/V base addresses must be 64-byte "
++      "aligned (head_size must be a multiple of 64 for the split layout); got "
++      "page stride ",
++      key_cache.stride(0),
++      ", head stride ",
++      key_cache.stride(2),
++      ", V offset ",
++      static_cast<int64_t>(addr(value_cache) - addr(key_cache)));
++}
 diff --git a/csrc/xpu/attn/xe_2/chunk_prefill.hpp b/csrc/xpu/attn/xe_2/chunk_prefill.hpp
 index 492c687..c1ff9ae 100644
 --- a/csrc/xpu/attn/xe_2/chunk_prefill.hpp
@@ -901,7 +996,7 @@ index 30f7b5c..c56cfa8 100644
 +    std::optional<const at::Tensor>& is_prefill,
 +    std::optional<const at::Tensor>& per_seq_causal);
 diff --git a/csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp b/csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp
-index 0401d05..4265fed 100644
+index 0401d05..e9f7f87 100644
 --- a/csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp
 +++ b/csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp
 @@ -271,7 +271,9 @@ struct FMHAFwdMainloop<
@@ -931,11 +1026,265 @@ index 0401d05..4265fed 100644
              if (left_mask || right_mask) {
                tSrS(i) = ElementS(-INFINITY);
              }
+@@ -691,6 +695,10 @@ struct DecodeFwdMainloop<
+   static constexpr bool CausalMask = CausalMask_;
+   static constexpr bool Fp8KV =
+       is_any_of_v<ElementK, float_e5m2_t, float_e4m3_t>;
++  // INT8 per-token-head KV: int8 K/V tiles plus one fp32 scale per (KV token,
++  // KV head), read from [num_blocks, block_size, num_heads_kv] scale caches
++  // (scale_k / scale_v point to them). Paged KV only.
++  static constexpr bool Int8KV = is_same_v<ElementK, int8_t>;
+   static constexpr bool LocalMask = LocalMask_;
+ 
+   // User-facing arguments
+@@ -708,6 +716,11 @@ struct DecodeFwdMainloop<
+     int window_size_right;
+     // Physical stride between paged blocks in seq-position units
+     int page_stride_elements;
++    // INT8 KV only (see FMHAFwdMainloop::Arguments).
++    int64_t scale_stride_block = 0;
++    int64_t scale_stride_slot = 0;
++    int64_t scale_stride_head = 0;
++    int64_t page_stride_bytes = 0;
+   };
+ 
+   // Kernel-facing parameters
+@@ -738,7 +751,11 @@ struct DecodeFwdMainloop<
+         args.total_seqlen_kv,
+         args.window_size_left,
+         args.window_size_right,
+-        args.page_stride_elements};
++        args.page_stride_elements,
++        args.scale_stride_block,
++        args.scale_stride_slot,
++        args.scale_stride_head,
++        args.page_stride_bytes};
+   }
+ 
+   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
+@@ -761,7 +778,8 @@ struct DecodeFwdMainloop<
+       int thr_id,
+       int seq_len,
+       int full_tile_offset,
+-      int discard_seq_coord) {
++      int discard_seq_coord,
++      int head_kv = 0) {
+     using namespace sycl::ext::oneapi::this_work_item;
+ 
+     // Short dimension names:
+@@ -867,7 +885,9 @@ struct DecodeFwdMainloop<
+     }
+ 
+     for (int D = 0; D < size<4>(pKgK); D++) {
+-      prefetch(prefetch_k, pKgK(_, _, _, tile_idx, D));
++      if constexpr (!Int8KV) {
++        prefetch(prefetch_k, pKgK(_, _, _, tile_idx, D));
++      }
+     }
+ 
+     clear(tArA);
+@@ -891,9 +911,171 @@ struct DecodeFwdMainloop<
+       effective_scale = params.scale * ElementS(scale_k);
+     }
+ 
++    // INT8 KV helpers (only instantiated for int8 K/V; see Arguments).
++    auto int8_phys_block = [&](int k_tile) {
++      int page_local = k_tile * get<1>(TileShapeQK{}) / params.page_size;
++      page_local = page_local < params.max_pages_per_seq
++                       ? page_local
++                       : params.max_pages_per_seq - 1;
++      return params
++          .ptr_page_table[idx_b * params.max_pages_per_seq + page_local];
++    };
++    auto int8_tile_in_block = [&](int k_tile) {
++      return k_tile % (params.page_size / get<1>(TileShapeQK{}));
++    };
++    // INT8 decode tile step: one page-table read per tile, scale loads issued
++    // before the K loads, per-block K/V surfaces built once per tile, V of this
++    // tile and K of the next tile prefetched through per-block surfaces.
++    auto int8_k_surface = [&](int pblk) {
++      return make_tensor(
++          K_2D.data() + int64_t(pblk) * params.page_stride_bytes,
++          make_layout(
++              make_shape(params.page_size, get<1>(K_2D.shape())),
++              K_2D.stride()));
++    };
++    auto int8_v_surface = [&](int pblk) {
++      return make_tensor(
++          V_2D.data() + int64_t(pblk) * params.page_stride_bytes,
++          make_layout(
++              make_shape(get<0>(V_2D.shape()), params.page_size),
++              V_2D.stride()));
++    };
++    auto int8_scales = [&](void* cache, int k_tile, int pblk) {
++      FragSCol sc;
++      const float* base = static_cast<const float*>(cache) +
++                          int64_t(pblk) * params.scale_stride_block +
++                          int64_t(head_kv) * params.scale_stride_head;
++      int k =
++          get<0>(tKgK(0, 0, 0, k_tile, 0)) + get_sub_group().get_local_id()[0];
++      CUTLASS_PRAGMA_UNROLL
++      for (int i = 0; i < sc.size(); i++, k += intel::sg_size) {
++        sc(i) = (k < seq_len) ? ElementS(
++                                    base
++                                        [int64_t(k % params.page_size) *
++                                         params.scale_stride_slot])
++                              : ElementS(0);
++      }
++      return sc;
++    };
++    auto int8_prefetch_k = [&](int k_tile) {
++      if (k_tile >= blk_k1) return;
++      auto K_blk = int8_k_surface(int8_phys_block(k_tile));
++      TiledCopyK copy_k_blk{K_blk};
++      auto pf_k = make_block_2d_prefetch(copy_k_blk);
++      auto pKgK_blk = pf_k.get_slice(thr_id).partition_S(local_tile(
++          make_identity_tensor(K_blk.shape()),
++          TileShapeQK{},
++          make_coord(_, _, _),
++          Step<X, _1, _1>{}));
++      CUTLASS_PRAGMA_UNROLL
++      for (int D = 0; D < size<4>(pKgK_blk); D++) {
++        prefetch(pf_k, pKgK_blk(_, _, _, int8_tile_in_block(k_tile), D));
++      }
++    };
++    auto int8_decode_tile = [&](int K) {
++      const int pblk = int8_phys_block(K);
++      const int t = int8_tile_in_block(K);
++      FragSCol ksc = int8_scales(params.scale_k, K, pblk);
++      FragSCol vsc = int8_scales(params.scale_v, K, pblk);
++
++      auto K_blk = int8_k_surface(pblk);
++      TiledCopyK copy_k_blk{K_blk};
++      auto tKgK_blk = thr_copy_k.partition_S(local_tile(
++          make_identity_tensor(K_blk.shape()),
++          TileShapeQK{},
++          make_coord(_, _, _),
++          Step<X, _1, _1>{}));
++      auto V_blk = int8_v_surface(pblk);
++      TiledCopyV copy_v_blk{V_blk};
++      auto gV_blk = local_tile(
++          make_identity_tensor(V_blk.shape()),
++          tile_shape_v,
++          make_coord(get<1>(blk_qv), _));
++      auto tVgV_blk = thr_copy_v.partition_S(local_tile(
++          gV_blk, TileShapePV{}, make_coord(_, _, 0), Step<X, _1, _1>{}));
++      auto pf_v = make_block_2d_prefetch<SGPerWG::value>(tile_shape_v, V_blk);
++      auto pVgV_blk = pf_v.get_slice(thr_id).partition_S(gV_blk);
++
++      /* GEMM 1: S = K * Q */
++      clear(tSrS);
++      for (int D = 0; D < size<4>(tKgK); D++) {
++        copy(copy_q, tQgQ(_, _, _, D), tQrQ);
++        copy(copy_k_blk, tKgK_blk(_, _, _, t, D), tKrK);
++        reorder(tQrQ, tSrQ);
++        reorder(tKrK, tSrK);
++        cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
++      }
++      prefetch(pf_v, pVgV_blk(_, _, _, t));
++      int8_prefetch_k(K + 1);
++
++      // S(:, j) *= k_scale[j]: per-token K dequantization (before masking).
++      CUTLASS_PRAGMA_UNROLL
++      for (int i = 0; i < tSrS.size(); i++) {
++        tSrS(i) *= broadcast<1>(ksc, tSrS, i);
++      }
++
++      /* Local/sliding window masking */
++      if constexpr (LocalMask) {
++        int decode_row = seq_len - 1 - full_tile_offset;
++        Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
++        Tensor gP = local_tile(
++            cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
++        auto cS_thread = thr_mma_qk.partition_C(gP);
++        CUTLASS_PRAGMA_UNROLL
++        for (int i = 0; i < tSrS.size(); ++i) {
++          int col_idx = get<1>(cS_thread(i)) - full_tile_offset;
++          bool left_mask = col_idx < decode_row - params.window_size_left;
++          bool right_mask = col_idx > decode_row + params.window_size_right;
++          if (left_mask || right_mask) {
++            tSrS(i) = ElementS(-INFINITY);
++          }
++        }
++      }
++
++      /* k masking for remainder tiles */
++      if (check_remainder_k && K == blk_k1 - 1) {
++        FragSCol k_rem_mask;
++        int k = get<0>(tKgK(0, 0, 0, K, 0)) + get_sub_group().get_local_id()[0];
++        CUTLASS_PRAGMA_UNROLL
++        for (int i = 0; i < k_rem_mask.size(); i++, k += intel::sg_size) {
++          k_rem_mask(i) =
++              (k < seq_len) ? ElementS(sycl::nan(0u)) : ElementS(-INFINITY);
++        }
++        CUTLASS_PRAGMA_UNROLL
++        for (int i = 0; i < tSrS.size(); i++) {
++          tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(k_rem_mask, tSrS, i));
++        }
++      }
++
++      softmax(effective_scale, K == blk_k0, tSrS, tA_max, tA_sum, tArA);
++      // P(:, j) *= v_scale[j]: per-token V dequantization, applied after the
++      // softmax row sums so the normalizer is unaffected.
++      CUTLASS_PRAGMA_UNROLL
++      for (int i = 0; i < tSrS.size(); i++) {
++        tSrS(i) *= broadcast<1>(vsc, tSrS, i);
++      }
++      reorder(tSrS, tArP);
++
++      /* GEMM 2: A += P * V, split in v dimension */
++      CUTLASS_PRAGMA_UNROLL
++      for (int VV = 0; VV < VTiles; VV++) {
++        copy(copy_v_blk, tVgV_blk(_, _, _, VV, t), tVrV);
++        reorder(tVrV, tArV);
++        cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
++      }
++      barrier();
++    };
++    if constexpr (Int8KV) {
++      int8_prefetch_k(blk_k0);
++    }
++
+     /* Main loop, blocked in k. */
+     int next_tile_idx;
+     for (int K = blk_k0; K < blk_k1; K++) {
++      if constexpr (Int8KV) {
++        int8_decode_tile(K);
++        continue;
++      }
+       /* Split barrier to keep threads together */
+       // barrier_arrive(ScopeWorkgroup);
+ 
 diff --git a/csrc/xpu/attn/xe_2/fmha_utils.hpp b/csrc/xpu/attn/xe_2/fmha_utils.hpp
-index 89c8132..2049d0b 100644
+index 89c8132..628d8c0 100644
 --- a/csrc/xpu/attn/xe_2/fmha_utils.hpp
 +++ b/csrc/xpu/attn/xe_2/fmha_utils.hpp
-@@ -139,6 +139,10 @@ struct chunk_policy_head512_b16 {
+@@ -11,7 +11,7 @@
+ #define HEAD_SIZE_LIMIT_5 512
+ #define HEAD_SIZE_LIMIT_6 576
+ 
+-enum class CutlassDType { half, bfloat16, float8_e4m3, float8_e5m2 };
++enum class CutlassDType { half, bfloat16, float8_e4m3, float8_e5m2, int8 };
+ 
+ // Struct to carry separate Q and K dtypes without breaking existing API
+ struct CutlassQKType {
+@@ -33,11 +33,13 @@ inline CutlassDType aten_to_dtype(const at::ScalarType st) {
+     return CutlassDType::float8_e4m3;
+   } else if (st == torch::kFloat8_e5m2) {
+     return CutlassDType::float8_e5m2;
++  } else if (st == torch::kChar) {
++    return CutlassDType::int8;  // KV only: per-token-head INT8 KV cache
+   }
+   TORCH_INTERNAL_ASSERT(
+       false,
+-      "Unsupported dtype: only half/bfloat16/float8_e4m3/float8_e5m2 supported "
+-      "for Q/K.");
++      "Unsupported dtype: only half/bfloat16/float8_e4m3/float8_e5m2 (and int8 "
++      "for KV) supported for Q/K.");
+ }
+ 
+ inline CutlassDType aten_to_dtype(const at::Tensor& t) {
+@@ -139,6 +141,10 @@ struct chunk_policy_head512_b16 {
  };
  
  // define decode policy
@@ -946,7 +1295,7 @@ index 89c8132..2049d0b 100644
  template <typename q_packed, typename head_dim, typename kv_tile>
  struct decode_policy_qpacked_head {
    static_assert(
-@@ -153,7 +157,7 @@ template <typename q_packed, typename head_dim>
+@@ -153,7 +159,7 @@ template <typename q_packed, typename head_dim>
  struct decode_policy_qpacked_head<q_packed, head_dim, _16> {
    using ShapeQK = Shape<q_packed, _16, _64>;
    using ShapePV = Shape<q_packed, _32, _16>;
@@ -955,7 +1304,7 @@ index 89c8132..2049d0b 100644
    using SubgroupLayoutQK = Layout<Shape<_1, _1, _1>>;
  };
  
-@@ -162,7 +166,7 @@ template <typename q_packed, typename head_dim>
+@@ -162,7 +168,7 @@ template <typename q_packed, typename head_dim>
  struct decode_policy_qpacked_head<q_packed, head_dim, _32> {
    using ShapeQK = Shape<q_packed, _32, _64>;
    using ShapePV = Shape<q_packed, _32, _32>;
@@ -964,7 +1313,7 @@ index 89c8132..2049d0b 100644
    using SubgroupLayoutQK = Layout<Shape<_1, _2, _1>>;
  };
  
-@@ -174,7 +178,7 @@ template <typename q_packed, typename head_dim>
+@@ -174,7 +180,7 @@ template <typename q_packed, typename head_dim>
  struct decode_policy_qpacked_head<q_packed, head_dim, _64> {
    using ShapeQK = Shape<q_packed, _64, _64>;
    using ShapePV = Shape<q_packed, _32, _64>;
@@ -973,7 +1322,7 @@ index 89c8132..2049d0b 100644
    using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
  };
  
-@@ -190,6 +194,6 @@ template <typename q_packed, typename head_dim>
+@@ -190,6 +196,6 @@ template <typename q_packed, typename head_dim>
  struct decode_policy_qpacked_head<q_packed, head_dim, _128> {
    using ShapeQK = Shape<q_packed, _128, _64>;
    using ShapePV = Shape<q_packed, _32, _128>;
@@ -1133,12 +1482,37 @@ index d1bc841..bb8ad48 100644
  
        // return softmax_lse
        if constexpr (SoftmaxLSE) {
+diff --git a/csrc/xpu/attn/xe_2/kernel/paged_decode_kernel.hpp b/csrc/xpu/attn/xe_2/kernel/paged_decode_kernel.hpp
+index 8f90189..08a0080 100644
+--- a/csrc/xpu/attn/xe_2/kernel/paged_decode_kernel.hpp
++++ b/csrc/xpu/attn/xe_2/kernel/paged_decode_kernel.hpp
+@@ -461,7 +461,8 @@ class XeFMHAFwdSplitKVKernel {
+           thr_id,
+           seq_len,
+           full_tile_offset,
+-          discard_seq_coord);
++          discard_seq_coord,
++          head);
+ 
+       if constexpr (
+           !is_empty_v<MainloopSharedStorage> &&
 diff --git a/csrc/xpu/attn/xe_2/paged_decode.hpp b/csrc/xpu/attn/xe_2/paged_decode.hpp
-index d31702b..664ad6c 100644
+index d31702b..91f5171 100644
 --- a/csrc/xpu/attn/xe_2/paged_decode.hpp
 +++ b/csrc/xpu/attn/xe_2/paged_decode.hpp
-@@ -143,6 +143,12 @@ struct paged_decode_args_t {
+@@ -141,8 +141,23 @@ struct paged_decode_args_t {
+   int64_t q_stride_heads = 0;
+   int64_t q_stride_batch = 0;
    int page_stride_elements = 0;
++  // INT8 per-token-head KV (key/value dtype int8): k_scale / v_scale point to
++  // fp32 scale caches [num_blocks, block_size, num_heads_kv]; strides in
++  // floats.
++  int64_t kv_scale_stride_block = 0;
++  int64_t kv_scale_stride_slot = 0;
++  int64_t kv_scale_stride_head = 0;
++  // Physical bytes between consecutive KV blocks (INT8 block-local split
++  // layout).
++  int64_t kv_page_stride_bytes = 0;
  };
  
 +template <typename Op>
@@ -1150,7 +1524,20 @@ index d31702b..664ad6c 100644
  template <class FMHAKernel, class ReductionSplitKernel, bool isVarLen>
  struct DecodeKernelLauncher {
    using StrideQ = typename FMHAKernel::StrideQ;
-@@ -418,16 +424,12 @@ struct DecodeKernelLauncher {
+@@ -334,7 +349,11 @@ struct DecodeKernelLauncher {
+          args.window_size_right,
+          // page_stride_elements: physical stride between paged blocks in
+          // seq-position units. It includes interleaved and cross-layer gaps.
+-         args.page_stride_elements},
++         args.page_stride_elements,
++         args.kv_scale_stride_block,
++         args.kv_scale_stride_slot,
++         args.kv_scale_stride_head,
++         args.kv_page_stride_bytes},
+         {},
+         hw_info,
+         args.num_kv_splits};
+@@ -418,16 +437,12 @@ struct DecodeKernelLauncher {
      const auto sycl_block = compat::dim3(block.x, block.y, block.z);
      const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
  
@@ -1170,7 +1557,7 @@ index d31702b..664ad6c 100644
          policy, queue, params);
  
      // event.wait();
-@@ -439,17 +441,14 @@ struct DecodeKernelLauncher {
+@@ -439,17 +454,14 @@ struct DecodeKernelLauncher {
        const auto reduce_sycl_block = compat::dim3(block.x, block.y, block.z);
        const auto reduce_sycl_grid =
            compat::dim3(reduce_grid.x, reduce_grid.y, reduce_grid.z);
@@ -1191,6 +1578,73 @@ index d31702b..664ad6c 100644
            reduce_policy, queue, reduce_params);
        // reduce_event.wait();
      }
+@@ -630,6 +642,21 @@ void decode_policy_dispatch_impl(
+           float_e5m2_t,
+           float_e5m2_t,
+           half_t>::kernel_dispatch(queue, args);
++    } else if (cuQKType.k_type == CutlassDType::int8) {
++      return PagedDecodeConfig<
++          typename decode_policy::ShapeQK,
++          typename decode_policy::ShapePV,
++          typename decode_policy::ShapeOut,
++          typename decode_policy::SubgroupLayoutQK,
++          void,
++          PipelineStages,
++          Causal,
++          Local,
++          Sink,
++          half_t,
++          int8_t,
++          int8_t,
++          half_t>::kernel_dispatch(queue, args);
+     }
+   } else if (cuQKType.q_type == CutlassDType::bfloat16) {
+     if (cuQKType.k_type == CutlassDType::bfloat16) {
+@@ -677,6 +704,21 @@ void decode_policy_dispatch_impl(
+           float_e5m2_t,
+           float_e5m2_t,
+           bfloat16_t>::kernel_dispatch(queue, args);
++    } else if (cuQKType.k_type == CutlassDType::int8) {
++      return PagedDecodeConfig<
++          typename decode_policy::ShapeQK,
++          typename decode_policy::ShapePV,
++          typename decode_policy::ShapeOut,
++          typename decode_policy::SubgroupLayoutQK,
++          void,
++          PipelineStages,
++          Causal,
++          Local,
++          Sink,
++          bfloat16_t,
++          int8_t,
++          int8_t,
++          bfloat16_t>::kernel_dispatch(queue, args);
+     }
+   }
+   TORCH_CHECK(
+diff --git a/csrc/xpu/attn/xe_2/paged_decode_xe2.cpp b/csrc/xpu/attn/xe_2/paged_decode_xe2.cpp
+index bec8b52..e83c907 100644
+--- a/csrc/xpu/attn/xe_2/paged_decode_xe2.cpp
++++ b/csrc/xpu/attn/xe_2/paged_decode_xe2.cpp
+@@ -227,6 +227,18 @@ void cutlass_paged_decode_impl(
+       is_varlen ? int64_t{0} : query.stride(0),
+       page_stride_elements};
+ 
++  // INT8 per-token-head KV: k_scale / v_scale are the per-token scale caches
++  // (validated in check_int8_kv_cache); the split layout's block stride is
++  // passed in bytes.
++  if (key_cache.scalar_type() == at::ScalarType::Char) {
++    args.k_scale = k_scale.value().data_ptr();
++    args.v_scale = v_scale.value().data_ptr();
++    args.kv_scale_stride_block = k_scale->stride(0);
++    args.kv_scale_stride_slot = k_scale->stride(1);
++    args.kv_scale_stride_head = k_scale->stride(2);
++    args.kv_page_stride_bytes = key_cache.stride(0);
++  }
++
+   // For non-contiguous paged KV (e.g., cross-layer KV cache), enlarge
+   // total_seqlen_k to cover the full physical extent for the 2D block
+   // load surface descriptor. Without this, block loads for blocks at
 diff --git a/csrc/xpu/gdn_attn/causal_conv1d.hpp b/csrc/xpu/gdn_attn/causal_conv1d.hpp
 index b7ba51f..9c09b02 100644
 --- a/csrc/xpu/gdn_attn/causal_conv1d.hpp
@@ -3050,6 +3504,207 @@ index 0000000..57fa952
 +
 +if __name__ == "__main__":
 +    main()
+diff --git a/tests/flash_attn/test_flash_attn_int8_kv.py b/tests/flash_attn/test_flash_attn_int8_kv.py
+new file mode 100644
+index 0000000..f983c85
+--- /dev/null
++++ b/tests/flash_attn/test_flash_attn_int8_kv.py
+@@ -0,0 +1,195 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""INT8 per-token-head KV cache (vLLM `int8_per_token_head`) for paged FA2.
++
++The cache uses the block-local split layout: per block
++[int8 K|V data for all (slot, head) | K scales fp32 | V scales fp32], i.e. the
++same bytes per block as vLLM's inline per-token-head layout. INT8 KV is
++supported by the paged decode kernel, including uniform speculative-decode
++batches (which the interface runs through the decode kernel); prefill / mixed
++batches are rejected (callers dequantize the referenced blocks and use the
++fp16/bf16 path). The kernel output is compared with an fp32 reference
++computed on the same quantized cache.
++"""
++import pytest
++import torch
++
++from tests.utils import format_tc
++from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
++
++NUM_HEADS = [(8, 8), (16, 4), (32, 4), (24, 2)]
++HEAD_SIZES = [64, 128, 192, 256, 512]
++BLOCK_SIZES = [16, 32, 64, 128]
++DTYPES = [torch.half, torch.bfloat16]
++SLIDING_WINDOWS = [None, 128]
++SINK = [False, True]
++MODES = ["decode", "spec_decode"]
++
++MINI_PYTEST_PARAMS = {
++    "default": {
++        "num_heads": [(16, 4)],
++        "head_size": [128, 256],
++        "block_size": [64],
++        "window": [None],
++    },
++}
++
++
++def quantize_per_token_head(x: torch.Tensor):
++    """vLLM int8_per_token_head write semantics (fp32): scale = absmax / 127,
++    round half away from zero, clamp to [-128, 127]."""
++    xf = x.float()
++    scale = torch.clamp(xf.abs().amax(-1) / 127.0, min=1e-6)
++    y = xf * (1.0 / scale)[..., None]
++    y = torch.where(y >= 0, y + 0.5, y - 0.5).clamp(-128.0, 127.0).trunc()
++    return y.to(torch.int8), scale
++
++
++def split_layout_views(raw, block_size, num_kv_heads, head_size):
++    """K/V int8 views [nb, B, H, D] and scale views [nb, B, H] over raw
++    [num_blocks, page_bytes] uint8."""
++    nb = raw.shape[0]
++    data = block_size * num_kv_heads * 2 * head_size
++    page = raw.shape[1]
++    assert page == 2 * (head_size + 4) * num_kv_heads * block_size
++    d = torch.as_strided(raw.view(torch.int8),
++                         (nb, block_size, num_kv_heads, 2 * head_size),
++                         (page, num_kv_heads * 2 * head_size, 2 * head_size,
++                          1))
++    f = raw.view(torch.float32)
++    sb = block_size * num_kv_heads * 4
++
++    def scales(off):
++        return torch.as_strided(f, (nb, block_size, num_kv_heads),
++                                (page // 4, num_kv_heads, 1),
++                                f.storage_offset() + off // 4)
++
++    return (d[..., :head_size], d[..., head_size:], scales(data),
++            scales(data + sb))
++
++
++def ref_attn(q, k, v, scale, q_pos, window, sinks):
++    g = q.shape[1] // k.shape[1]
++    k, v = k.repeat_interleave(g, 1), v.repeat_interleave(g, 1)
++    s = torch.einsum("qhd,khd->hqk", q, k) * scale
++    kpos = torch.arange(k.shape[0], device=q.device)
++    ok = kpos[None, :] <= q_pos[:, None]
++    if window:
++        ok &= (q_pos[:, None] - kpos[None, :]) < window
++    s = s.masked_fill(~ok[None], float("-inf"))
++    if sinks is not None:
++        m = torch.maximum(s.amax(-1), sinks[:, None].float())
++        p = torch.exp(s - m[..., None])
++        p = p / (p.sum(-1) + torch.exp(sinks[:, None].float() - m))[..., None]
++    else:
++        p = torch.softmax(s, -1)
++    return torch.einsum("hqk,khd->qhd", p, v)
++
++
++@pytest.mark.parametrize("mode", MODES)
++@pytest.mark.parametrize("num_heads", NUM_HEADS)
++@pytest.mark.parametrize("head_size", HEAD_SIZES)
++@pytest.mark.parametrize("block_size", BLOCK_SIZES)
++@pytest.mark.parametrize("window", SLIDING_WINDOWS)
++@pytest.mark.parametrize("is_sink", SINK)
++@pytest.mark.parametrize("dtype", DTYPES, ids=format_tc)
++@torch.inference_mode()
++def test_varlen_int8_kv(mode, num_heads, head_size, block_size, window,
++                        is_sink, dtype):
++    torch.manual_seed(0)
++    dev = "xpu"
++    hq, hkv = num_heads
++    # spec_decode: every sequence has the same q_len (<= seq_len).
++    seq_lens = [17, 64, 200, 1 if mode == "decode" else 3, 129]
++    q_lens = {
++        "decode": [1] * 5,
++        "spec_decode": [3] * 5,
++    }[mode]
++    nblk = [(L + block_size - 1) // block_size for L in seq_lens]
++    num_blocks = sum(nblk) + 3
++    page = 2 * (head_size + 4) * hkv * block_size
++    raw = torch.full((num_blocks, page), 0x7F, dtype=torch.uint8, device=dev)
++    kc, vc, ks, vs = split_layout_views(raw, block_size, hkv, head_size)
++    perm = (torch.randperm(num_blocks - 1, device=dev) + 1).to(torch.int32)
++    block_table = torch.zeros(len(seq_lens), max(nblk), dtype=torch.int32,
++                              device=dev)
++    keys, values, c = [], [], 0
++    for i, (L, n) in enumerate(zip(seq_lens, nblk)):
++        block_table[i, :n] = perm[c:c + n]
++        c += n
++        key = (torch.randn(L, hkv, head_size, device=dev) * 2).to(dtype)
++        key[:, :, 7] *= 20  # outlier channel, as in real K
++        val = torch.randn(L, hkv, head_size, device=dev).to(dtype)
++        pos = torch.arange(L, device=dev)
++        b = block_table[i, pos // block_size].long()
++        o = pos % block_size
++        kq, kscale = quantize_per_token_head(key)
++        vq, vscale = quantize_per_token_head(val)
++        kc[b, o], vc[b, o], ks[b, o], vs[b, o] = kq, vq, kscale, vscale
++        keys.append(kq.float() * kscale[..., None])
++        values.append(vq.float() * vscale[..., None])
++
++    q = torch.randn(sum(q_lens), hq, head_size, device=dev).to(dtype)
++    cu_q = torch.tensor([0] + torch.tensor(q_lens).cumsum(0).tolist(),
++                        dtype=torch.int32, device=dev)
++    seqused_k = torch.tensor(seq_lens, dtype=torch.int32, device=dev)
++    sinks = (torch.randn(hq, device=dev) * 2).to(dtype) if is_sink else None
++    scale = head_size**-0.5
++    out = torch.empty_like(q)
++    flash_attn_varlen_func(q,
++                           kc,
++                           vc,
++                           max(q_lens),
++                           cu_q,
++                           max(seq_lens),
++                           seqused_k=seqused_k,
++                           softmax_scale=scale,
++                           causal=True,
++                           window_size=[window - 1, 0] if window else None,
++                           block_table=block_table,
++                           out=out,
++                           k_descale=ks,
++                           v_descale=vs,
++                           s_aux=sinks)
++    ref = []
++    for i, (L, ql) in enumerate(zip(seq_lens, q_lens)):
++        q0 = int(cu_q[i])
++        ref.append(
++            ref_attn(q[q0:q0 + ql].float(), keys[i], values[i], scale,
++                     torch.arange(L - ql, L, device=dev), window, sinks))
++    torch.testing.assert_close(out.float(),
++                               torch.cat(ref),
++                               atol=1.5e-2,
++                               rtol=1.5e-2)
++
++
++@pytest.mark.parametrize("q_lens", [[33], [1, 4]])
++def test_varlen_int8_kv_rejects_prefill(q_lens):
++    """Batches routed to chunk prefill (non-uniform or long q) are rejected."""
++    dev = "xpu"
++    hq, hkv, head_size, block_size = 16, 4, 128, 64
++    page = 2 * (head_size + 4) * hkv * block_size
++    raw = torch.zeros((4, page), dtype=torch.uint8, device=dev)
++    kc, vc, ks, vs = split_layout_views(raw, block_size, hkv, head_size)
++    n = len(q_lens)
++    q = torch.randn(sum(q_lens), hq, head_size, device=dev, dtype=torch.half)
++    cu_q = torch.tensor([0] + torch.tensor(q_lens).cumsum(0).tolist(),
++                        dtype=torch.int32,
++                        device=dev)
++    with pytest.raises(RuntimeError, match="decode"):
++        flash_attn_varlen_func(q,
++                               kc,
++                               vc,
++                               max(q_lens),
++                               cu_q,
++                               64,
++                               seqused_k=torch.full((n, ),
++                                                    64,
++                                                    dtype=torch.int32,
++                                                    device=dev),
++                               causal=True,
++                               block_table=torch.ones((n, 1),
++                                                      dtype=torch.int32,
++                                                      device=dev),
++                               k_descale=ks,
++                               v_descale=vs)
 diff --git a/tests/flash_attn/test_flash_attn_varlen_func.py b/tests/flash_attn/test_flash_attn_varlen_func.py
 index 55aa520..727ef76 100644
 --- a/tests/flash_attn/test_flash_attn_varlen_func.py
@@ -5102,7 +5757,7 @@ index 0000000..046a99a
 +        )
 \ No newline at end of file
 diff --git a/vllm_xpu_kernels/flash_attn_interface.py b/vllm_xpu_kernels/flash_attn_interface.py
-index 1e2dc45..2518455 100644
+index 1e2dc45..ac05ce9 100644
 --- a/vllm_xpu_kernels/flash_attn_interface.py
 +++ b/vllm_xpu_kernels/flash_attn_interface.py
 @@ -1,4 +1,5 @@
@@ -5238,7 +5893,24 @@ index 1e2dc45..2518455 100644
  ):
      """
      FlashAttention interface for variable-length sequences, with optional
-@@ -387,6 +501,36 @@ def flash_attn_varlen_func(
+@@ -356,8 +470,14 @@ def flash_attn_varlen_func(
+ 
+     if softmax_scale is None:
+         softmax_scale = q.shape[-1]**(-0.5)
+-    k_descale = _normalize_descale_tensor(k_descale, "k_descale")
+-    v_descale = _normalize_descale_tensor(v_descale, "v_descale")
++    if k.dtype == torch.int8:
++        # INT8 per-token-head KV: k_descale / v_descale are the fp32 scale
++        # caches [num_blocks, block_size, num_heads_kv] (validated in C++).
++        assert k_descale is not None and v_descale is not None, \
++            "INT8 KV cache requires per-token-head k_descale and v_descale"
++    else:
++        k_descale = _normalize_descale_tensor(k_descale, "k_descale")
++        v_descale = _normalize_descale_tensor(v_descale, "v_descale")
+     # custom op does not support non-tuple input
+     real_window_size: tuple[int, int]
+     if window_size is None:
+@@ -387,6 +507,36 @@ def flash_attn_varlen_func(
                                             and v_descale is not None):
              raise NotImplementedError(
                  "FA2 only supports both KV cache descaled")
@@ -5275,7 +5947,7 @@ index 1e2dc45..2518455 100644
          # Compute per-seq splits and work_list on host, upload to device.
          # Only enable for decode (max_seqlen_q == 1) with paged KV cache,
          # multi-seq batches, and global num_splits_kv > 1.
-@@ -444,6 +588,7 @@ def flash_attn_varlen_func(
+@@ -444,6 +594,7 @@ def flash_attn_varlen_func(
                  is_mix_batch,
                  splits_per_seq_dev,
                  work_list_dev,
@@ -5283,7 +5955,7 @@ index 1e2dc45..2518455 100644
              )
          except RuntimeError as e:
              if "not compiled" not in str(e):
-@@ -567,5 +712,3 @@ def _fallback_varlen_attn(
+@@ -567,5 +718,3 @@ def _fallback_varlen_attn(
      if return_softmax_lse:
          return result[0], result[1]
      return result, None
