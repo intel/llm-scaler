@@ -70,7 +70,9 @@ contracts or a missing native companion, alongside the native XPU LLM
 decode/cache and deferred-state adapters paired with the Omni kernels in this
 checkout. Official AIMDO 0.6.0 uses
 the matching 0.6.0 provider source at `xiangyuT/comfy-aimdo-xpu`
-(`0f86ae803d741319c86cc8f978a540de4d99f991`). Both provider manifests
+(`3bc6afbcb92e10a2d4737e79d170190ed787bf89`), including the Linux native-hook
+fix that preserves Torch cache for faults already excluded by the pre-fault
+watermark. Both provider manifests
 accept their matching official 0.2.40 and 0.6.0 versions. AIMDO provider metadata
 comes from its source wheel; its builder has no manual release allowlist or
 version-to-upstream-commit table. This image selects the version combination and
