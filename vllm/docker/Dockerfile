@@ -13,7 +13,7 @@
 #   runtime         : torch 2.14.0+xpu + GPU UMD driver in /opt/venv.  Shipped.
 #
 # vLLM v0.31.0 requires separately built Rust extensions. The Intel PyTorch
-# runtime is installed into a Python 3.12.14 isolated venv. OMIX supplies
+# runtime is installed into a Python 3.12.15 isolated venv. OMIX supplies
 # the compiler and GPU UMD; its default Python 3.14 is not the wheel interpreter.
 #
 # Scope: vLLM v0.31.0 + vllm-xpu-kernels with Qwen3.8-Flash-Next and
@@ -31,7 +31,7 @@ ARG VLLM_XPU_KERNELS_COMMIT=ddf336d86e3c8602888572a3502f951abd51df12
 # LMCache v0.4.7 and KVWeave sources.
 ARG LMCACHE_COMMIT=307439a1d7a4eb49fcaac1b565ad5c3b3b3f918f
 ARG KVWEAVE_COMMIT=4eacc5a8613060a066655acb4f20edbd63a40703
-ARG PYTHON_VERSION=3.12.14
+ARG PYTHON_VERSION=3.12.15
 
 # =========================================================================
 # rust-build -- compile vLLM Rust extensions
@@ -88,7 +88,7 @@ ENV PATH="/root/.local/bin:${PATH}" \
 SHELL ["bash", "-c"]
 RUN --mount=type=secret,id=build-ca,target=/etc/ssl/certs/ca-certificates.crt \
     set -eo pipefail && \
-    curl -LsSf https://astral.sh/uv/0.12.5/install.sh | sh && \
+    curl -LsSf https://astral.sh/uv/0.12.22/install.sh | sh && \
     uv python install "${PYTHON_VERSION}"
 # Builds see only the shared ABI/version policy. The runtime lock is applied
 # in the runtime stage, so changing it does not invalidate native builds.
