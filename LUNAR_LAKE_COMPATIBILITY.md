@@ -53,7 +53,7 @@ The upstream image `vllm/vllm-openai-xpu:<tag>` is the reference environment. Th
 | GPT-OSS-20B | MXFP4 | 12.9 GiB | ~23 tok/s | — | reasoning-parser leaks with some harnesses |
 | Qwen3.5-9B dense | INT4 | ~6 GiB | 8–10 tok/s | — | dense = bandwidth-bound |
 
-Model load from NVMe is 36–40 s; KV cache is ~40–48 KiB/token for the 30B-class MoEs (32K ≈ 1.5 GiB).
+Model load from NVMe is 36–40 s. KV cache per token at bf16: GPT-OSS-20B 48 KiB (32K ≈ 1.5 GiB), Qwen3-Coder-30B-A3B 96 KiB (48 layers × 4 KV heads × 128; 32K ≈ 3.0 GiB), Qwen3.6-35B-A3B ~20 KiB plus a fixed GDN state per sequence (est.); fp8_e4m3 KV halves these but is not yet validated on this box. Read the "GPU KV cache size: N tokens" startup line rather than trusting these figures.
 
 ### Local patches still carried (v0.32.0)
 
