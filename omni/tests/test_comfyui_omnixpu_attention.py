@@ -31,7 +31,8 @@ def _pinned_comfy_attention_namespace():
     pinned_sources = {
         "bc0a142275a9b1ebacd42d75d674ac6ce74e1c6bbdedeb8fc52706599d4ad498": "b0b74356",
         "2e688c4c96ba10915c7ca847ea692faea3be4b9c2605d74d785b7abb23ee2502":
-            "426f5eea52a7ece1dd599fff4cb6cd1f352ddd24 (0.43.0)",
+            "426f5eea52a7ece1dd599fff4cb6cd1f352ddd24 (0.43.0), "
+            "989d93d0d968e704c589ce0146bb18c77f6b50cc (0.45.0)",
     }
     if hashlib.sha256(contents).hexdigest() not in pinned_sources:
         pytest.fail("explicit Comfy attention.py is not a pinned source")

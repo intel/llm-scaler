@@ -723,7 +723,7 @@ class ComfyUIImageContractTest(unittest.TestCase):
                 self.assertIn(label, dockerfile)
 
         pairs = (
-            ("comfy_kitchen.xpu", "0.2.40", "0.2.40", "https://github.com/xiangyuT/comfy-kitchen-xpu.git"),
+            ("comfy_kitchen.xpu", "0.2.41", "0.2.41", "https://github.com/xiangyuT/comfy-kitchen-xpu.git"),
             ("comfy_aimdo.xpu", "0.6.0", "0.6.0", "https://github.com/xiangyuT/comfy-aimdo-xpu.git"),
         )
         for provider_id, source_version, official_version, source_repository in pairs:
@@ -765,19 +765,19 @@ class ComfyUIImageContractTest(unittest.TestCase):
         mismatched_manifest = {
             "provider_distribution": {"version": "0.2.34"},
             "source": {
-                "version": "0.2.40",
+                "version": "0.2.41",
                 "repository": "https://github.com/xiangyuT/comfy-kitchen-xpu.git",
             },
             "canonical_distribution": {
-                "compatible_versions": ["0.2.40"]
+                "compatible_versions": ["0.2.41"]
             },
         }
         with self.assertRaisesRegex(RuntimeError, "distribution version"):
             validator.require_provider_version_compatibility(
                 "comfy_kitchen.xpu",
                 mismatched_manifest,
-                official_version="0.2.40",
-                provider_version="0.2.40",
+                official_version="0.2.41",
+                provider_version="0.2.41",
                 source_repository="https://github.com/xiangyuT/comfy-kitchen-xpu.git",
             )
         validator.require_provider_package_is_disjoint(
