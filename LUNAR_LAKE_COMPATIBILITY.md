@@ -1,8 +1,79 @@
 # Lunar Lake Xe2 140V Compatibility
 
-**Status: EXPERIMENTAL SUPPORT**
+**Status: WORKING on upstream vLLM-XPU (see "Current status" below). The sections after it are the original
+v0.14 / v0.19-era notes (March–April 2026) and are kept as history; where they disagree with "Current status",
+"Current status" wins.**
 
-This document describes how to run llm-scaler on Intel Lunar Lake platforms with the Arc 140V (Xe2) integrated GPU.
+This document describes how to run vLLM on Intel Lunar Lake platforms with the Arc 140V (Xe2) integrated GPU
+(MSI Claw 8 AI+, Core Ultra 7 258V, 32 GB LPDDR5x unified memory).
+
+## Current status (2026-11)
+
+### Stack that works
+
+| Component | Version in use | Notes |
+|---|---|---|
+| vLLM | **v0.32.0** (upstream, XPU backend) | v0.33.0 (Nov 2) has byte-identical XPU pins and is the next planned step; do not use `main` (torch 2.15 / kernels 0.1.17 churn) |
+| vllm-xpu-kernels | **0.1.15.4** (vLLM's pin) | 0.1.16.x ≥ .3 and 0.1.17 need torch 2.15 |
+| torch | **2.14.0+xpu** | bundles the oneAPI 2026.1 runtime (libsycl.so.9); no IPEX |
+| triton | 3.8.0+xpu | |
+| compute-runtime | ≥ 26.18 (26.27 is upstream's Docker reference) | 26.18+ does `/proc/meminfo`-based usable-memory accounting for iGPUs |
+| Mode | **eager** | XPU graphs are default-on since v0.31 and measured +3 % / 0 % with MTP on this box at ~1 GiB cost; pin eager explicitly |
+
+The upstream image `vllm/vllm-openai-xpu:<tag>` is the reference environment. The native-install scripts in
+`vllm/scripts/` and the Docker variant below are the v0.14/v0.19-era path and are kept for history only.
+
+### Rules learned the hard way
+
+1. **Never `source /opt/intel/oneapi/setvars.sh` at runtime.** torch ≥ 2.11 bundles its own SYCL runtime; putting
+   the system oneAPI libraries ahead of it on `LD_LIBRARY_PATH` produces the oneDNN "Backends mismatch" error.
+   oneAPI is needed only to *build* vllm-xpu-kernels from source. (Older sections of this file still say to
+   source it; ignore them.)
+2. `export SYCL_UR_USE_LEVEL_ZERO_V2=0` is required for eager mode on Xe2 (the V2 adapter is the default on
+   Lunar Lake). It also disables graph capture, which is fine because eager is the recommended mode.
+3. **Resident ceiling ≈ 21 GiB** for model weights + KV cache + activations (not 13 GiB as stated below). 28.57 GiB
+   is visible to the XPU; the rest is page cache, pinned buffers and the OS. Since v0.25 vLLM reads the driver's
+   usable-memory figure (`getMemoryInfo`), so the old "needs 2× RAM" symptom from page-cache miscounting is gone.
+4. **Crashed or killed launches leak Level Zero shared memory.** `sync && echo 3 | sudo tee /proc/sys/vm/drop_caches`
+   usually recovers it; after two or three failed launches only a reboot does. Never SIGKILL the engine, never
+   let a unit restart-loop.
+5. **MoE INT4 checkpoints must be symmetric INT4 in GPTQ or compressed-tensors packing.** AWQ-packed MoE does not
+   work on XPU (no AWQ→GPTQ repack; upstream PR #48552 still open). AutoRound checkpoints route through INC and
+   quantize all linears, so they are ~5 GiB smaller than experts-only GPTQ.
+6. GDN-hybrid models (Qwen3.5/3.6, Ornith) with native MTP need `--no-enable-prefix-caching` (upstream #53912).
+7. `--enable-auto-tool-choice --tool-call-parser gemma4|qwen3_coder` for agent harnesses; keep `--enforce-eager`.
+
+### Models measured on this console (single stream, eager)
+
+| Model | Quant | Resident | Decode | Prefill / TTFT | Notes |
+|---|---|---|---|---|---|
+| Gemma 4 26B-A4B | INT4 (QAT) | ~16 GiB + KV | ~30 tok/s | ~1000 tok/s | needs the home-made attention kernel + `--attention-backend FLASH_ATTN` on v0.32; v0.33.0 stops forcing Triton attention (#62014) |
+| Qwen3-Coder-30B-A3B | compressed-tensors sym INT4 gs32 | ~17 GiB | 18 tok/s | 756 tok/s, TTFT 1.35 s @ 1k | gs128 variants are ~10 tok/s |
+| Qwen3.6-35B-A3B / Ornith-1.5 | GPTQ INT4 + native MTP | 18–20 GiB | ~19 tok/s; 27.7 tok/s with MTP k=2 | — | prefix caching off with MTP |
+| GPT-OSS-20B | MXFP4 | 12.9 GiB | ~23 tok/s | — | reasoning-parser leaks with some harnesses |
+| Qwen3.5-9B dense | INT4 | ~6 GiB | 8–10 tok/s | — | dense = bandwidth-bound |
+
+Model load from NVMe is 36–40 s; KV cache is ~40–48 KiB/token for the 30B-class MoEs (32K ≈ 1.5 GiB).
+
+### Local patches still carried (v0.32.0)
+
+| Patch | Status |
+|---|---|
+| oneDNN engine/stream context fix ("Backends mismatch") | keep until located in the wheel diff; may be a packaging issue rather than code |
+| UMA memory-accounting fix (`MemorySnapshot.measure`; upstream PR #40295, stale) | probably deletable once the driver's `getMemoryInfo` is verified to track MemAvailable (work plan S10) |
+| Gemma 4 attention kernel + `FLASH_ATTN` override | must keep; the override becomes a plain launch flag on v0.33.0 |
+| Hybrid-MoE page-size cherry-pick (#40128) | **obsolete**: superseded upstream in v0.24 (#39931 + #45181); patch moved to `vllm/patches/attic/` |
+
+### Where the detail lives
+
+- `issues/vllm-xpu-status-2026-11-01.md` — latest upstream status, idea uptake, watchlist (and the Sep 2 report before it)
+- `issues/xpu-graph-status-2026-10-09.md` — why graphs stay off
+- `issues/vllm-v19-lunar-lake-findings.md` — the memory-ceiling and shared-memory-leak findings
+- `issues/stack-work-plan-2026-10-29.md` — the ordered plan for the next measurements
+- `issues/agent-harness-study-2026-10-22.md` — which coding/Telegram harness to put in front of the endpoint
+- `scripts/quant_kld.py` — KL-divergence and greedy-parity gate for quantized checkpoints
+
+---
 
 ## Architecture Compatibility
 
@@ -32,22 +103,16 @@ Deep analysis of the codebase revealed that the core SYCL ESIMD kernels are **fu
 ### Option A: Native Install (recommended for Lunar Lake)
 
 ```bash
-# 1. Install oneAPI (Fedora/Nobara)
-sudo dnf install intel-oneapi-basekit
+# Historical (v0.14/v0.19 era). Current path: use the upstream image or pip-install
+# vLLM v0.32.0/v0.33.0 with the pins from its requirements/xpu.txt (torch 2.14.0+xpu,
+# triton 3.8.0+xpu, vllm_xpu_kernels 0.1.15.4) into a Python 3.12 venv, and do NOT
+# source oneAPI at runtime. oneAPI is only needed to build vllm-xpu-kernels from source.
 
-# 2. Install Level-Zero for Xe2 iGPU
-sudo dnf install level-zero level-zero-devel
-
-# 3. Source oneAPI
-source /opt/intel/oneapi/setvars.sh --force
-
-# 4. Install PyTorch XPU
-pip install torch==2.10.0+xpu --extra-index-url=https://download.pytorch.org/whl/xpu
-
-# 5. Install vLLM with XPU support
-cd llm-scaler/vllm
-pip install -r patches/requirements-lunar-lake.txt  # if available
-# Or follow standard vLLM XPU install
+# 1. Driver: compute-runtime >= 26.18 and level-zero (Nobara: intel-compute-runtime, oneapi-level-zero)
+# 2. venv with Python 3.12
+# 3. pip install -r https://raw.githubusercontent.com/vllm-project/vllm/v0.32.0/requirements/xpu.txt
+#    pip install vllm==0.32.0  # or the matching +xpu wheel from wheels.vllm.ai/<version>/xpu/
+# 4. export SYCL_UR_USE_LEVEL_ZERO_V2=0
 
 # 6. Run evaluation
 ./tools/platform/evaluation/lunar_lake_evaluation.sh
@@ -85,13 +150,13 @@ Not all model architectures work on Lunar Lake XPU. Key blockers discovered duri
 | Blocker | Affected Models | Root Cause |
 |---------|----------------|------------|
 | **~~Triton XPU backend broken on Xe2~~** RESOLVED | Qwen3.5 (all sizes) | **Root cause: packaging bug, NOT hardware limitation.** The `install_lunar_lake.sh` script installed `triton-xpu` without first uninstalling the plain `triton` package (pulled in as a transitive dependency by vllm-xpu-kernels). Plain `triton`'s `libtriton.so` lacks the Intel backend, causing `ImportError: cannot import name 'intel'` and `TypeError: 'function' object is not subscriptable`. **Fix:** `pip uninstall triton triton-xpu -y && pip install triton-xpu==3.6.0`. Also requires `oneapi-level-zero-devel` for Triton's JIT compilation of `driver.c → spirv_utils.so` (needs `level_zero/ze_api.h`). Install scripts updated. Intel's Docker always did the uninstall-first pattern — that's why it worked. |
-| **Marlin kernels are CUDA-only** | AWQ, GPTQ (compressed-tensors format) | `gptq_marlin_repack` is an NVIDIA CUDA kernel. AWQ/GPTQ MoE models route to `CompressedTensorsWNA16MarlinMoEMethod`. **Note:** Intel has an `ipex marlin` backend for MXFP4 (used by gpt-oss-20b), but this is a separate implementation — GPTQ/AWQ Marlin is NOT ported to XPU. |
-| **Shared memory ceiling ~13 GiB** | AutoRound/GPTQ models >14B | Both AutoRound and sym_int4 use layer-by-layer `process_weights_after_loading` (peak ≈ initial load + one layer overhead, NOT 2x). However, models with >13 GiB loaded weights OOM due to IPEX kernel buffers + KV cache pre-allocation + OS overhead competing for the same 32GB shared pool. gpt-oss-20b (13.27 GiB) is the largest model that fits. |
+| **~~Marlin kernels are CUDA-only~~** PARTLY RESOLVED (2026-04, v0.19 + kernels 0.1.5) | AWQ-packed MoE only | GPTQ-packed and compressed-tensors **symmetric** INT4 MoE now run through the native XPU grouped-GEMM INT4 path (Qwen3-Coder-30B-A3B at 18 tok/s, Qwen3.6-35B-A3B at ~19 tok/s). AWQ-packed MoE still has no XPU repack (upstream #48552 open). |
+| **~~Shared memory ceiling ~13 GiB~~** CORRECTED | — | The practical ceiling is **~21 GiB resident** (weights + KV + activations) once the v0.19-era memory-profile bug was fixed and vLLM (v0.25+) started reading the driver's usable-memory figure. Qwen3.6-35B-A3B at 18–20 GiB fits. See "Current status" and `issues/vllm-v19-lunar-lake-findings.md`. |
 | **transformers 5.x `max_pixels` rename** | Qwen3.5 multimodal models | vLLM pins `transformers<5`. Upgrading to 5.x enables `qwen3_5`/`glm4_moe_lite` architecture recognition but renames `image_processor.max_pixels` → `size["longest_edge"]`. Fix: `getattr()` fallback in `qwen2_vl.py` (see limitation #12). Intel's Docker image applies `vllm_for_multi_arc.patch` which includes full Qwen3.5 support. |
 
 ### What DOES Work
 
-**Practical model size limit for sym_int4 on 32GB Lunar Lake:** ≤ ~10B dense params. sym_int4 requires loading the full BF16 model into CPU RAM for quantization — on the Claw, CPU and GPU share the same 32GB. A 10B model = ~20 GiB BF16, leaving room for OS + KV cache. Models >10B need pre-quantized formats (AutoRound/GGUF) or llama.cpp with Vulkan.
+*(Historical, v0.19 era; see "Current status" for the models that run today.)* **Practical model size limit for sym_int4 on 32GB Lunar Lake:** ≤ ~10B dense params. sym_int4 requires loading the full BF16 model into CPU RAM for quantization — on the Claw, CPU and GPU share the same 32GB. A 10B model = ~20 GiB BF16, leaving room for OS + KV cache. Models >10B need pre-quantized formats (AutoRound/GGUF) or llama.cpp with Vulkan.
 
 Only models meeting **all three** criteria work on Lunar Lake XPU:
 1. **Standard attention** or **fla/linear attention with Triton** (requires correct `triton-xpu` install — see blocker fix above)
@@ -120,11 +185,10 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 |-------|--------|-------------|
 | ~~Qwen3.5-* (any size)~~ | Any | ~~Triton kernel crash~~ **RESOLVED & VERIFIED** — was a packaging bug (plain `triton` shadowing `triton-xpu`). Qwen3.5-4B now runs successfully with correct triton-xpu install + `torch.cuda→torch.xpu` patches + `oneapi-level-zero-devel`. See benchmark results below. |
 | GLM-4.7-flash AWQ | AWQ 4-bit | `CompressedTensorsWNA16MarlinMoEMethod` → `gptq_marlin_repack` CUDA kernel missing. Dense layers work via `XPUwNa16LinearKernel` but MoE layers still route to Marlin. compressed-tensors MoE has no XPU redirect. |
-| GLM-4.7-flash AutoRound INT4 | AutoRound | IPEX routing works (no Marlin error) but **OOM → DEVICE_LOST** during weight init. 30B-A3B MoE model — loaded weights exceed ~13 GiB practical ceiling on 32GB shared memory. Confirmed with 32GB swap enabled. |
-| Qwen3.5-35B-A3B GPTQ | GPTQ INT4 | OOM + GPU DEVICE_LOST at 79% loading |
-| Qwen3.5-35B-A3B AutoRound | AutoRound INT4 | OOM — ~18 GiB loaded weights exceed ~13 GiB practical ceiling on 32GB shared memory |
-| Qwen3-30B-A3B GPTQ INT4 | GPTQ INT4 | Loads 15.7 GiB via IPEX, OOM during MoE expert weight shuffle → DEVICE_LOST |
-| Qwen3-Coder-30B-A3B AWQ | AWQ 4-bit | Same compressed-tensors MoE Marlin issue as GLM AWQ + 30B OOM risk |
+| GLM-4.7-flash AutoRound INT4 | AutoRound | v0.14-era: OOM → DEVICE_LOST at the old 13 GiB ceiling. Later work on the MLA/MoE paths is in `issues/glm4-*.md`. |
+| ~~Qwen3.5-35B-A3B GPTQ / AutoRound~~ | INT4 | **NOW WORKING** (v0.19+, kernels ≥ 0.1.5): 18–20 GiB resident, ~19 tok/s, 27.7 tok/s with MTP k=2 on the Qwen3.6 successor. The old OOM was the v0.14/v0.19 memory-profile bug, not the hardware. |
+| ~~Qwen3-30B-A3B GPTQ INT4~~ | GPTQ INT4 | **NOW WORKING** via the native XPU INT4 grouped-GEMM path (`issues/vllm-v19-lunar-lake-findings.md`). gs32 ≈ 18 tok/s, gs128 ≈ 10 tok/s. |
+| Qwen3-Coder-30B-A3B AWQ | AWQ 4-bit | AWQ-packed MoE still unsupported on XPU. **Use the compressed-tensors sym INT4 gs32 checkpoint instead — 18 tok/s, working.** |
 | ~~Qwen3.5-4B AutoRound INT4~~ | AutoRound | **NOW WORKING** — 3.68 GiB, 23.4 tok/s single-user, 159 tok/s batched. Moved to recommended models. Required fixes: (1) `triton-xpu` clean install, (2) `oneapi-level-zero-devel`, (3) `torch.cuda→torch.xpu` patches, (4) `getattr()` fix for `max_pixels`. |
 | ~~gpt-oss-20b~~ | MXFP4 (pre-quant) | **RESOLVED** — was hanging during `profile_run()` in KV cache init. Fixed by setting `VLLM_SKIP_PROFILE_RUN=1` (see patch `vllm_xpu_worker_skip_profile.patch`). Now loads and serves successfully. See "Recommended Models" table above. |
 | LFM2-24B-A2B AWQ | AWQ 4-bit | Custom Liquid AI tokenizer (`TokenizersBackend`) not supported |
@@ -136,17 +200,18 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 # Required for Lunar Lake
 export VLLM_TARGET_DEVICE=xpu
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 export PYTORCH_ALLOC_CONF="expandable_segments:True"
+
+# Required for eager mode on Xe2 (and it disables graph capture, which we want)
+export SYCL_UR_USE_LEVEL_ZERO_V2=0
 
 # Shared memory mode (no P2P)
 export CCL_TOPO_P2P_ACCESS=0
 
-# Skip profile_run() — required for Lunar Lake iGPU (hangs during dummy forward pass)
-export VLLM_SKIP_PROFILE_RUN=1
+# Historical (v0.14/v0.19 only): VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 for online sym_int4,
+# VLLM_SKIP_PROFILE_RUN=1 for the profile_run() hang. Neither is needed on v0.25+.
 
-# Source oneAPI
-source /opt/intel/oneapi/setvars.sh --force
+# Do NOT source /opt/intel/oneapi/setvars.sh here — see "Rules learned the hard way".
 ```
 
 ## vLLM Launch Flags
@@ -167,8 +232,8 @@ Key flags:
 - `VLLM_TARGET_DEVICE=xpu` — **Environment variable** (NOT `--device xpu`, which is not a valid CLI flag)
 - `--tensor-parallel-size 1` — Single iGPU (no multi-GPU)
 - `--gpu-memory-utilization 0.7` — Conservative for shared memory (leave room for OS)
-- `--enforce-eager` — Disable CUDA graphs (XPU uses eager mode)
-- `--quantization int4` — Online INT4 quantization for fitting larger models in shared memory
+- `--enforce-eager` — Keep eager. XPU graph mode is default-on since v0.31 and buys nothing on this box (see `issues/xpu-graph-status-2026-10-09.md`)
+- `--quantization int4` — Historical: online INT4 was the v0.14/v0.19 IPEX path. Use pre-quantized sym INT4 (GPTQ / compressed-tensors) or AutoRound checkpoints on v0.32+
 - `--allow-deprecated-quantization` — Required for pre-quantized AutoRound/GPTQ models
 
 ## CCL Single-GPU Workaround
@@ -192,6 +257,9 @@ export CCL_SOCKET_IFNAME=wlo1  # or your WiFi interface name
 Additionally, the `all_reduce` warmup in `vllm/v1/worker/xpu_worker.py` (lines ~201-203) must be patched out for single-GPU. The `install_lunar_lake.sh` script does this automatically.
 
 ## Benchmark Results: gpt-oss-20b (MXFP4)
+
+> **Historical.** Everything from here down was measured on the v0.14/v0.19 stacks (March–April 2026).
+> Current numbers are in "Current status" at the top and in `issues/`.
 
 **Model:** openai/gpt-oss-20b (13.27 GiB loaded, MXFP4 pre-quantized)
 **Architecture:** Dense transformer, 13B actual parameters (despite "20b" name)
@@ -293,7 +361,7 @@ The script automatically sets all required environment variables including `VLLM
 ### Manual launch
 
 ```bash
-source /opt/intel/oneapi/setvars.sh --force
+# (Historical. On v0.25+ do NOT source oneAPI; export SYCL_UR_USE_LEVEL_ZERO_V2=0 instead.)
 
 export VLLM_TARGET_DEVICE=xpu
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -358,11 +426,11 @@ gpt-oss-20b supports three thinking levels controlled via system prompt:
 3. **No PCIe P2P** — CCL collective operations run in USM mode, not P2P.
 4. **Bandwidth-bound TG** — Token generation speed is limited by LPDDR5x bandwidth (136.5 GB/s), similar to the Vulkan path.
 5. **Platform installer** — The B60 offline installer (BMG firmware, Xeon kernel) does not apply. Use native oneAPI install instead.
-6. **~13 GiB practical model ceiling** — Both AutoRound INT4 and sym_int4 use layer-by-layer `process_weights_after_loading` (peak ≈ initial load + one layer overhead, NOT 2x). However, models with loaded weights exceeding ~13 GiB OOM because IPEX kernel buffers, KV cache pre-allocation, MoE expert weight shuffling, and OS overhead all compete for the same 32GB shared pool. gpt-oss-20b (13.27 GiB) is the largest confirmed working model. Qwen3.5-35B-A3B (~18 GiB), GLM-4.7-flash (~15-17 GiB), and Qwen3-30B-A3B (~17.5 GiB) all fail with DEVICE_LOST.
-7. **GPU crash requires reboot** — If vLLM OOMs and the GPU enters `UR_RESULT_ERROR_DEVICE_LOST` state, a full system reboot is required to reset the GPU.
+6. **~~13 GiB~~ → ~21 GiB practical resident ceiling** — The 13 GiB figure came from the v0.14/v0.19 memory-profile bug. With that fixed and v0.25+ reading the driver's usable-memory figure, weights + KV + activations up to ~21 GiB run (Qwen3.6-35B-A3B INT4 at 18–20 GiB works). Keep ~2 GiB of MemAvailable headroom; zram makes INT4 weights thrash, use a disk swapfile.
+7. **Crashed launches leak Level Zero shared memory** — `sync && echo 3 | sudo tee /proc/sys/vm/drop_caches` usually recovers enough to relaunch; after two or three failed launches, or on `UR_RESULT_ERROR_DEVICE_LOST`, only a reboot resets the GPU. Never SIGKILL the engine and never let a service restart-loop.
 8. **Build time** — vllm-xpu-kernels compilation (933 SYCL files) takes **1.5-2 hours** on Lunar Lake. Ensure the device is plugged in and sleep is disabled (`systemctl mask sleep.target suspend.target`).
 9. **~~Triton XPU broken on Xe2~~ RESOLVED — packaging bug** — The native install scripts installed `triton-xpu` without first removing the plain `triton` package. The `vllm-xpu-kernels` build pulls in plain `triton` as a transitive dependency, and its `libtriton.so` (which lacks the Intel backend) shadows `triton-xpu`'s version. This caused `ImportError: cannot import name 'intel' from 'triton._C.libtriton'`, which made `@triton.jit` kernels degrade to plain functions (`TypeError: 'function' object is not subscriptable`). **Fix:** `pip uninstall triton triton-xpu -y && pip install triton-xpu==3.6.0`. Additionally, `oneapi-level-zero-devel` must be installed for Triton's Intel backend to JIT-compile `driver.c → spirv_utils.so` (requires `level_zero/ze_api.h` header). Intel's Docker images always did the uninstall-first pattern — the bug was only in the native install scripts. The `triton-xpu` source code explicitly recognizes `lnl` (Lunar Lake) as a valid architecture — there is NO iGPU exclusion. Install scripts have been updated.
-10. **Marlin kernels CUDA-only** — AWQ and GPTQ models using compressed-tensors format route to Marlin repack kernels (`_C.gptq_marlin_repack`), which are NVIDIA CUDA kernels with no XPU equivalent. Pre-quantized AWQ/GPTQ models cannot be used on XPU.
+10. **~~Marlin kernels CUDA-only~~ (partly resolved)** — Since v0.19 + kernels 0.1.5, GPTQ-packed and compressed-tensors symmetric INT4 (dense and MoE) run on native XPU kernels. Only AWQ-packed MoE remains unsupported (no repack; upstream #48552 open).
 11. **Download FP16 base models** — For models without pre-quantized INT4 weights, download FP16/BF16 base weights and use vLLM's online quantization (`--quantization fp8` or `--quantization int4`). Both online and pre-quantized (AutoRound) paths use layer-by-layer weight processing. Pre-quantized INT4 (AutoRound) is preferred when available — smaller initial load (~9 GiB vs ~18 GiB for BF16), same inference speed.
 12. **transformers 5.x `max_pixels` rename** — vLLM pins `transformers<5,>=4.56.0`. Upgrading to 5.x for Qwen3.5/GLM-4.7 architecture recognition breaks `Qwen2VLImageProcessor.max_pixels` — the attribute was renamed to `size["longest_edge"]` (and `min_pixels` to `size["shortest_edge"]`). Intel's llm-scaler Docker image installs transformers from git HEAD and applies `vllm_for_multi_arc.patch` which adds full Qwen3.5 support. On a native install without the patch, apply the one-line fix below:
     ```python
@@ -913,6 +981,8 @@ huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-Base --local-dir /shared/model
 
 ```bash
 source ~/qwen-tts-env/bin/activate
+# (This TTS venv is separate from the vLLM venv; sourcing oneAPI here is fine for it,
+#  but never do it in the shell that launches vLLM.)
 oneapi   # alias for: source /opt/intel/oneapi/setvars.sh --force
 ```
 

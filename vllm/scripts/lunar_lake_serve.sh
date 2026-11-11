@@ -21,12 +21,20 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-# === Source oneAPI ===
-if [ -f /opt/intel/oneapi/setvars.sh ]; then
+# === oneAPI: NOT sourced at runtime ===
+# torch >= 2.11 bundles its own SYCL runtime; putting /opt/intel/oneapi ahead of it on
+# LD_LIBRARY_PATH causes oneDNN "Backends mismatch" on Lunar Lake. Only the v0.14/v0.19
+# IPEX-era venvs needed it. Opt in explicitly for those: LUNAR_LAKE_SOURCE_ONEAPI=1
+if [ "${LUNAR_LAKE_SOURCE_ONEAPI:-0}" = "1" ] && [ -f /opt/intel/oneapi/setvars.sh ]; then
     set +euo pipefail
     source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
     set -euo pipefail
+    echo -e "${YELLOW}[Lunar Lake vLLM]${NC} oneAPI sourced (legacy mode)"
 fi
+
+# Eager mode on Xe2 needs the legacy Level Zero adapter (also disables graph capture,
+# which is the recommended state on this hardware).
+export SYCL_UR_USE_LEVEL_ZERO_V2=0
 
 # === Fix MKL library path ===
 # PyTorch bundles MKL stubs with relative RPATHs that break in venvs.
@@ -78,9 +86,8 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export PYTORCH_ALLOC_CONF="expandable_segments:True"
 # USM mode for shared memory (no P2P needed)
 export CCL_TOPO_P2P_ACCESS=0
-# Skip profile_run() during KV cache init — the dummy forward pass hangs
-# indefinitely on Lunar Lake iGPU (Xe2/BMG). Instead, estimate peak memory
-# from current allocation. Requires the corresponding xpu_worker.py patch.
+# Historical (v0.14/v0.19 + xpu_worker.py patch): skip the profile_run() that hung on
+# Lunar Lake. Harmless on v0.25+, which reads the driver's usable-memory figure instead.
 export VLLM_SKIP_PROFILE_RUN=1
 
 # === CCL single-GPU workaround ===
@@ -109,7 +116,7 @@ echo "────────────────────────�
 # Device is set via VLLM_TARGET_DEVICE=xpu (not a CLI flag)
 # --tensor-parallel-size 1:  Single GPU (integrated)
 # --gpu-memory-utilization:  Conservative for shared memory (leave room for OS + KV cache)
-# --enforce-eager:           Disable CUDA graphs (not supported on XPU)
+# --enforce-eager:           Keep eager; XPU graphs (default-on since v0.31) measured +3%/0% here at ~1 GiB cost
 exec vllm serve "$MODEL" \
     --tensor-parallel-size 1 \
     --gpu-memory-utilization 0.7 \

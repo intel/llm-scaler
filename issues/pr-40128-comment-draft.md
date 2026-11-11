@@ -1,3 +1,8 @@
+> **OBSOLETE (2026-11-01) — do not post.** PR #40128 was closed unmerged by its author on 2026-04-21; the
+> equivalent page-size padding landed upstream via #39931 and #45181 (first in v0.24.0), and v0.32.0 already pads
+> MambaSpec and non-MLA attention pages. The local cherry-pick is retired to `vllm/patches/attic/`.
+> If KV capacity on hybrid models matters later, watch upstream #63347 instead.
+
 # Draft comment for vllm-project/vllm PR #40128
 
 Target: https://github.com/vllm-project/vllm/pull/40128
