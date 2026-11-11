@@ -23,12 +23,12 @@ Columns: **A** = Linux + vLLM XPU (today). **B** = Linux + llama.cpp (Vulkan). *
 |---|---|---|---|---|
 | OS idle memory | ~3.9 GiB KDE+browser (here, inferred); headless less (est.) | same as A | 6.2-8.6 GB (other: Claw units) | same as C |
 | Usable iGPU budget | 28.57 GiB to Level Zero (here); ~21 GiB practical (here) | ANV heap ~23.7 GB (here); ~22-23 GiB practical (here, derived) | default 57% ≈ 18 GiB (other: 18409 MB on a Claw 8); 85-87% ≈ 27.3 GiB (other: 258V) | same cap as C |
-| Largest model + context | Qwen3.6-35B INT4 18-20 GiB; Qwen3-Coder gs32 at 32K at the ceiling (here) | Qwen3.5-35B Q4_K_XL 19.3 GiB at 32K, ~1 GB headroom (here) | default: ~15-16 GiB (est.); override: ~20-22 GiB (est.) [unverified] | 30B MoE fits at 87%; 30B + 14B do not co-reside (other) |
+| Largest model + context | Qwen3.6-35B INT4 18-20 GiB; Qwen3-Coder gs32 at 32K at the ceiling (est.) | Qwen3.5-35B Q4_K_XL 19.3 GiB at 32K, ~1 GB headroom (here) | default: ~15-16 GiB (est.); override: ~20-22 GiB (est.) [unverified] | 30B MoE fits at 87%; 30B + 14B do not co-reside (other) |
 | Qwen3-Coder-30B-A3B at 32K | device 20.8-21.3 + host 2.0 GiB (est. from parts measured here) | IQ4_XS 17.4-17.9 / Q4_K_M 19.4-19.9 + 0.3-0.5 GiB (est.) | same as B (est.) | ~16 GB weights; "19 GB+ VRAM" recommended (vendor doc) |
-| Decode tok/s | 18 Coder gs32; 19 / 27.7 MTP Qwen3.6; 23 GPT-OSS; 30 Gemma 4 (here) | 9.5-16.9, old build (here); 25.8 Qwen3.6 SYCL (other: 288V) | ~25 Qwen3-30B partial offload, c=1024 (other: Claw 8); 17.2 Ollama (other: 258V) | 38 median, 31 accuracy-safe (other: 258V); 15.7 at ~11.7K (other: OpenVINO, 16 GB 258V) |
+| Decode tok/s | 18 Coder gs32 (v0.19); 19 / 27.7 MTP Qwen3.6 (v0.30, MXFP4); 23 GPT-OSS (v0.19); 30 Gemma 4 (here) | 9.5-16.9, old build (here); 25.8 Qwen3.6 SYCL (other: 288V) | ~25 Qwen3-30B partial offload, c=1024 (other: Claw 8); 17.2 Ollama (other: 258V) | 38 median, 31 accuracy-safe (other: 258V); 15.7 at ~11.7K (other: OpenVINO, 16 GB 258V) |
 | 16K agent prompt TTFT | cold 20.3 s, warm 0.4 s (here, GPT-OSS, older stack); Qwen3.6+MTP re-prefills every turn | ~70-95 s cold (est. from 159-235 tok/s here); prompt cache when warm | ~3 min (est. from 83 tok/s, other) | ~60 s (est. from 260 tok/s at 11.7K, other) |
 | Concurrency | paged batching: 5 streams 49 tok/s aggregate (here, older stack) | continuous batching, unified KV; not measured | same code; Windows read-back ~10x slow on slot swaps (other: 140T) | continuous batching; not measured on a 140V |
-| Model switch | 36-40 s load (here) + leak risk | ~5-15 s (est.); router, `/models/unload`, sleep-idle | same as B (est.) + reboot to change OS | not found |
+| Model switch | 36-40 s load (here, v0.19) + leak risk | ~5-15 s (est.); router, `/models/unload`, sleep-idle | same as B (est.) + reboot to change OS | not found |
 | GUI apps | Open WebUI / Jan via OpenAI API | LM Studio, Jan, Ollama Linux builds + Open WebUI | LM Studio (iGPU off by default), Jan, Ollama (`OLLAMA_IGPU_ENABLE=1`), AI Playground | AI Playground (beta); Open WebUI against OVMS |
 | Agent harnesses | native; `qwen3_coder`/`gemma4`/`openai` parsers | native; `--jinja` default, Qwen3-Coder XML parser | pi needs Git Bash; OpenClaw recommends a WSL2 gateway; nanobot native | same as C; parsers `qwen3coder`, `gptoss`, `gemma4` |
 | Always-on reliability | systemd; Level Zero leak after crashes, no restart loops, local patches | systemd; no leak recorded | Win11 Home: monthly reboots, 35-day pause; single-reporter TDR/garbage bugs; override resets | same Windows ops; ovms.exe can run as a service |
@@ -37,7 +37,7 @@ Columns: **A** = Linux + vLLM XPU (today). **B** = Linux + llama.cpp (Vulkan). *
 
 ## 3. Memory: worked budget, one 30B-A3B at 32K on 32 GB
 
-Model: Qwen3-Coder-30B-A3B. KV is 96 KiB/token at bf16 (here), so 3.0 GiB at 32K, or 1.59 GiB at q8_0 (est.). MemTotal is 30.9 GiB (here); I assume the same usable total on Windows (est.; the ~1.1 GiB firmware reserve applies to both OSes). "OS + desktop" uses the inferred 3.9 GiB on Linux, with the repo's conservative 6.3 GiB (2.3 reserve + 4 desktop) shown in brackets.
+Model: Qwen3-Coder-30B-A3B. KV is 96 KiB/token at bf16 (est., from config; confirm with the startup line), so 3.0 GiB at 32K, or 1.59 GiB at q8_0 (est.). MemTotal is 30.9 GiB (here); I assume the same usable total on Windows (est.; the ~1.1 GiB firmware reserve applies to both OSes). "OS + desktop" uses the inferred 3.9 GiB on Linux, with the repo's conservative 6.3 GiB (2.3 reserve + 4 desktop) shown in brackets.
 
 | Item (GiB) | A vLLM gs32, bf16 KV | B llama.cpp IQ4_XS, q8_0 KV | C Windows llama.cpp IQ4_XS, q8_0 KV | D Windows OVMS int4-ov, u8 KV |
 |---|---|---|---|---|
@@ -54,7 +54,7 @@ Takeaways:
 - Whether the "(16GB)" in llama.cpp #18946 is a 16 GB cap or just the device-name string is disputed [unverified]. Measure `--list-devices` on Windows.
 - Windows also counts allocations against the commit limit (RAM + pagefile), so keep the pagefile system-managed. The claim that Windows pages out an idle llama-server's Vulkan weights is [unverified]: VidMm, not working-set trimming, manages those allocations.
 - Linux trap: zram makes INT4 weights thrash (owner note, here). Keep the 16 GB disk swapfile from the post-install script, and keep at least 2 GiB MemAvailable.
-- Headless Linux (`systemctl isolate multi-user.target`) has no measured figure. It should free most of the 3.9 GiB desktop share (est.).
+- Headless Linux (`systemctl isolate multi-user.target`) has no measured figure. Headless gain is TBD (1.5–3.9 GiB est.) until measured; 3.9 GiB is the inferred OS + desktop total, not the desktop share alone. The bracketed [6.3] figures above count the 2.29 GiB driver guard as consumed RAM; it is not.
 
 ## 4. Speed and features by job
 
@@ -87,9 +87,10 @@ How to get a GUI on Linux + vLLM:
 ```
 SYCL_UR_USE_LEVEL_ZERO_V2=0   # never source oneAPI setvars at runtime
 vllm serve <Qwen3-Coder-30B-A3B sym INT4 gs32> --enforce-eager \
-  --max-model-len 32768 --gpu-memory-utilization 0.7 \
+  --max-model-len 24576 --kv-cache-memory-bytes 2415919104 \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder
 ```
+- Qwen3-Coder: 24576 with bf16 KV until FP8 KV is validated (work plan S12a), then `--max-model-len 32768 --kv-cache-dtype fp8_e4m3 --kv-cache-memory-bytes 1610612736`. Do not size KV from `--gpu-memory-utilization`.
 - For Qwen3.6 with MTP, use the owner's existing MTP k=2 config and add `--no-enable-prefix-caching`. Use it for bots and short-context work, not long coding sessions.
 - Unit: `Restart=on-failure`, `RestartSec=60`, `StartLimitBurst=2`, a graceful stop signal (SIGINT/SIGTERM, never SIGKILL), `TimeoutStopSec=60`, and an `ExecStartPre` check that refuses to start if XPU free memory is below ~22 GiB.
 - System: zram off, 16 GB disk swapfile, sleep masked on AC, the WiFi D3cold units from the post-install script, and game-watch that stops vLLM and reroutes the bots.

@@ -1,5 +1,7 @@
 # PR body: [Platform][XPU] Opt-in integrated-GPU override for unified memory
 
+> **Premise stale (2026-11-11):** since #47134 (v0.25) vLLM reads `getMemoryInfo`, not `torch.xpu.mem_get_info`. Rewrite only after the work-plan S10 run. An `is_integrated_gpu` override would also activate #49760's 8 GiB UMA host reserve if that PR merges, unless the same PR sets the reserve to 0 for lnl_m.
+
 Target: `vllm-project/vllm` main
 Branch: `MegaStood:xpu-integrated-gpu-mem` → https://github.com/MegaStood/vllm/tree/xpu-integrated-gpu-mem
 

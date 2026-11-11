@@ -13,7 +13,7 @@ This document describes how to run vLLM on Intel Lunar Lake platforms with the A
 
 | Component | Version in use | Notes |
 |---|---|---|
-| vLLM | **v0.32.0** (upstream, XPU backend) | v0.33.0 (Nov 2) has byte-identical XPU pins and is the next planned step; do not use `main` (torch 2.15 / kernels 0.1.17 churn) |
+| vLLM | **v0.32.0** (upstream, XPU backend) | v0.33.0 (Nov 2) has byte-identical XPU pins and is the target for all week-1 baselines (work plan v2); do not use `main` or `v0.34.0rc0` (torch 2.15 / kernels 0.1.17 churn; rc0 carries the #57770 spec-decode NaN regression without the #64897 fix) |
 | vllm-xpu-kernels | **0.1.15.4** (vLLM's pin) | 0.1.16.x ≥ .3 and 0.1.17 need torch 2.15 |
 | torch | **2.14.0+xpu** | bundles the oneAPI 2026.1 runtime (libsycl.so.9); no IPEX |
 | triton | 3.8.0+xpu | |
@@ -34,7 +34,7 @@ The upstream image `vllm/vllm-openai-xpu:<tag>` is the reference environment. Th
 3. **Resident ceiling ≈ 21 GiB** for model weights + KV cache + activations (not 13 GiB as stated below). 28.57 GiB
    is visible to the XPU; the rest is page cache, pinned buffers and the OS. Since v0.25 vLLM reads the driver's
    usable-memory figure (`getMemoryInfo`), so the old "needs 2× RAM" symptom from page-cache miscounting is gone.
-4. **Crashed or killed launches leak Level Zero shared memory.** `sync && echo 3 | sudo tee /proc/sys/vm/drop_caches`
+4. **Crashed or killed launches leak Level Zero shared memory; on v0.19 clean SIGTERM stops leaked too (v19 Finding 3 expanded); not yet re-tested on v0.32/v0.33.** `sync && echo 3 | sudo tee /proc/sys/vm/drop_caches`
    usually recovers it; after two or three failed launches only a reboot does. Never SIGKILL the engine, never
    let a unit restart-loop.
 5. **MoE INT4 checkpoints must be symmetric INT4 in GPTQ or compressed-tensors packing.** AWQ-packed MoE does not
@@ -48,12 +48,12 @@ The upstream image `vllm/vllm-openai-xpu:<tag>` is the reference environment. Th
 | Model | Quant | Resident | Decode | Prefill / TTFT | Notes |
 |---|---|---|---|---|---|
 | Gemma 4 26B-A4B | INT4 (QAT) | ~16 GiB + KV | ~30 tok/s | ~1000 tok/s | needs the home-made attention kernel + `--attention-backend FLASH_ATTN` on v0.32; v0.33.0 stops forcing Triton attention (#62014) |
-| Qwen3-Coder-30B-A3B | compressed-tensors sym INT4 gs32 | ~17 GiB | 18 tok/s | 756 tok/s, TTFT 1.35 s @ 1k | gs128 variants are ~10 tok/s |
-| Qwen3.6-35B-A3B / Ornith-1.5 | GPTQ INT4 + native MTP | 18–20 GiB | ~19 tok/s; 27.7 tok/s with MTP k=2 | — | prefix caching off with MTP |
-| GPT-OSS-20B | MXFP4 | 12.9 GiB | ~23 tok/s | — | reasoning-parser leaks with some harnesses |
+| Qwen3-Coder-30B-A3B | compressed-tensors sym INT4 gs32 | ~17 GiB | 18 tok/s (v0.19.0, 2026-04) | 756 tok/s, TTFT 1.35 s @ 1k (v0.19.0, 2026-04) | gs128 variants are ~10 tok/s |
+| Qwen3.6-35B-A3B / Ornith-1.5 | GPTQ INT4 + native MTP | 18–20 GiB | ~19 tok/s; 27.7 tok/s with MTP k=2 (v0.30, MXFP4 checkpoint per xpu-graph-status:108-109, historical; name the checkpoint served today) | — | prefix caching off with MTP |
+| GPT-OSS-20B | MXFP4 | 12.9 GiB | ~23 tok/s (v0.19.0) | — | reasoning-parser leaks with some harnesses |
 | Qwen3.5-9B dense | INT4 | ~6 GiB | 8–10 tok/s | — | dense = bandwidth-bound |
 
-Model load from NVMe is 36–40 s. KV cache per token at bf16: GPT-OSS-20B 48 KiB (32K ≈ 1.5 GiB), Qwen3-Coder-30B-A3B 96 KiB (48 layers × 4 KV heads × 128; 32K ≈ 3.0 GiB), Qwen3.6-35B-A3B ~20 KiB plus a fixed GDN state per sequence (est.); fp8_e4m3 KV halves these but is not yet validated on this box. Read the "GPU KV cache size: N tokens" startup line rather than trusting these figures.
+Model load from NVMe is 36–40 s (v0.19.0; re-baselined by the work plan's Day-1 S06 launch). KV cache per token at bf16: GPT-OSS-20B 48 KiB (32K ≈ 1.5 GiB), Qwen3-Coder-30B-A3B 96 KiB (48 layers × 4 KV heads × 128; 32K ≈ 3.0 GiB), Qwen3.6-35B-A3B ~20 KiB plus a fixed GDN state per sequence (est.); fp8_e4m3 KV halves these but is not yet validated on this box. Read the "GPU KV cache size: N tokens" startup line rather than trusting these figures.
 
 ### Local patches still carried (v0.32.0)
 
@@ -61,7 +61,7 @@ Model load from NVMe is 36–40 s. KV cache per token at bf16: GPT-OSS-20B 48 Ki
 |---|---|
 | oneDNN engine/stream context fix ("Backends mismatch") | keep until located in the wheel diff; may be a packaging issue rather than code |
 | UMA memory-accounting fix (`MemorySnapshot.measure`; upstream PR #40295, stale) | probably deletable once the driver's `getMemoryInfo` is verified to track MemAvailable (work plan S10) |
-| Gemma 4 attention kernel + `FLASH_ATTN` override | must keep; the override becomes a plain launch flag on v0.33.0 |
+| Gemma 4 attention kernel + `FLASH_ATTN` override | keep unless the stock-v0.33 zero-patch test (work plan v2) passes; the override becomes a plain launch flag on v0.33.0 |
 | Hybrid-MoE page-size cherry-pick (#40128) | **obsolete**: superseded upstream in v0.24 (#39931 + #45181); patch moved to `vllm/patches/attic/` |
 
 ### Where the detail lives

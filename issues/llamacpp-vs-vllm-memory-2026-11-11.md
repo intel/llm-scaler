@@ -10,7 +10,7 @@ llama.cpp is the better fit for memory on this box, by about 1.5–3 GiB at the 
 GGUFs quantize the embedding and output tensors, its KV cache can be stored at q8_0 or q4_0, it allocates
 exactly what you ask for with no ~2 GiB Python layer and no profiling peak, it can push experts to the CPU,
 and the repos record no memory leak for it. vLLM is the better choice per GiB of throughput: it decodes
-1.4–2.4× faster per stream (about 18–23 tok/s against 9.5–13.3 tok/s), so for one resident model that fits
+1.4–2.4× faster per stream (about 18–23 tok/s against 9.5–13.3 tok/s; both sides stale: llama.cpp March build, vLLM v0.19; verdict pending a current-build re-bench), so for one resident model that fits
 under about 21 GiB, vLLM still gives more tokens per byte.
 
 ## Side-by-side
@@ -25,7 +25,7 @@ under about 21 GiB, vLLM still gives more tokens per byte.
 | Partial offload | `-ngl N`, `-ot`, `--cpu-moe`, `--n-cpu-moe`, `--moe-cache-mib` all work | `--cpu-offload-gb` only moves accounting on UMA |
 | Crash / leak recovery | nothing recorded; Vulkan buffers freed when the DRM fd closes (est.); SYCL untested against the leak | Level Zero shared-memory leak even on clean exits (Finding 3): 28 → 7–8 GiB free, drop_caches sometimes recovers, reboot after 2–3 crashes |
 | Load / switch | not measured; ~5–15 s est. | 36–40 s measured |
-| Measured tok/s here | Qwen3.5-35B IQ4_XS 13.3; Q4_K_XL 9.5; GPT-OSS-20B 9.5; Nemotron-30B-A3B 16.9 (all Vulkan; no SYCL numbers on Lunar Lake) | Qwen3-Coder gs32 18.2; Qwen3.6-35B ~19 (27.7 with MTP k=2); GPT-OSS-20B ~23 |
+| Measured tok/s here | Qwen3.5-35B IQ4_XS 13.3; Q4_K_XL 9.5; GPT-OSS-20B 9.5; Nemotron-30B-A3B 16.9 (all Vulkan; no SYCL numbers on Lunar Lake) | Qwen3-Coder gs32 18.2 (v0.19.0); Qwen3.6-35B ~19 (27.7 with MTP k=2; v0.30, MXFP4); GPT-OSS-20B ~23 (v0.19.0) |
 | Second request | no extra KV: `-c` is split or shared across slots; hybrids add ~60 MiB state per slot | shares the paged pool; costs only the blocks it uses; much better aggregate throughput |
 
 ## Weight bytes
@@ -62,9 +62,9 @@ default, `swa_full=false`; vLLM est.). Qwen3.6-35B-A3B: ~20 KiB/token (10 full-a
 | Activations, compute, scratch | 0.8–1.3 | 0.8–1.3 | 0.5–1.0 est. | 0.5–1.0 est. |
 | **Device subtotal** | **20.8–21.3 (at the ceiling)** | 19.3–19.8 | 19.4–19.9 | 17.4–17.9 |
 | Host process | ~2.0 | ~2.0 | 0.3–0.5 est. (+ up to 8 GiB prompt cache unless `--cache-ram` is set) | 0.3–0.5 |
-| Firmware / display / OS reserved | 2.3 | 2.3 | 2.3 | 2.3 |
+| Driver guard (0.06 × MemTotal + 450 MB): limits XPU allocation, not consumed RAM | 2.3 | 2.3 | 2.3 | 2.3 |
 | Desktop session (est.) | 4 | 4 | 4 | 4 |
-| **MemAvailable left (est.)** | **~1.3–1.8** | ~2.8–3.3 | ~3.7–4.4 | ~5.7–6.4 |
+| **XPU free left (est.; = MemAvailable left − 2.29, which is why the guard row is subtracted)** | **~1.3–1.8** | ~2.8–3.3 | ~3.7–4.4 | ~5.7–6.4 |
 
 ## Throughput per GiB (measured tok/s ÷ resident GiB)
 

@@ -30,7 +30,7 @@ passed, **[corrected]** skeptic amended the claim (text below is the corrected v
   model/cwd/memory, so it could cover job 2 as well.
 - **Hermes Agent is the best Telegram assistant on paper and refuses your 32K models.** Hard
   64,000-token floor [confirmed]. It becomes viable only if you serve Gemma 4 at `--max-model-len
-  65536` (feasible: ~2.6 GiB of KV at 40 KiB/token on a 16 GiB model), and its hidden auxiliary LLM
+  65536` (feasibility unknown: Gemma 4 KiB/token is unmeasured; 40 KiB/token was a GPT-OSS-class figure), and its hidden auxiliary LLM
   calls need taming on a 30 tok/s box.
 - **nanobot is the lightest drop-in OpenClaw replacement** if you do want to leave: first-class
   `vllm` provider block, JSON text-fallback tool parsing with corrective retries, fallback chains

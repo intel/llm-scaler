@@ -210,7 +210,7 @@ The nightly image grew from 5.22 GB (Oct 30) to 5.62 GB (Oct 31) right after #64
 
 The plan does not stand as written. Changes are in bold. Everything else is as in the 2026-10-29 plan.
 
-**Today (before Day 1, 10 min): #40295 decision.** Its stale window ends about 2026-11-03. Either post a short holding comment ("re-measuring on v0.32/v0.33 with driver-side usable-memory accounting; will update or close with readings") or let it auto-close and reopen later as "driver-independence for compute-runtime <26.18" if S10 fails. Do nothing on #41370 beyond an optional comment, since it is not the owner's PR.
+**Today (before Day 1, 10 min): #40295 decision.** [2026-11-11: did not happen; #40295 is still open and stale; the decision moves to after the Day-1 S10 run, work plan v2.] Its stale window ends about 2026-11-03. Either post a short holding comment ("re-measuring on v0.32/v0.33 with driver-side usable-memory accounting; will update or close with readings") or let it auto-close and reopen later as "driver-independence for compute-runtime <26.18" if S10 fails. Do nothing on #41370 beyond an optional comment, since it is not the owner's PR.
 
 **Day 1 (console, v0.32.0):**
 - S02 probe + request capture, **three turns**.
@@ -228,7 +228,7 @@ The plan does not stand as written. Changes are in bold. Everything else is as i
 - **S05 computes the 0.94/450 MB formula and cross-checks it against live `getMemoryInfo`. Do not hard-code it** [corrected per skeptic].
 
 **Day 5:**
-- **S15 with three arms (`ngram` V2, `ngram_gpu` V2, `ngram` V1).** Do the V1 arm now; draft #63373 would remove it.
+- **S15 with three arms (`ngram` V2, `ngram_gpu` V2, `ngram` V1).** Do the V1 arm now; draft #63373 would remove it. [2026-11-11: #63373 merged into v0.34.0rc0; work plan v2 drops the V1 arm and the GDN smoke.]
 - **Plus a 20-minute n-gram smoke test on the Qwen3.6 GDN lane, watching for the #54740 RuntimeError.**
 
 **End of week 1: cutover decision.** If the S45 dry run is clean, rebuild the lanes on v0.33.0 with:
@@ -237,7 +237,7 @@ The plan does not stand as written. Changes are in bold. Everything else is as i
 - `VLLM_XPU_INC_WNA16_BACKEND=w4a16` on any INC/AutoRound lane;
 - kernels pinned to `==0.1.15.4`.
 
-Re-take the A/A noise floor on v0.33.0 before S16. If the dry run is not clean, stay on v0.32.0 for S16 phase 0.
+Re-take the A/A noise floor on v0.33.0 before S16. If the dry run is not clean, stay on v0.32.0 for S16 phase 0. [2026-11-11: superseded; work plan v2 moves the cutover to Day 0/Day 1 so all baselines are taken on v0.33.0 once.]
 
 **Week 2 changes:**
 - S12b runs first on **stock v0.33.0** (no home kernel).
@@ -250,8 +250,8 @@ Re-take the A/A noise floor on v0.33.0 before S16. If the dry run is not clean, 
 
 **vLLM**
 - [#63977](https://github.com/vllm-project/vllm/pull/63977): torch 2.15 + triton-xpu 3.9.0 + kernels 0.1.16.3 (GH full config) + OMIX 0.4.1 driver. Draft, last head 10-31. It is the next container-stack change.
-- [#63373](https://github.com/vllm-project/vllm/pull/63373): removes Model Runner V1 and `VLLM_USE_V2_MODEL_RUNNER`. Draft, needs-rebase, 11-02. Kills the S15 V1 arm and the S07 MRV1 parity run.
-- [#64897](https://github.com/vllm-project/vllm/pull/64897): XPU greedy_argmax NaN fix for the main regression #57770. Open, 10-31.
+- [#63373](https://github.com/vllm-project/vllm/pull/63373): removes Model Runner V1 and `VLLM_USE_V2_MODEL_RUNNER`. Draft, needs-rebase, 11-02. Kills the S15 V1 arm and the S07 MRV1 parity run. [2026-11-11: merged, in v0.34.0rc0.]
+- [#64897](https://github.com/vllm-project/vllm/pull/64897): XPU greedy_argmax NaN fix for the main regression #57770. Open, 10-31. [2026-11-11: merged on main Nov 9 as 0f0b352, in no tag; v0.34.0rc0 contains #57770 without it, so no spec decode on rc0.]
 - [#64687](https://github.com/vllm-project/vllm/pull/64687) + kernels [#670](https://github.com/vllm-project/vllm-xpu-kernels/pull/670): eager Qwen3.5 port + fused MoE decode. FP8-per-tensor only, accuracy drops reported. Open, 11-02.
 - [#61630](https://github.com/vllm-project/vllm/pull/61630): XPU head-256 tuned Triton prefill. Approved 10-23, open; changes the Triton half of the Gemma 4 composite.
 - [#58131](https://github.com/vllm-project/vllm/pull/58131): XPU FA `num_splits` forwarding. Approved and ready 11-02; affects determinism and A/A.
