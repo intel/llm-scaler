@@ -131,7 +131,7 @@ match. Other text encoders retain their existing routes.
 The image defaults to `MONO_DECODE_XPU=1`. Set `MONO_DECODE_XPU=0` in the
 container environment to disable the recommended stack. Explicit per-piece
 settings override that master switch; the experimental graph path remains off.
-See the node's [environment reference](https://github.com/xiangyuT/comfy-mono-decode-xpu/blob/4948600f7205fe2ddba103040ea8580a9f5e553b/docs/ENV.md)
+See the node's [environment reference](https://github.com/xiangyuT/comfy-mono-decode-xpu/blob/387e0a0aaeb1140ccd0cba70db905f87c70979ce/docs/ENV.md)
 for individual controls and counters. ComfyUI's memory mode and transfer policy
 are selected independently through its existing arguments.
 

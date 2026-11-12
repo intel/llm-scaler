@@ -138,7 +138,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_MONO_DECODE_COMMIT": (
         "MONO_DECODE_COMMIT",
-        "4948600f7205fe2ddba103040ea8580a9f5e553b",
+        "387e0a0aaeb1140ccd0cba70db905f87c70979ce",
     ),
 }
 
