@@ -56,6 +56,8 @@ The supported environment overrides are:
 | `COMFY_NUNCHAKU_REPOSITORY` | Combined Nunchaku custom-node/runtime repository | pinned in `build.sh` |
 | `COMFY_NUNCHAKU_COMMIT` | Combined Nunchaku source revision | pinned in `build.sh` |
 | `COMFY_NUNCHAKU_VERSION` | Expected combined distribution version | pinned in `build.sh` |
+| `COMFY_MONO_DECODE_REPOSITORY` | Mono Decode XPU custom-node source repository | pinned in `build.sh` |
+| `COMFY_MONO_DECODE_COMMIT` | Mono Decode XPU source revision | pinned in `build.sh` |
 
 ComfyUI repository, commit, and version must be updated together. Kitchen and
 AIMDO official dependency versions are separate from the versions of their
@@ -100,6 +102,15 @@ distribution version; the current source revision is
 ComfyUI's built-in node and the Kitchen XPU provider; it has no separate
 custom-node source pin. The kernel source is copied from `omni/omni_xpu_kernel`
 in the current llm-scaler checkout.
+
+Mono Decode XPU is pinned to
+[`4948600f7205fe2ddba103040ea8580a9f5e553b`](https://github.com/xiangyuT/comfy-mono-decode-xpu/commit/4948600f7205fe2ddba103040ea8580a9f5e553b).
+Its separate `mono-decode` stage builds the native extension for `XPU_TARGET`
+with the project's `build_icpx.sh` single compiler invocation. It does not use
+`install.py`, which skips compilation when a build sandbox has no XPU. A build
+or native import failure stops image construction. The final image retains the
+pinned checkout and compiled extension under
+`/llm/ComfyUI/custom_nodes/comfy-mono-decode-xpu` for normal ComfyUI discovery.
 
 Each provider revision must be reachable from its pinned remote. The build
 fetches and checks out those exact full commits before constructing the private
@@ -184,12 +195,13 @@ The focused Dockerfile separates the frequently changed native projects:
 | `kernel-wheel` | Target-specific `omni_xpu_kernel` wheel |
 | `kitchen-wheel` | Pinned Kitchen XPU source wheel and co-installable provider wheel |
 | `aimdo-wheel` | Pinned AIMDO Level Zero source wheel and co-installable provider wheel |
+| `mono-decode` | Pinned Mono Decode custom node and target-specific native extension |
 | `builder-comfyui` | Wheel installation and local ComfyUI integration |
 | `runtime-comfyui` | Final labels, environment, and runtime metadata |
 
 BuildKit is enabled by `build.sh`. Normal incremental builds should preserve
-the cache. The `kernel-wheel`, `kitchen-wheel`, and `aimdo-wheel` targets are
-diagnostics; image acceptance must use the default final target.
+the cache. The `kernel-wheel`, `kitchen-wheel`, `aimdo-wheel`, and `mono-decode`
+targets are diagnostics; image acceptance must use the default final target.
 
 ## Source and artifact identity
 
@@ -208,6 +220,7 @@ whether `omni/` had uncommitted changes. The final image also records:
 - retained XPU provider wheel SHA256 values;
 - GGUF custom-node commit;
 - combined Nunchaku custom-node/runtime version and commit;
+- Mono Decode custom-node repository and commit;
 - SYCL-TLA commit.
 
 Build from a clean commit before release acceptance. A device-less Docker
@@ -230,8 +243,9 @@ sudo docker run --rm \
 The acceptance check requires a real XPU and clean source metadata. The
 `--allow-no-xpu` and `--allow-dirty-source` switches are intended only for
 explicit diagnostics and do not replace device-backed acceptance. The same
-validator also requires exact Kitchen, AIMDO, GGUF, and combined Nunchaku
-provider source revisions; both official distributions; both disjoint provider
+validator also requires exact Kitchen, AIMDO, GGUF, combined Nunchaku and
+Mono Decode source revisions; an importable Mono Decode native extension from
+its packaged checkout; both official distributions; both disjoint provider
 distributions; conditional routing; the installed AIMDO XPU backend and Linux
 allocator takeover after a verified unwind of official AIMDO's reversible
 pre-device state; the
