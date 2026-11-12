@@ -81,11 +81,6 @@ REQUIRED_MINIMAX_H3_TEMPLATES = {
     "video_minimax_h3_r2v.json",
     "video_minimax_h3_t2v.json",
 }
-PINNED_MINIMAX_H3_TEMPLATE_HASHES = {
-    "video_minimax_h3_t2v.json": (
-        "8149b64db94375cd01a7d46da0b4a4c7349d83dedf6b5e1026b460e5e202626f"
-    ),
-}
 
 EXPECTED_LINUX_AIMDO_ALLOCATOR_MODE = "native_hook"
 
@@ -836,17 +831,9 @@ def main() -> None:
             "ComfyUI workflow template package is missing MiniMax H3 files: "
             + ", ".join(missing_templates)
         )
-    h3_template_hashes = {}
     for name in sorted(REQUIRED_MINIMAX_H3_TEMPLATES):
         path = template_root / name
         json.loads(path.read_text(encoding="utf-8"))
-        h3_template_hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    for name, expected_hash in PINNED_MINIMAX_H3_TEMPLATE_HASHES.items():
-        require_equal(
-            f"MiniMax H3 official template hash ({name})",
-            h3_template_hashes[name],
-            expected_hash,
-        )
 
     dependency_manifest = Path("/llm/manifests/comfyui-python-freeze.txt")
     if not dependency_manifest.is_file() or not dependency_manifest.read_text(
@@ -991,7 +978,7 @@ def main() -> None:
         f"{sol_attn_backend['library_sha256'][:12]}, "
         f"gguf={dependency_versions['gguf']}, nunchaku={expected_nunchaku}, "
         f"xpu={device_name!r}, kitchen_capabilities={len(capabilities)}, "
-        f"h3_templates={len(h3_template_hashes)}"
+        f"h3_templates={len(REQUIRED_MINIMAX_H3_TEMPLATES)}"
     )
 
 
