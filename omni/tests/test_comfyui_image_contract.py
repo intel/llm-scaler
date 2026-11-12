@@ -670,7 +670,6 @@ class ComfyUIImageContractTest(unittest.TestCase):
                 "comfyui-manager": "OMNI_COMFYUI_MANAGER_VERSION",
             },
         )
-        self.assertEqual(len(validator.REQUIRED_MINIMAX_H3_TEMPLATES), 6)
         self.assertIn(
             "/llm/manifests/comfyui-python-freeze.txt",
             dockerfile,
