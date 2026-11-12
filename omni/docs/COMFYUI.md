@@ -110,12 +110,30 @@ The focused image installs pinned revisions of:
 - CacheDiT;
 - ComfyUI-GGUF-XPU;
 - ComfyUI-nunchaku-XPU;
+- Mono Decode XPU;
 - ControlNet auxiliary nodes;
 - ComfyUI-OmniXPU.
 
 The Dockerfile is the source of truth for exact revisions. Installing or
 updating nodes through ComfyUI Manager changes the running container and is
 not part of the reproducible image build.
+
+## Prompt-enhancement decode
+
+The image includes
+[Mono Decode XPU](https://github.com/xiangyuT/comfy-mono-decode-xpu) as a standard
+custom node with a prebuilt native extension. It accelerates eligible
+Qwen3.5-9B W4A8 prompt-enhancement decode calls from `TextGenerate` and
+`TextGenerateV2`, including the supported MTP paths. It adds no graph nodes;
+existing upstream workflows use the hooks when their model and input contracts
+match. Other text encoders retain their existing routes.
+
+The image defaults to `MONO_DECODE_XPU=1`. Set `MONO_DECODE_XPU=0` in the
+container environment to disable the recommended stack. Explicit per-piece
+settings override that master switch; the experimental graph path remains off.
+See the node's [environment reference](https://github.com/xiangyuT/comfy-mono-decode-xpu/blob/d42987e7e8a7fdee0ea8dd27f4bc90f1af0cb34a/docs/ENV.md)
+for individual controls and counters. ComfyUI's memory mode and transfer policy
+are selected independently through its existing arguments.
 
 ## Sparse attention
 

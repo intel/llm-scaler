@@ -59,6 +59,10 @@ PINNED_CHECKOUTS = {
         Path("/llm/ComfyUI/custom_nodes/ComfyUI-nunchaku-XPU"),
         "OMNI_COMFY_NUNCHAKU_REVISION",
     ),
+    "Mono Decode custom node": (
+        Path("/llm/ComfyUI/custom_nodes/comfy-mono-decode-xpu"),
+        "OMNI_COMFY_MONO_DECODE_REVISION",
+    ),
 }
 
 GGUF_DEPENDENCIES = {
@@ -651,6 +655,13 @@ def main() -> None:
     for label, (path, environment_variable) in PINNED_CHECKOUTS.items():
         require_checkout_revision(label, path, os.environ[environment_variable])
 
+    # Import the compiled package without running the custom-node hook installer.
+    mono_decode_root = PINNED_CHECKOUTS["Mono Decode custom node"][0]
+    sys.path.insert(0, str(mono_decode_root))
+    mono_decode_native = importlib.import_module("comfy_mono_decode_xpu._C")
+    mono_decode_library = Path(mono_decode_native.__file__).resolve()
+    mono_decode_library.relative_to(mono_decode_root.resolve())
+
     require_equal(
         "Comfy AIMDO distribution version",
         importlib.metadata.version("comfy-aimdo"),
@@ -947,6 +958,7 @@ def main() -> None:
         f"sol_attn={sol_attn_backend['backend']}@"
         f"{sol_attn_backend['library_sha256'][:12]}, "
         f"gguf={dependency_versions['gguf']}, nunchaku={expected_nunchaku}, "
+        f"mono_decode={os.environ['OMNI_COMFY_MONO_DECODE_REVISION'][:12]}, "
         f"xpu={device_name!r}, kitchen_capabilities={len(capabilities)}"
     )
 

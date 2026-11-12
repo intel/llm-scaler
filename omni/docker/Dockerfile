@@ -42,6 +42,8 @@ ARG COMFY_GGUF_COMMIT=39671fe73117ba97de7011e7e06e32599dcda06d
 ARG COMFY_NUNCHAKU_REPOSITORY=https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git
 ARG COMFY_NUNCHAKU_COMMIT=9f5604445f56154dd44e8b4acfed1aef868003c5
 ARG COMFY_NUNCHAKU_VERSION=1.2.1+xpu.3
+ARG COMFY_MONO_DECODE_REPOSITORY=https://github.com/xiangyuT/comfy-mono-decode-xpu.git
+ARG COMFY_MONO_DECODE_COMMIT=d42987e7e8a7fdee0ea8dd27f4bc90f1af0cb34a
 ARG LLM_SCALER_SOURCE_REVISION=unknown
 ARG LLM_SCALER_SOURCE_DIRTY=unknown
 
@@ -388,6 +390,33 @@ RUN cd /llm && \
         --torch-version "${TORCH_VERSION}" \
         --xpu-target "${XPU_TARGET}"
 
+# ======== Mono Decode custom-node branch ========
+FROM python-base AS mono-decode
+
+ARG COMFY_MONO_DECODE_REPOSITORY
+ARG COMFY_MONO_DECODE_COMMIT
+
+RUN cd /llm && \
+    git clone --filter=blob:none --no-checkout \
+        "${COMFY_MONO_DECODE_REPOSITORY}" comfy-mono-decode-xpu && \
+    git -C comfy-mono-decode-xpu fetch --depth 1 origin \
+        "${COMFY_MONO_DECODE_COMMIT}" && \
+    git -C comfy-mono-decode-xpu checkout --detach FETCH_HEAD
+
+ARG XPU_TARGET
+
+# install.py intentionally skips compilation without an XPU. Build directly
+# so a device-less image build produces the extension or fails visibly.
+# Preserve the project's single-invocation compile/device-link contract.
+RUN set -eo pipefail && \
+    source /opt/intel/oneapi/setvars.sh --force && \
+    cd /llm/comfy-mono-decode-xpu && \
+    MONO_DECODE_XPU_XPU_DEVICE="${XPU_TARGET}" PYTHON=python bash build_icpx.sh
+
+# Use the base stage's Torch runtime paths, outside setvars.sh's shell.
+RUN cd /llm/comfy-mono-decode-xpu && \
+    python -c "import torch; from comfy_mono_decode_xpu import _C"
+
 # ======== Omni kernel wheel branch ========
 FROM sycl-tla AS kernel-wheel
 
@@ -440,6 +469,7 @@ COPY --from=kernel-wheel /llm/omni_xpu_kernel /llm/omni_xpu_kernel
 COPY --from=kitchen-wheel /wheels/kitchen-provider/ /wheels/providers/
 COPY --from=aimdo-wheel /wheels/aimdo-provider/ /wheels/providers/
 COPY --from=kernel-wheel /wheels/ /wheels/
+COPY --from=mono-decode /llm/comfy-mono-decode-xpu /llm/ComfyUI/custom_nodes/comfy-mono-decode-xpu
 
 # All third-party requirements, including official Kitchen and AIMDO, are
 # already installed. Install the kernel and the two privately named XPU runtime
@@ -522,6 +552,8 @@ ARG COMFY_AIMDO_PROVIDER_VERSION
 ARG COMFY_GGUF_COMMIT
 ARG COMFY_NUNCHAKU_COMMIT
 ARG COMFY_NUNCHAKU_VERSION
+ARG COMFY_MONO_DECODE_REPOSITORY
+ARG COMFY_MONO_DECODE_COMMIT
 ARG LLM_SCALER_SOURCE_REVISION
 ARG LLM_SCALER_SOURCE_DIRTY
 
@@ -558,7 +590,9 @@ LABEL org.opencontainers.image.version="${IMAGE_TAG}" \
       com.intel.omni.comfy-aimdo-xpu-runtime.revision="${COMFY_AIMDO_COMMIT}" \
       com.intel.omni.comfy-gguf.revision="${COMFY_GGUF_COMMIT}" \
       com.intel.omni.comfy-nunchaku.version="${COMFY_NUNCHAKU_VERSION}" \
-      com.intel.omni.comfy-nunchaku.revision="${COMFY_NUNCHAKU_COMMIT}"
+      com.intel.omni.comfy-nunchaku.revision="${COMFY_NUNCHAKU_COMMIT}" \
+      com.intel.omni.comfy-mono-decode.repository="${COMFY_MONO_DECODE_REPOSITORY}" \
+      com.intel.omni.comfy-mono-decode.revision="${COMFY_MONO_DECODE_COMMIT}"
 
 ENV OMNIXPU_INTERPOLATE_FIX=0 \
     UR_INCLUDE_DIR="/opt/venv/include/unified-runtime" \
@@ -591,7 +625,10 @@ ENV OMNIXPU_INTERPOLATE_FIX=0 \
     OMNI_COMFY_AIMDO_PROVIDER_REVISION="${COMFY_AIMDO_COMMIT}" \
     OMNI_COMFY_GGUF_REVISION="${COMFY_GGUF_COMMIT}" \
     OMNI_COMFY_NUNCHAKU_VERSION="${COMFY_NUNCHAKU_VERSION}" \
-    OMNI_COMFY_NUNCHAKU_REVISION="${COMFY_NUNCHAKU_COMMIT}"
+    OMNI_COMFY_NUNCHAKU_REVISION="${COMFY_NUNCHAKU_COMMIT}" \
+    OMNI_COMFY_MONO_DECODE_REPOSITORY="${COMFY_MONO_DECODE_REPOSITORY}" \
+    OMNI_COMFY_MONO_DECODE_REVISION="${COMFY_MONO_DECODE_COMMIT}" \
+    MONO_DECODE_XPU=1
 
 # Retain OMIX's oneAPI environment initialization, then restore the venv's
 # Torch-matched 2026.0 SYCL/UR runtime ahead of the OMIX 2026.1 build

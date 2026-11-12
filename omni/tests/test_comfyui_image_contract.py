@@ -132,6 +132,14 @@ COMPONENT_PINS = {
         "9f5604445f56154dd44e8b4acfed1aef868003c5",
     ),
     "COMFY_NUNCHAKU_VERSION": ("NUNCHAKU_VERSION", "1.2.1+xpu.3"),
+    "COMFY_MONO_DECODE_REPOSITORY": (
+        "MONO_DECODE_REPOSITORY",
+        "https://github.com/xiangyuT/comfy-mono-decode-xpu.git",
+    ),
+    "COMFY_MONO_DECODE_COMMIT": (
+        "MONO_DECODE_COMMIT",
+        "d42987e7e8a7fdee0ea8dd27f4bc90f1af0cb34a",
+    ),
 }
 
 
@@ -443,6 +451,7 @@ class ComfyUIImageContractTest(unittest.TestCase):
                 "Comfy AIMDO",
                 "GGUF custom node",
                 "combined Nunchaku custom node/runtime",
+                "Mono Decode custom node",
             },
         )
         self.assertIn(
