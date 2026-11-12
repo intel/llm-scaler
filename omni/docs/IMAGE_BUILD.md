@@ -104,7 +104,7 @@ custom-node source pin. The kernel source is copied from `omni/omni_xpu_kernel`
 in the current llm-scaler checkout.
 
 Mono Decode XPU is pinned to
-[`387e0a0aaeb1140ccd0cba70db905f87c70979ce`](https://github.com/xiangyuT/comfy-mono-decode-xpu/commit/387e0a0aaeb1140ccd0cba70db905f87c70979ce).
+[`d42987e7e8a7fdee0ea8dd27f4bc90f1af0cb34a`](https://github.com/xiangyuT/comfy-mono-decode-xpu/commit/d42987e7e8a7fdee0ea8dd27f4bc90f1af0cb34a).
 Its separate `mono-decode` stage builds the native extension for `XPU_TARGET`
 with the project's `build_icpx.sh` single compiler invocation. It does not use
 `install.py`, which skips compilation when a build sandbox has no XPU. A build
