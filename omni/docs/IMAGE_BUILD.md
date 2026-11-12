@@ -62,21 +62,21 @@ AIMDO official dependency versions are separate from the versions of their
 pinned provider source wheels. The provider manifests declare which official
 versions each source wheel accepts, and image validation checks both identities.
 
-For the default ComfyUI 0.43.0 source build, official Kitchen 0.2.40 uses the matching
-0.2.40 provider source at `xiangyuT/comfy-kitchen-xpu`
-(`ddd4a4eb93f45477761a154512564ac6781e0ea5`). This provider includes packed W4A8
+For the default ComfyUI 0.45.0 source build, official Kitchen 0.2.41 uses the matching
+0.2.41 provider source at `xiangyuT/comfy-kitchen-xpu`
+(`f27f58782c51b6ab314b4cc0f6e65c8a6bafa277`). This provider includes packed W4A8
 decode for one to eight rows, with explicit errors for incompatible decode
 contracts or a missing native companion, alongside the native XPU LLM
 decode/cache and deferred-state adapters paired with the Omni kernels in this
 checkout. Official AIMDO 0.6.0 uses
 the matching 0.6.0 provider source at `xiangyuT/comfy-aimdo-xpu`
 (`3bc6afbcb92e10a2d4737e79d170190ed787bf89`). Both provider manifests
-accept their matching official 0.2.40 and 0.6.0 versions. AIMDO provider metadata
+accept their matching official 0.2.41 and 0.6.0 versions. AIMDO provider metadata
 comes from its source wheel; its builder has no manual release allowlist or
 version-to-upstream-commit table. This image selects the version combination and
 validates it at integration time. The ComfyUI release
-requirements also pin embedded docs to 0.5.15; frontend and workflow templates
-are selected as 1.57.4 and 0.11.97 by the build inputs.
+requirements also pin embedded docs to 0.5.16; frontend and workflow templates
+are selected as 1.58.5 and 0.11.105 by the build inputs.
 GGUF repository and commit must be updated together.
 The private sidecar build requires the Torch release supported by llm-scaler
 (currently `2.14.0+xpu`) and an explicitly selected AIMDO revision that contains
