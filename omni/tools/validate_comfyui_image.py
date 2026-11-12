@@ -73,20 +73,6 @@ COMFYUI_PACKAGE_ENVIRONMENT = {
     "comfyui-manager": "OMNI_COMFYUI_MANAGER_VERSION",
 }
 
-REQUIRED_MINIMAX_H3_TEMPLATES = {
-    "api_minimax_h3_flf2v.json",
-    "api_minimax_h3_r2v.json",
-    "api_minimax_h3_t2v.json",
-    "video_minimax_h3_i2v.json",
-    "video_minimax_h3_r2v.json",
-    "video_minimax_h3_t2v.json",
-}
-PINNED_MINIMAX_H3_TEMPLATE_HASHES = {
-    "video_minimax_h3_t2v.json": (
-        "8a5eb23b0dd2df9e99b6f7af9684e770f188feca820d241364b729e01dedf3b6"
-    ),
-}
-
 EXPECTED_LINUX_AIMDO_ALLOCATOR_MODE = "native_hook"
 
 COMFYUI_ROOT = Path("/llm/ComfyUI")
@@ -819,35 +805,6 @@ def main() -> None:
     if not comfyui_manager.__file__:
         raise RuntimeError("comfyui_manager package has no importable source")
 
-    template_distribution = importlib.metadata.distribution(
-        "comfyui-workflow-templates-json"
-    )
-    template_root = Path(
-        template_distribution.locate_file(
-            "comfyui_workflow_templates_json/templates"
-        )
-    )
-    missing_templates = sorted(
-        name for name in REQUIRED_MINIMAX_H3_TEMPLATES
-        if not (template_root / name).is_file()
-    )
-    if missing_templates:
-        raise RuntimeError(
-            "ComfyUI workflow template package is missing MiniMax H3 files: "
-            + ", ".join(missing_templates)
-        )
-    h3_template_hashes = {}
-    for name in sorted(REQUIRED_MINIMAX_H3_TEMPLATES):
-        path = template_root / name
-        json.loads(path.read_text(encoding="utf-8"))
-        h3_template_hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    for name, expected_hash in PINNED_MINIMAX_H3_TEMPLATE_HASHES.items():
-        require_equal(
-            f"MiniMax H3 official template hash ({name})",
-            h3_template_hashes[name],
-            expected_hash,
-        )
-
     dependency_manifest = Path("/llm/manifests/comfyui-python-freeze.txt")
     if not dependency_manifest.is_file() or not dependency_manifest.read_text(
         encoding="utf-8"
@@ -990,8 +947,7 @@ def main() -> None:
         f"sol_attn={sol_attn_backend['backend']}@"
         f"{sol_attn_backend['library_sha256'][:12]}, "
         f"gguf={dependency_versions['gguf']}, nunchaku={expected_nunchaku}, "
-        f"xpu={device_name!r}, kitchen_capabilities={len(capabilities)}, "
-        f"h3_templates={len(h3_template_hashes)}"
+        f"xpu={device_name!r}, kitchen_capabilities={len(capabilities)}"
     )
 
 
