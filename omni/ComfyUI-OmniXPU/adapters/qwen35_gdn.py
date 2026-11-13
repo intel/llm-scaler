@@ -45,6 +45,7 @@ def apply():
 
     # Reuse the upstream algorithm and its initial/final dtype boundary. Only
     # this function sees the precision adapter; global F.normalize is untouched.
+    # Later upstream global rebinding is not reflected in this snapshot.
     namespace = dict(original.__globals__)
     namespace["F"] = _Functional(namespace["F"])
     patched = FunctionType(
