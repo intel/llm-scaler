@@ -151,8 +151,8 @@ offloading remain available. This limitation does not disable OmniXPU's
 
 ## Components and switches
 
-Adapters are enabled by default and always retain the original ComfyUI route
-for unsupported inputs:
+Adapter switches are controlled by environment variables. Unsupported inputs
+retain the original ComfyUI route:
 
 ```bash
 OMNIXPU_ENABLE=0            # Disable every custom-node component
@@ -172,7 +172,12 @@ OMNIXPU_SEEDVR_CAPACITY=0     # Disable bounded SeedVR2 window-attention schedul
 OMNIXPU_LARGE_VIDEO_PREPROCESS=0  # Disable bounded large-video CPU preprocessing
 ```
 
-The MiniMax H3 INT8 ConvRot text projection adapter is enabled by default.
+The MiniMax H3 INT8 ConvRot text projection adapter is disabled by default
+when the custom node is installed independently. Set `OMNIXPU_H3_TE_INT8_CR=1`
+before startup to enable it. The Omni ComfyUI image explicitly sets
+`ENV OMNIXPU_H3_TE_INT8_CR=1` in `omni/docker/Dockerfile`, so the bundled image
+enables this policy. Use `docker run -e OMNIXPU_H3_TE_INT8_CR=0 ...` to override
+the image setting and keep upstream full-precision projections.
 It uses ComfyUI's `custom_operations` interface and the public Kitchen INT8
 Linear API. Only eligible INT8 ConvRot projections use BF16 activation
 conversion and dynamic INT8 quantization, returning FP32 output. The FP32

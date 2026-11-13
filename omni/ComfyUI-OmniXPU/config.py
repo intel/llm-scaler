@@ -26,7 +26,7 @@ class Config:
             master and os.environ.get("OMNIXPU_QUANTIZED_MATMUL", "1") != "0"
         )
         self.h3_te_int8_cr = (
-            master and os.environ.get("OMNIXPU_H3_TE_INT8_CR", "1") != "0"
+            master and os.environ.get("OMNIXPU_H3_TE_INT8_CR", "0") == "1"
         )
         self.int8_ffn = master and os.environ.get("OMNIXPU_INT8_FFN", "1") != "0"
         self.lora_memory = (

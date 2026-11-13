@@ -124,7 +124,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     assert config.rotary
     assert config.norm
     assert config.h3_rms_modulation
-    assert config.h3_te_int8_cr
+    assert not config.h3_te_int8_cr
     assert config.fp8_gemm
     assert config.int8_ffn
     assert config.dynamic_vram_boundary_trim
@@ -178,7 +178,7 @@ def test_gdn_precision_fix_is_independent_of_norm(
 
 
 @pytest.mark.parametrize("master,switch,expected", [
-    ("1", None, True), ("1", "0", False), ("0", "1", False),
+    ("1", None, False), ("1", "1", True), ("1", "0", False), ("0", "1", False),
 ])
 def test_h3_te_int8_switch(monkeypatch, master, switch, expected):
     monkeypatch.setenv("OMNIXPU_ENABLE", master)
