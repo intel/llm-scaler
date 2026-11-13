@@ -171,12 +171,19 @@ OMNIXPU_SEEDVR_CAPACITY=0     # Disable bounded SeedVR2 window-attention schedul
 OMNIXPU_LARGE_VIDEO_PREPROCESS=0  # Disable bounded large-video CPU preprocessing
 ```
 
-The norm adapter also keeps Qwen3.5 GDN prefill Q/K L2 normalization in FP32
-on XPU for BF16/FP16 inputs. It uses PyTorch's FP32 norm output and division,
-retaining the upstream chunk algorithm, epsilon and final output dtype.
-It applies to the shared text-encoder call site independently of Mono Decode;
-`OMNIXPU_NORM=0` disables this precision adapter as well. Global functional
-normalization and non-XPU calls keep their existing behavior.
+The Qwen3.5 GDN prefill precision fix is opt-in:
+
+```bash
+OMNIXPU_QWEN35_GDN_PREFILL_FP32_FIX=1
+```
+
+It keeps Q/K L2 normalization intermediates in FP32 on XPU for BF16/FP16
+inputs, using PyTorch's FP32 norm output and division. The upstream chunk
+algorithm, epsilon and final output dtype are retained. This fix is controlled
+independently of `OMNIXPU_NORM` and remains subject to `OMNIXPU_ENABLE`.
+Leave its variable unset or set it to `0` to retain upstream precision.
+It applies at the shared text-encoder call site independently of Mono Decode;
+global functional normalization and non-XPU calls keep their existing behavior.
 
 On Windows XPU, the boundary trim turns an unmet DynamicVRAM minimum-memory
 budget into an explicit partial VBAR reclaim before model loading. It preserves

@@ -66,7 +66,7 @@ COMPONENTS = (
     ),
     Component(
         "qwen35_gdn_precision",
-        "norm",
+        "qwen35_gdn_prefill_fp32_fix",
         "compatibility_patch",
         "ComfyUI-OmniXPU",
         "adapters/qwen35_gdn.py",
