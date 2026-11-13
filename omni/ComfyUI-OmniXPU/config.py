@@ -55,6 +55,10 @@ class Config:
         self.xpu_ram_staging = (
             master and os.environ.get("OMNIXPU_XPU_RAM_STAGING", "1") != "0"
         )
+        self.qwen35_gdn_prefill_fp32_fix = (
+            master
+            and os.environ.get("OMNIXPU_QWEN35_GDN_PREFILL_FP32_FIX", "1") != "0"
+        )
         self.interpolate_fix = (
             master and os.environ.get("OMNIXPU_INTERPOLATE_FIX", "0") != "0"
         )

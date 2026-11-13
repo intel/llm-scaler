@@ -8,6 +8,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 _PLUGIN = Path(__file__).parents[1] / "ComfyUI-OmniXPU"
 
 
@@ -110,6 +112,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
         "OMNIXPU_SEEDVR_ADA_RESHAPE",
         "OMNIXPU_SEEDVR_CAPACITY",
         "OMNIXPU_LARGE_VIDEO_PREPROCESS",
+        "OMNIXPU_QWEN35_GDN_PREFILL_FP32_FIX",
         "OMNIXPU_INTERPOLATE_FIX",
         "OMNIXPU_MEDIAN_FIX",
     ):
@@ -131,12 +134,45 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     assert config.seedvr_ada_reshape
     assert config.seedvr_capacity
     assert config.large_video_preprocess
+    assert config.qwen35_gdn_prefill_fp32_fix
     assert not config.interpolate_fix
     assert not config.median_fix
     assert not config.aimdo_memory_compiler
     assert not hasattr(config, "rope")
     assert not hasattr(config, "int8")
     assert not hasattr(config, "fp8_neg_zero_fix")
+
+
+@pytest.mark.parametrize("master,norm,fix,enabled", [
+    ("1", "0", None, {"qwen35_gdn_precision"}),
+    ("1", "1", "0", {"norm_adapter"}),
+    ("0", "1", "1", set()),
+])
+def test_gdn_precision_fix_is_independent_of_norm(
+    monkeypatch, master, norm, fix, enabled
+):
+    monkeypatch.setenv("OMNIXPU_ENABLE", master)
+    monkeypatch.setenv("OMNIXPU_NORM", norm)
+    if fix is None:
+        monkeypatch.delenv("OMNIXPU_QWEN35_GDN_PREFILL_FP32_FIX", raising=False)
+    else:
+        monkeypatch.setenv("OMNIXPU_QWEN35_GDN_PREFILL_FP32_FIX", fix)
+    cfg = _load_module("omnixpu_bootstrap_config", _PLUGIN / "config.py").config
+    patches = _load_registry(monkeypatch)
+    monkeypatch.setattr(patches, "COMPONENTS", tuple(
+        c for c in patches.COMPONENTS
+        if c.name in {"norm_adapter", "qwen35_gdn_precision"}
+    ))
+    loaded = []
+
+    def load_component(plugin_dir, pkg_name, component):
+        loaded.append(component.name)
+        return lambda: (True, None)
+
+    monkeypatch.setattr(patches, "_load_component", load_component)
+    patches.apply_all_patches(cfg)
+    assert set(loaded) == enabled
+    assert {r["name"] for r in patches.get_status() if r["status"] == "applied"} == enabled
 
 
 def test_disabled_components_are_reported_without_importing_modules(monkeypatch):
@@ -160,6 +196,7 @@ def test_disabled_components_are_reported_without_importing_modules(monkeypatch)
         seedvr_ada_reshape=False,
         seedvr_capacity=False,
         large_video_preprocess=False,
+        qwen35_gdn_prefill_fp32_fix=False,
         interpolate_fix=False,
         median_fix=False,
     )

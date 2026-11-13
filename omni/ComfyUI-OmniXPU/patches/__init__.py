@@ -65,6 +65,13 @@ COMPONENTS = (
         "adapters/norm.py",
     ),
     Component(
+        "qwen35_gdn_precision",
+        "qwen35_gdn_prefill_fp32_fix",
+        "compatibility_patch",
+        "ComfyUI-OmniXPU",
+        "adapters/qwen35_gdn.py",
+    ),
+    Component(
         "h3_rms_modulation_adapter",
         "h3_rms_modulation",
         "adapter",
