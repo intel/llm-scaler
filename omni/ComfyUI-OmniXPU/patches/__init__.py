@@ -44,6 +44,13 @@ COMPONENTS = (
         "adapters/sparse_attention.py",
     ),
     Component(
+        "h3_te_int8_cr_adapter",
+        "h3_te_int8_cr",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/h3_text_encoder.py",
+    ),
+    Component(
         "attention_adapter",
         "attention",
         "adapter",
