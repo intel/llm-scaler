@@ -103,8 +103,15 @@ ComfyUI's built-in node and the Kitchen XPU provider; it has no separate
 custom-node source pin. The kernel source is copied from `omni/omni_xpu_kernel`
 in the current llm-scaler checkout.
 
+The ComfyUI runtime image explicitly enables H3 INT8 ConvRot text projections
+with `OMNIXPU_H3_TE_INT8_CR=1`. The custom node itself defaults to disabled.
+Override the image setting with `docker run -e OMNIXPU_H3_TE_INT8_CR=0 ...`
+to use upstream full-precision H3 projections. See the
+[adapter documentation](../ComfyUI-OmniXPU/README.md#components-and-switches)
+for the precision policy and shared H3 scope.
+
 Mono Decode XPU is pinned to
-[`d42987e7e8a7fdee0ea8dd27f4bc90f1af0cb34a`](https://github.com/xiangyuT/comfy-mono-decode-xpu/commit/d42987e7e8a7fdee0ea8dd27f4bc90f1af0cb34a).
+[`5483586c6f357e75dd1833a9b4ccd9546fdf1b3a`](https://github.com/xiangyuT/comfy-mono-decode-xpu/commit/5483586c6f357e75dd1833a9b4ccd9546fdf1b3a).
 Its separate `mono-decode` stage builds the native extension for `XPU_TARGET`
 with the project's `build_icpx.sh` single compiler invocation. It does not use
 `install.py`, which skips compilation when a build sandbox has no XPU. A build

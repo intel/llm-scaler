@@ -43,7 +43,7 @@ ARG COMFY_NUNCHAKU_REPOSITORY=https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.g
 ARG COMFY_NUNCHAKU_COMMIT=9f5604445f56154dd44e8b4acfed1aef868003c5
 ARG COMFY_NUNCHAKU_VERSION=1.2.1+xpu.3
 ARG COMFY_MONO_DECODE_REPOSITORY=https://github.com/xiangyuT/comfy-mono-decode-xpu.git
-ARG COMFY_MONO_DECODE_COMMIT=d42987e7e8a7fdee0ea8dd27f4bc90f1af0cb34a
+ARG COMFY_MONO_DECODE_COMMIT=5483586c6f357e75dd1833a9b4ccd9546fdf1b3a
 ARG LLM_SCALER_SOURCE_REVISION=unknown
 ARG LLM_SCALER_SOURCE_DIRTY=unknown
 
@@ -595,6 +595,7 @@ LABEL org.opencontainers.image.version="${IMAGE_TAG}" \
       com.intel.omni.comfy-mono-decode.revision="${COMFY_MONO_DECODE_COMMIT}"
 
 ENV OMNIXPU_INTERPOLATE_FIX=0 \
+    OMNIXPU_H3_TE_INT8_CR=1 \
     UR_INCLUDE_DIR="/opt/venv/include/unified-runtime" \
     PIP_CONSTRAINT="/llm/manifests/omni-runtime-constraints.txt" \
     OMNI_IMAGE_VERSION="${IMAGE_TAG}" \

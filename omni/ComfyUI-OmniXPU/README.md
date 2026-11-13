@@ -151,8 +151,8 @@ offloading remain available. This limitation does not disable OmniXPU's
 
 ## Components and switches
 
-Adapters are enabled by default and always retain the original ComfyUI route
-for unsupported inputs:
+Adapter switches are controlled by environment variables. Unsupported inputs
+retain the original ComfyUI route:
 
 ```bash
 OMNIXPU_ENABLE=0            # Disable every custom-node component
@@ -161,6 +161,7 @@ OMNIXPU_SPARSE_ATTENTION=0  # Disable XPU eligibility for Model Sparse Attention
 OMNIXPU_NORM=0              # Disable the norm adapter
 OMNIXPU_FP8_GEMM=0          # Disable the temporary FP8 model/factory adapter
 OMNIXPU_QUANTIZED_MATMUL=0  # Disable native INT8 model-format eligibility
+OMNIXPU_H3_TE_INT8_CR=0     # Keep upstream full-precision H3 text projections
 OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
 OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM=0  # Disable Windows XPU model-boundary trim
 OMNIXPU_XPU_RAM_STAGING=0   # Disable DynamicVRAM host RAM weight staging on discrete XPU
@@ -170,6 +171,26 @@ OMNIXPU_SEEDVR_ADA_RESHAPE=0  # Disable the guarded SeedVR2 Ada reshape patch
 OMNIXPU_SEEDVR_CAPACITY=0     # Disable bounded SeedVR2 window-attention scheduling
 OMNIXPU_LARGE_VIDEO_PREPROCESS=0  # Disable bounded large-video CPU preprocessing
 ```
+
+The MiniMax H3 INT8 ConvRot text projection adapter is disabled by default
+when the custom node is installed independently. Set `OMNIXPU_H3_TE_INT8_CR=1`
+before startup to enable it. The Omni ComfyUI image explicitly sets
+`ENV OMNIXPU_H3_TE_INT8_CR=1` in `omni/docker/Dockerfile`, so the bundled image
+enables this policy. Use `docker run -e OMNIXPU_H3_TE_INT8_CR=0 ...` to override
+the image setting and keep upstream full-precision projections.
+It uses ComfyUI's `custom_operations` interface and the public Kitchen INT8
+Linear API. Only eligible INT8 ConvRot projections use BF16 activation
+conversion and dynamic INT8 quantization, returning FP32 output. The FP32
+residual, normalization, RoPE and attention boundaries are retained. This is
+a quantization policy and can change conditioning and image composition.
+Set `OMNIXPU_H3_TE_INT8_CR=0` before startup to keep upstream full-precision
+matrix multiplication. Explicit per-file full-precision requests, disabled
+formats/backends, weight/bias patches and caller-supplied custom operations
+retain their existing behavior. No Device ID or fixed projection dimensions
+are required. Other text encoder classes retain upstream's policy.
+ComfyUI's `comfy_force_forward` flag keeps these projections on their module
+path, including hooks and FP32 input activations; combined projection shortcuts
+do not bypass the conversion. Alternate PH3 text backbones are unchanged.
 
 The Qwen3.5 GDN prefill precision fix is enabled by default. Disable it with:
 

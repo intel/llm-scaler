@@ -110,12 +110,13 @@ def comfy_bridge(monkeypatch, comfy_ops):
     return ops
 
 
-def loaded_linear(ops, *, convrot, full_precision, width=256, output=96, group=256):
+def loaded_linear(ops, *, convrot, full_precision, width=256, output=96, group=256,
+                  factory=None):
     from comfy_kitchen.tensor import QuantizedTensor
     weight = torch.randn((output, width), dtype=torch.bfloat16, device='xpu')
     quantized = QuantizedTensor.from_float(weight, 'TensorWiseINT8Layout',
         per_channel=convrot, convrot=convrot, convrot_groupsize=group)
-    klass = ops.mixed_precision_ops({}, torch.bfloat16,
+    klass = factory or ops.mixed_precision_ops({}, torch.bfloat16,
         disabled=ops.get_disabled_quant_formats(torch.device('xpu')))
     model = klass.Linear(width, output, bias=False, device='xpu')
     configuration = {'format': 'int8_tensorwise', 'convrot': convrot,
@@ -369,3 +370,156 @@ def test_shared_qkv_preserves_global_module_hooks(shared_qkv, kind):
     assert all(torch.equal(a, b) for a, b in zip(actual, expected))
     assert qkv.get_stats()["fallback:module_contract"] == 1
     assert not qkv.get_stats().get("shared_calls")
+
+
+def h3_adapter():
+    spec = importlib.util.spec_from_file_location(
+        'h3_text_encoder_adapter_test', PATH.with_name('h3_text_encoder.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize('convrot,full_precision,group', [
+    (True, False, 64), (True, False, 256),
+    (True, True, 64), (False, False, 64),
+])
+def test_h3_fp32_boundary_and_file_precision(
+    comfy_bridge, monkeypatch, convrot, full_precision, group
+):
+    import comfy_kitchen as ck
+    from omni_xpu_kernel import int8
+    factory = h3_adapter()._operations(comfy_bridge, {}, torch.bfloat16)
+    model = loaded_linear(comfy_bridge, convrot=convrot,
+        full_precision=full_precision, width=512, group=group, factory=factory).eval()
+    x = torch.randn((1, 37, 512), device='xpu', dtype=torch.float32)
+    with torch.no_grad():
+        if convrot and not full_precision:
+            expected = ck.int8_linear(x.bfloat16(), model.weight._qdata,
+                model.weight._params.scale, out_dtype=torch.float32,
+                convrot=True, convrot_groupsize=group)
+        else:
+            expected = torch.nn.functional.linear(x, model.weight.to(x.dtype).dequantize())
+    original = int8.int8_linear
+    calls, hooks = [], []
+    def observe(*args, **kwargs):
+        calls.append((args[0].dtype, kwargs.get('out_dtype')))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(int8, 'int8_linear', observe)
+    handle = torch.nn.modules.module.register_module_forward_hook(
+        lambda module, inputs, output: hooks.append(module))
+    try:
+        with torch.no_grad(): actual = model(x)
+    finally:
+        handle.remove()
+    assert torch.equal(actual, expected) and actual.dtype == torch.float32
+    assert len(calls) == (1 if convrot and not full_precision else 0)
+    assert hooks == [model]
+
+
+def test_h3_weight_patch_and_disabled_backend_keep_dense_path(comfy_bridge, monkeypatch):
+    import comfy_kitchen as ck
+    from omni_xpu_kernel import int8
+    factory = h3_adapter()._operations(comfy_bridge, {}, torch.bfloat16)
+    model = loaded_linear(comfy_bridge, convrot=True, full_precision=False,
+                          factory=factory).eval()
+    x = torch.randn((7, 256), dtype=torch.float32, device='xpu')
+    monkeypatch.setattr(int8, 'int8_linear',
+        lambda *args, **kwargs: pytest.fail('native INT8 must be disabled here'))
+    model.weight_function = [lambda weight: weight * 1.25]
+    with torch.no_grad():
+        expected = torch.nn.functional.linear(x, model.weight.to(x.dtype).dequantize() * 1.25)
+        assert torch.equal(model(x), expected)
+    model.weight_function = []
+    with ck.use_backend('eager'), torch.no_grad():
+        expected = torch.nn.functional.linear(x, model.weight.to(x.dtype).dequantize())
+        assert torch.equal(model(x), expected)
+    model = model.cpu()
+    with torch.no_grad():
+        for dtype in (torch.float32, torch.bfloat16):
+            cpu_input = x.cpu().to(dtype)
+            expected = torch.nn.functional.linear(cpu_input, model.weight.to(dtype).dequantize())
+            assert torch.equal(model(cpu_input), expected)
+
+
+def test_h3_gradient_input_keeps_dense_autograd(comfy_bridge, monkeypatch):
+    from omni_xpu_kernel import int8
+    factory = h3_adapter()._operations(comfy_bridge, {}, torch.bfloat16)
+    model = loaded_linear(comfy_bridge, convrot=True, full_precision=False,
+                          factory=factory).eval()
+    monkeypatch.setattr(int8, 'int8_linear',
+        lambda *args, **kwargs: pytest.fail('INT8 inference bypassed autograd'))
+    for dtype in (torch.float32, torch.bfloat16):
+        x = torch.randn((7, 256), device='xpu', dtype=dtype, requires_grad=True)
+        actual = model(x)
+        weight = model.weight.to(dtype).dequantize()
+        expected = torch.nn.functional.linear(x, weight)
+        assert torch.equal(actual, expected)
+        actual.sum().backward()
+        assert torch.equal(x.grad, torch.ones_like(actual) @ weight)
+
+
+def test_h3_constructor_keeps_custom_operations_and_other_models(monkeypatch):
+    adapter = h3_adapter()
+    supported, other, custom, injected = object(), object(), object(), object()
+    calls = []
+    def original(self, dtype=None, model_class=supported, model_options={}):
+        calls.append(model_options)
+    monkeypatch.setattr(adapter, '_operations', lambda *args: injected)
+    wrapped = adapter._wrap_init(original, object(), supported)
+    options = {'quantization_metadata': {'layers': {}}}
+    wrapped(object(), torch.bfloat16, supported, options)
+    assert calls[-1]['custom_operations'] is injected
+    assert 'custom_operations' not in options
+    wrapped(object(), model_class=other, model_options=options)
+    assert calls[-1] is options
+    options = {**options, 'custom_operations': custom}
+    wrapped(object(), model_options=options)
+    assert calls[-1] is options
+
+
+def test_h3_combined_and_input_activation_use_module_path(comfy_bridge):
+    import comfy_kitchen as ck
+    factory = h3_adapter()._operations(comfy_bridge, {}, torch.bfloat16)
+    model = loaded_linear(comfy_bridge, convrot=True, full_precision=False,
+                          factory=factory).eval()
+    model._v_weight = model.weight
+    combined = comfy_bridge.CombinedLinear((model, model))
+    combined.prepare(torch.device('xpu'))
+    assert combined._v_weight is None
+    assert model._v_weight is model.weight
+    del model._v_weight
+    x = torch.randn((7, 512), device='xpu', dtype=torch.float32)
+    activated = torch.nn.functional.silu(x[..., :256]) * x[..., 256:]
+    with torch.no_grad():
+        expected = ck.int8_linear(activated.bfloat16(), model.weight._qdata,
+            model.weight._params.scale, out_dtype=torch.float32,
+            convrot=True, convrot_groupsize=256)
+        actual = comfy_bridge.linear_input_act(model, x, 'swiglu')
+    assert torch.equal(actual, expected)
+
+
+def test_h3_half_input_keeps_existing_qtensor_dispatch(comfy_bridge):
+    import comfy_kitchen as ck
+    factory = h3_adapter()._operations(comfy_bridge, {}, torch.bfloat16)
+    model = loaded_linear(comfy_bridge, convrot=True, full_precision=False,
+                          factory=factory).eval()
+    x = torch.randn((7, 256), device='xpu', dtype=torch.bfloat16)
+    with torch.no_grad():
+        expected = ck.int8_linear(x, model.weight._qdata, model.weight._params.scale,
+            out_dtype=x.dtype, convrot=True, convrot_groupsize=256)
+        assert torch.equal(model(x), expected)
+
+
+@pytest.mark.parametrize('shape', [(256,), (0, 256)])
+def test_h3_vector_and_empty_keep_linear_contract(comfy_bridge, monkeypatch, shape):
+    from omni_xpu_kernel import int8
+    factory = h3_adapter()._operations(comfy_bridge, {}, torch.bfloat16)
+    model = loaded_linear(comfy_bridge, convrot=True, full_precision=False,
+                          factory=factory).eval()
+    x = torch.randn(shape, device='xpu', dtype=torch.float32)
+    monkeypatch.setattr(int8, 'int8_linear',
+        lambda *args, **kwargs: pytest.fail('unsupported native rotation input'))
+    with torch.no_grad():
+        expected = torch.nn.functional.linear(x, model.weight.to(x.dtype).dequantize())
+        assert torch.equal(model(x), expected)
