@@ -171,17 +171,17 @@ OMNIXPU_SEEDVR_CAPACITY=0     # Disable bounded SeedVR2 window-attention schedul
 OMNIXPU_LARGE_VIDEO_PREPROCESS=0  # Disable bounded large-video CPU preprocessing
 ```
 
-The Qwen3.5 GDN prefill precision fix is opt-in:
+The Qwen3.5 GDN prefill precision fix is enabled by default. Disable it with:
 
 ```bash
-OMNIXPU_QWEN35_GDN_PREFILL_FP32_FIX=1
+OMNIXPU_QWEN35_GDN_PREFILL_FP32_FIX=0
 ```
 
 It keeps Q/K L2 normalization intermediates in FP32 on XPU for BF16/FP16
 inputs, using PyTorch's FP32 norm output and division. The upstream chunk
 algorithm, epsilon and final output dtype are retained. This fix is controlled
 independently of `OMNIXPU_NORM` and remains subject to `OMNIXPU_ENABLE`.
-Leave its variable unset or set it to `0` to retain upstream precision.
+Set its variable to `0` to retain upstream precision.
 It applies at the shared text-encoder call site independently of Mono Decode;
 global functional normalization and non-XPU calls keep their existing behavior.
 

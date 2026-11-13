@@ -134,7 +134,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     assert config.seedvr_ada_reshape
     assert config.seedvr_capacity
     assert config.large_video_preprocess
-    assert not config.qwen35_gdn_prefill_fp32_fix
+    assert config.qwen35_gdn_prefill_fp32_fix
     assert not config.interpolate_fix
     assert not config.median_fix
     assert not config.aimdo_memory_compiler
@@ -144,7 +144,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
 
 
 @pytest.mark.parametrize("master,norm,fix,enabled", [
-    ("1", "0", "1", {"qwen35_gdn_precision"}),
+    ("1", "0", None, {"qwen35_gdn_precision"}),
     ("1", "1", "0", {"norm_adapter"}),
     ("0", "1", "1", set()),
 ])
@@ -153,7 +153,10 @@ def test_gdn_precision_fix_is_independent_of_norm(
 ):
     monkeypatch.setenv("OMNIXPU_ENABLE", master)
     monkeypatch.setenv("OMNIXPU_NORM", norm)
-    monkeypatch.setenv("OMNIXPU_QWEN35_GDN_PREFILL_FP32_FIX", fix)
+    if fix is None:
+        monkeypatch.delenv("OMNIXPU_QWEN35_GDN_PREFILL_FP32_FIX", raising=False)
+    else:
+        monkeypatch.setenv("OMNIXPU_QWEN35_GDN_PREFILL_FP32_FIX", fix)
     cfg = _load_module("omnixpu_bootstrap_config", _PLUGIN / "config.py").config
     patches = _load_registry(monkeypatch)
     monkeypatch.setattr(patches, "COMPONENTS", tuple(

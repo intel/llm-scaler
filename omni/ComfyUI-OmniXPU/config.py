@@ -57,7 +57,7 @@ class Config:
         )
         self.qwen35_gdn_prefill_fp32_fix = (
             master
-            and os.environ.get("OMNIXPU_QWEN35_GDN_PREFILL_FP32_FIX", "0") != "0"
+            and os.environ.get("OMNIXPU_QWEN35_GDN_PREFILL_FP32_FIX", "1") != "0"
         )
         self.interpolate_fix = (
             master and os.environ.get("OMNIXPU_INTERPOLATE_FIX", "0") != "0"
