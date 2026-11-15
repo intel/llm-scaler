@@ -128,10 +128,17 @@ Qwen3.5-9B W4A8 prompt-enhancement decode calls from `TextGenerate` and
 existing upstream workflows use the hooks when their model and input contracts
 match. Other text encoders retain their existing routes.
 
-The image defaults to `MONO_DECODE_XPU=1`. Set `MONO_DECODE_XPU=0` in the
-container environment to disable the recommended stack. Explicit per-piece
+The image defaults to `MONO_DECODE_XPU=1` and
+`MONO_DECODE_XPU_DRAFT_INT4=1`. The latter enables the two-stage MTP draft
+lm_head: INT4 vocabulary scoring followed by exact INT8 scoring of the selected
+candidates. Its per-generation INT4 weight copy is created when the model and
+available memory permit. Set `MONO_DECODE_XPU_DRAFT_INT4=0` in the container
+environment to use the INT8 draft head; the standalone custom node defaults
+this option to `0`.
+
+Set `MONO_DECODE_XPU=0` to disable the recommended stack. Explicit per-piece
 settings override that master switch; the experimental graph path remains off.
-See the node's [environment reference](https://github.com/xiangyuT/comfy-mono-decode-xpu/blob/d42987e7e8a7fdee0ea8dd27f4bc90f1af0cb34a/docs/ENV.md)
+See the node's [environment reference](https://github.com/xiangyuT/comfy-mono-decode-xpu/blob/b155da66cc1b47d642c7ec599c7f396c98f9e7ac/docs/ENV.md)
 for individual controls and counters. ComfyUI's memory mode and transfer policy
 are selected independently through its existing arguments.
 
