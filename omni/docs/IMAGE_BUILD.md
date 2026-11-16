@@ -111,13 +111,15 @@ to use upstream full-precision H3 projections. See the
 for the precision policy and shared H3 scope.
 
 Mono Decode XPU is pinned to
-[`5483586c6f357e75dd1833a9b4ccd9546fdf1b3a`](https://github.com/xiangyuT/comfy-mono-decode-xpu/commit/5483586c6f357e75dd1833a9b4ccd9546fdf1b3a).
+[`b155da66cc1b47d642c7ec599c7f396c98f9e7ac`](https://github.com/xiangyuT/comfy-mono-decode-xpu/commit/b155da66cc1b47d642c7ec599c7f396c98f9e7ac).
 Its separate `mono-decode` stage builds the native extension for `XPU_TARGET`
 with the project's `build_icpx.sh` single compiler invocation. It does not use
 `install.py`, which skips compilation when a build sandbox has no XPU. A build
 or native import failure stops image construction. The final image retains the
 pinned checkout and compiled extension under
 `/llm/ComfyUI/custom_nodes/comfy-mono-decode-xpu` for normal ComfyUI discovery.
+The final image sets `MONO_DECODE_XPU_DRAFT_INT4=1`; see the
+[prompt-enhancement controls](COMFYUI.md#prompt-enhancement-decode) for runtime overrides.
 
 Each provider revision must be reachable from its pinned remote. The build
 fetches and checks out those exact full commits before constructing the private
