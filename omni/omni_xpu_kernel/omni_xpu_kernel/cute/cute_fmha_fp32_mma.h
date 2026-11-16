@@ -4,6 +4,7 @@
 
 #include <cute/arch/mma_xe.hpp>
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <type_traits>
 
 namespace cute {
@@ -24,12 +25,12 @@ struct XE_DPAS_TT<M, float, float, float, float>
   // Largest float whose ties-to-even TF32 rounding is still finite (0x7f7fefff).
   static constexpr float kHighLimit = 0x1.ffdffep+127f;
 
-  // Ties-to-even TF32 rounding of the clamped value. The clamp keeps the high
-  // part finite; Inf and NaN inputs still reach the result through a - high.
+  // Ties-to-even TF32 rounding of the clamped value: one hardware conversion
+  // on BMG (SPV_INTEL_tensor_float32_conversion). The clamp keeps the high part
+  // finite; Inf and NaN inputs still reach the result through a - high.
   CUTE_DEVICE static float high(float value) {
-    value = sycl::fmin(sycl::fmax(value, -kHighLimit), kHighLimit);
-    const uint32_t bits = sycl::bit_cast<uint32_t>(value);
-    return sycl::bit_cast<float>((bits + 0xfffu + ((bits >> 13) & 1u)) & ~0x1fffu);
+    return sycl::ext::oneapi::experimental::matrix::round_to_tf32(
+        sycl::fmin(sycl::fmax(value, -kHighLimit), kHighLimit));
   }
 
   template <class Vector>
@@ -37,14 +38,15 @@ struct XE_DPAS_TT<M, float, float, float, float>
     if constexpr (std::is_same_v<Vector, float>) {
       return high(source);
     } else {
-      // Use whole register vectors to avoid addressable element temporaries
-      // in the SYCL lowering of this atom.
 #if defined(__SYCL_DEVICE_ONLY__)
-      using Bits = intel::vector_t<uint32_t, sizeof(Vector) / sizeof(float)>;
+      // Clamp whole register vectors; the conversion is per element.
       const Vector clamped = __builtin_elementwise_min(
           __builtin_elementwise_max(source, Vector(-kHighLimit)), Vector(kHighLimit));
-      const auto bits = sycl::bit_cast<Bits>(clamped);
-      return sycl::bit_cast<Vector>((bits + 0xfffu + ((bits >> 13) & 1u)) & ~0x1fffu);
+      Vector rounded;
+      CUTE_UNROLL
+      for (int i = 0; i < int(sizeof(Vector) / sizeof(float)); ++i)
+        rounded[i] = sycl::ext::oneapi::experimental::matrix::round_to_tf32(clamped[i]);
+      return rounded;
 #else
       // CuTe uses marray for the non-executed host instantiation.
       Vector rounded;

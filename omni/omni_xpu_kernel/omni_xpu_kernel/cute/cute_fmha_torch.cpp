@@ -413,7 +413,8 @@ at::Tensor sdp_bhld_fp32_d72(
               "cute_fmha: FP32 D72 requires unit channel stride");
   auto out = at::empty({B, Lq, H, D}, q.options());
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
-  run_d128_tile<float, 2, 256, 16, 8, 16, 96, 32>(
+  // D72 fills five 16-wide V tiles (80 columns) instead of six.
+  run_d128_tile<float, 2, 256, 16, 8, 16, 80, 32>(
       q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(),
       B, H, Lq, Lkv, D, scale,
       q.stride(2), q.stride(1), q.stride(0),

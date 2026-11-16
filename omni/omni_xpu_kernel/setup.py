@@ -818,7 +818,8 @@ class ICPXBuildExt(build_ext):
                     f"-device {cute_aot_target}",
                     "-Xspirv-translator",
                     "-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,"
-                    "+SPV_INTEL_subgroup_matrix_multiply_accumulate",
+                    "+SPV_INTEL_subgroup_matrix_multiply_accumulate,"
+                    "+SPV_INTEL_tensor_float32_conversion",
                     "-fno-sycl-instrument-device-code",
                     "-DCUTLASS_ENABLE_SYCL",
                     "-DSYCL_INTEL_TARGET",
@@ -932,7 +933,8 @@ class ICPXBuildExt(build_ext):
                     "-Xsycl-target-backend", f"-device {cute_aot_target}",
                     "-Xspirv-translator",
                     "-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,"
-                    "+SPV_INTEL_subgroup_matrix_multiply_accumulate",
+                    "+SPV_INTEL_subgroup_matrix_multiply_accumulate,"
+                    "+SPV_INTEL_tensor_float32_conversion",
                     "-fno-sycl-instrument-device-code",
                     "-DCUTLASS_ENABLE_SYCL", "-DSYCL_INTEL_TARGET",
                     f"-D{XPU_ARCH_MACRO}=1",
