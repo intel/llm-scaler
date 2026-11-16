@@ -17,6 +17,7 @@
  **************************************************************************************************/
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
+#include <c10/core/DeviceGuard.h>
 #include <torch/all.h>
 #include <torch/library.h>
 
@@ -44,6 +45,9 @@
 #include "../csrc/device_utils.h"
 #endif
 #include "cute_fmha_config.h"
+#if defined(OMNI_XPU_ARCH_BMG)
+#include "cute_fmha_fp32_mma.h"
+#endif
 
 using namespace cute;
 
@@ -383,6 +387,42 @@ at::Tensor sdp(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
 }
 
 #if defined(OMNI_XPU_ARCH_BMG)
+// The vision encoder supplies FP32 Q/K/V with D72. CuTe's bounded online
+// softmax is shared with the existing half/BF16 kernels; FP32 fragments use
+// the three-product DPAS atom above. No dense Lq*Lkv buffer is allocated.
+at::Tensor sdp_bhld_fp32_d72(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+  TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+              "cute_fmha: FP32 D72 expects [B,H,L,D]");
+  TORCH_CHECK(q.device().is_xpu() && k.device() == q.device() && v.device() == q.device(),
+              "cute_fmha: FP32 D72 requires Q/K/V on the same XPU");
+  c10::OptionalDeviceGuard device_guard(q.device());
+  TORCH_CHECK(q.scalar_type() == at::kFloat && k.scalar_type() == at::kFloat &&
+              v.scalar_type() == at::kFloat, "cute_fmha: D72 requires FP32 Q/K/V");
+  const int B = checked_int(q.size(0), "batch");
+  const int H = checked_int(q.size(1), "heads");
+  const int Lq = checked_int(q.size(2), "query length");
+  const int Lkv = checked_int(k.size(2), "key/value length");
+  constexpr int D = 72;
+  TORCH_CHECK(B > 0 && H > 0 && Lq > 0 && Lkv > 0 && q.size(3) == D,
+              "cute_fmha: FP32 D72 requires positive B/H/L and head_dim=72");
+  TORCH_CHECK(k.size(0) == B && v.size(0) == B && k.size(1) == H &&
+              v.size(1) == H && k.size(3) == D && v.size(3) == D &&
+              v.size(2) == Lkv, "cute_fmha: FP32 D72 Q/K/V shape mismatch");
+  TORCH_CHECK(q.stride(3) == 1 && k.stride(3) == 1 && v.stride(3) == 1,
+              "cute_fmha: FP32 D72 requires unit channel stride");
+  auto out = at::empty({B, Lq, H, D}, q.options());
+  const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+  run_d128_tile<float, 2, 256, 16, 8, 16, 96, 32>(
+      q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(),
+      B, H, Lq, Lkv, D, scale,
+      q.stride(2), q.stride(1), q.stride(0),
+      k.stride(2), k.stride(1), k.stride(0),
+      v.stride(2), v.stride(1), v.stride(0),
+      out.stride(1), out.stride(2), out.stride(0));
+  return out.permute({0, 2, 1, 3});
+}
+
 at::Tensor sdp_wan22_cross(
     const at::Tensor& q,
     const at::Tensor& k,
@@ -788,6 +828,10 @@ at::Tensor sdp_bhld_d120(
 #define CUTE_FMHA_D120_IMPL(m)
 #endif
 #if defined(OMNI_XPU_ARCH_BMG)
+#define CUTE_FMHA_FP32_D72_DEF(m) \
+  m.def("sdp_bhld_fp32_d72(Tensor q, Tensor k, Tensor v) -> Tensor");
+#define CUTE_FMHA_FP32_D72_IMPL(m) \
+  m.impl("sdp_bhld_fp32_d72", &sdp_bhld_fp32_d72);
 #define CUTE_FMHA_WAN22_DEF(m) \
   m.def("sdp_wan22_cross(Tensor q, Tensor k, Tensor v) -> Tensor");
 #define CUTE_FMHA_WAN22_IMPL(m) \
@@ -801,6 +845,8 @@ at::Tensor sdp_bhld_d120(
 #define CUTE_FMHA_H3_VAE_D64_IMPL(m) \
   m.impl("sdp_minimax_h3_vae_d64", &sdp_minimax_h3_vae_d64);
 #else
+#define CUTE_FMHA_FP32_D72_DEF(m)
+#define CUTE_FMHA_FP32_D72_IMPL(m)
 #define CUTE_FMHA_WAN22_DEF(m)
 #define CUTE_FMHA_WAN22_IMPL(m)
 #define CUTE_FMHA_BHLD_D128_DEF(m)
@@ -811,6 +857,7 @@ at::Tensor sdp_bhld_d120(
 #define CUTE_FMHA_LIB_(NS) \
   TORCH_LIBRARY(NS, m) { \
     m.def("sdp(Tensor q, Tensor k, Tensor v) -> Tensor"); \
+    CUTE_FMHA_FP32_D72_DEF(m) \
     CUTE_FMHA_WAN22_DEF(m) \
     CUTE_FMHA_BHLD_D128_DEF(m) \
     CUTE_FMHA_H3_VAE_D64_DEF(m) \
@@ -818,6 +865,7 @@ at::Tensor sdp_bhld_d120(
   } \
   TORCH_LIBRARY_IMPL(NS, XPU, m) { \
     m.impl("sdp", &sdp); \
+    CUTE_FMHA_FP32_D72_IMPL(m) \
     CUTE_FMHA_WAN22_IMPL(m) \
     CUTE_FMHA_BHLD_D128_IMPL(m) \
     CUTE_FMHA_H3_VAE_D64_IMPL(m) \
