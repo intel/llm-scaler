@@ -21,13 +21,15 @@ struct XE_DPAS_TT<M, float, float, float, float>
   using typename Base::CVector;
   using typename Base::DVector;
 
+  // Largest float whose ties-to-even TF32 rounding is still finite (0x7f7fefff).
+  static constexpr float kHighLimit = 0x1.ffdffep+127f;
+
+  // Ties-to-even TF32 rounding of the clamped value. The clamp keeps the high
+  // part finite; Inf and NaN inputs still reach the result through a - high.
   CUTE_DEVICE static float high(float value) {
+    value = sycl::fmin(sycl::fmax(value, -kHighLimit), kHighLimit);
     const uint32_t bits = sycl::bit_cast<uint32_t>(value);
-    if ((bits & 0x7f800000u) == 0x7f800000u) return value;
-    uint32_t rounded = (bits + 0xfffu + ((bits >> 13) & 1u)) & ~0x1fffu;
-    // Rounding the largest finite inputs must not introduce infinity.
-    if ((rounded & 0x7f800000u) == 0x7f800000u) rounded = bits & ~0x1fffu;
-    return sycl::bit_cast<float>(rounded);
+    return sycl::bit_cast<float>((bits + 0xfffu + ((bits >> 13) & 1u)) & ~0x1fffu);
   }
 
   template <class Vector>
@@ -39,12 +41,10 @@ struct XE_DPAS_TT<M, float, float, float, float>
       // in the SYCL lowering of this atom.
 #if defined(__SYCL_DEVICE_ONLY__)
       using Bits = intel::vector_t<uint32_t, sizeof(Vector) / sizeof(float)>;
-      const auto bits = sycl::bit_cast<Bits>(source);
-      auto rounded = (bits + 0xfffu + ((bits >> 13) & 1u)) & ~0x1fffu;
-      rounded = ((rounded & 0x7f800000u) == 0x7f800000u)
-                    ? (bits & ~0x1fffu) : rounded;
-      rounded = ((bits & 0x7f800000u) == 0x7f800000u) ? bits : rounded;
-      return sycl::bit_cast<Vector>(rounded);
+      const Vector clamped = __builtin_elementwise_min(
+          __builtin_elementwise_max(source, Vector(-kHighLimit)), Vector(kHighLimit));
+      const auto bits = sycl::bit_cast<Bits>(clamped);
+      return sycl::bit_cast<Vector>((bits + 0xfffu + ((bits >> 13) & 1u)) & ~0x1fffu);
 #else
       // CuTe uses marray for the non-executed host instantiation.
       Vector rounded;
@@ -55,13 +55,16 @@ struct XE_DPAS_TT<M, float, float, float, float>
     }
   }
 
+  // The low part a - high is exact and is not rounded again: the DPAS reads
+  // only its TF32 bits, which drops at most 2^-21 of |a|, the same order as the
+  // omitted low*low product.
   template <class Accumulator = CVector>
   CUTE_DEVICE static void fma(DVector& d, AVector const& a,
                               BVector const& b, Accumulator const& c) {
     const AVector ah = high_vector(a);
     const BVector bh = high_vector(b);
-    const AVector al = high_vector(a - ah);
-    const BVector bl = high_vector(b - bh);
+    const AVector al = a - ah;
+    const BVector bl = b - bh;
     const auto ah_native = sycl::bit_cast<typename Native::AVector>(ah);
     const auto al_native = sycl::bit_cast<typename Native::AVector>(al);
     const auto bh_native = sycl::bit_cast<typename Native::BVector>(bh);

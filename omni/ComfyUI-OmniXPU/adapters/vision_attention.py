@@ -1,18 +1,27 @@
-"""Qwen3.5 vision attention: CuTe FP32 first, bounded FP32 fallback."""
+"""Qwen3.5 vision attention: CuTe FP32 for D72 contracts, upstream otherwise."""
 import functools
 import logging
 
 import torch
 
 log = logging.getLogger("ComfyUI-OmniXPU")
-_state = {"installed": False, "cute": 0, "sub_quad": 0}
+_state = {"installed": False, "cute": 0, "upstream": 0, "sub_quad": 0}
 
 
 def status():
     return dict(_state)
 
 
+def _dense_score_bytes(q, k, heads, skip_reshape):
+    if skip_reshape:
+        batch, lq, lkv = q.shape[0], q.shape[-2], k.shape[-2]
+    else:
+        batch, lq, lkv = q.shape[0], q.shape[1], k.shape[1]
+    return batch * heads * lq * lkv * q.element_size()
+
+
 def install():
+    from comfy import model_management
     from comfy.ldm.modules import attention
     try:
         from comfy.text_encoders import qwen35
@@ -50,7 +59,12 @@ def install():
             and k.shape[2] == v.shape[2]
             and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
         )
-        route = "cute" if native else "sub_quad"
+        if native:
+            route = "cute"
+        else:
+            # attention_pytorch materializes the score matrix and its softmax.
+            dense = 2 * _dense_score_bytes(q, k, heads, kwargs.get("skip_reshape", False))
+            route = "sub_quad" if dense > model_management.get_free_memory(q.device) else "upstream"
         _state[route] += 1
         if _state[route] == 1:
             log.info("[OmniXPU] Qwen3.5 FP32 vision attention: %s, shape=%s, CUTE available=%s",
@@ -61,6 +75,8 @@ def install():
             if kwargs.get("skip_output_reshape", False):
                 return out
             return out.transpose(1, 2).reshape(q.shape[0], q.shape[2], -1)
+        if route == "upstream":
+            return upstream(q, k, v, heads, **kwargs)
         return attention.attention_sub_quad(q, k, v, heads, **kwargs)
 
     @functools.wraps(original)

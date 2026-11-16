@@ -39,8 +39,10 @@ The D72 vision entry point keeps Q/K/V, online softmax and output in FP32.
 Its matrix products use three TF32 high/low products rather than a single
 TF32 product; results are not bitwise identical to an IEEE FP32 reduction.
 Use `cute.supports_fp32_d72_bhld()` to check the installed sidecar. The
-ComfyUI vision adapter selects this path for supported contracts and reports
-explicit FP32 sub-quadratic fallback counts for unsupported vision inputs.
+ComfyUI vision adapter selects this path for supported contracts. Other FP32
+vision inputs keep the upstream attention, except that inputs whose dense
+score matrix does not fit in free device memory use FP32 sub-quadratic
+attention; the adapter reports the count for each route.
 
 ## Artifact identity
 
