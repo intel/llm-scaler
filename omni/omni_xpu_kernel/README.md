@@ -13,6 +13,7 @@ across those native ABI boundaries.
 |---|---|
 | `sdp` | ESIMD scaled dot-product attention |
 | `cute` | CUTLASS-SYCL fused attention |
+| `cute.sdp_bhld_fp32_d72` | BMG FP32-input D72 vision attention with TF32 high/low products |
 | `cute.sdp_bhld_d128` | BMG batched/rectangular D128 BHLD attention |
 | `cute.sdp_minimax_h3_vae_d64` | Structural BMG MiniMax H3 VideoVAE D64 tile attention |
 | `cute.sdp_wan22_cross` | Exact BMG Wan 2.2 14B T2V Turbo cross-attention |
@@ -33,6 +34,15 @@ import omni_xpu_kernel as omni
 
 print(omni.native_capabilities())
 ```
+
+The D72 vision entry point keeps Q/K/V, online softmax and output in FP32.
+Its matrix products use three TF32 high/low products rather than a single
+TF32 product; results are not bitwise identical to an IEEE FP32 reduction.
+Use `cute.supports_fp32_d72_bhld()` to check the installed sidecar. The
+ComfyUI vision adapter selects this path for supported contracts. Other FP32
+vision inputs keep the upstream attention, except that inputs whose dense
+score matrix does not fit in free device memory use FP32 sub-quadratic
+attention; the adapter reports the count for each route.
 
 ## Artifact identity
 

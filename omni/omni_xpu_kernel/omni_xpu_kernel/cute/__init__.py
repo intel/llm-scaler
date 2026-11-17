@@ -107,6 +107,7 @@ def _register_fake_kernels():
         ("sdp", _fake_blhd),
         ("sdp_wan22_cross", _fake_blhd),
         ("sdp_bhld_d128", _fake_bhld_d128),
+        ("sdp_bhld_fp32_d72", _fake_bhld_blhd_backed),
         ("sdp_bhld_d120", _fake_bhld_blhd_backed),
         ("sdp_minimax_h3_vae_d64", _fake_bhld_blhd_backed),
     ):
@@ -174,6 +175,34 @@ def sdp_wan22_cross(
             "in this sidecar"
         )
     return torch.ops.cute_fmha.sdp_wan22_cross(q, k, v)
+
+
+def supports_fp32_d72_bhld() -> bool:
+    """Whether this sidecar provides the FP32-input D72 vision kernel."""
+    try:
+        _ensure_loaded()
+        return hasattr(torch.ops.cute_fmha, "sdp_bhld_fp32_d72")
+    except Exception:
+        return False
+
+
+@compile_op("cute_sdp_bhld_fp32_d72", _fake_bhld_blhd_backed)
+def sdp_bhld_fp32_d72(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """D72 BHLD attention with FP32 inputs, softmax and output.
+
+    Matrix products use a three-product TF32 high/low expansion. This keeps
+    the cross terms discarded by a single TF32 product; it is not bitwise
+    identical to an IEEE FP32 reduction tree.
+    """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.cute_sdp_bhld_fp32_d72(q, k, v)
+    _ensure_loaded()
+    if not hasattr(torch.ops.cute_fmha, "sdp_bhld_fp32_d72"):
+        raise RuntimeError("CUTE FP32 D72 attention is unavailable in this sidecar")
+    _prepare_bmg_policy_dispatch(q)
+    return torch.ops.cute_fmha.sdp_bhld_fp32_d72(q, k, v)
 
 
 def supports_d128_bhld() -> bool:

@@ -21,6 +21,7 @@ _attention_route_counts = {}
 _attention_failed_contracts = set()
 _attention_experimental_warning_emitted = False
 _attention_traced_contracts = set()
+_vision_status = None
 
 _MINIMAX_H3_H56_CUTE_MIN_SEQUENCE = 31
 _MINIMAX_H3_VAE_D64_CUTE_MIN_SEQUENCE = 6
@@ -749,6 +750,14 @@ def _load_cute_backend():
 
         class _Wrap:
             @staticmethod
+            def supports_fp32_d72_bhld():
+                return hasattr(torch.ops.cute_fmha, "sdp_bhld_fp32_d72")
+
+            @staticmethod
+            def sdp_bhld_fp32_d72(q, k, v):
+                return torch.ops.cute_fmha.sdp_bhld_fp32_d72(q, k, v)
+
+            @staticmethod
             def sdp(q, k, v):
                 return fn(q, k, v)
 
@@ -801,11 +810,12 @@ def get_stats():
         "reasons": dict(_attention_fallback_reasons),
         "routes": dict(_attention_route_counts),
         "quarantined_contracts": len(_attention_failed_contracts),
+        "vision": _vision_status() if _vision_status is not None else None,
     }
 
 
 def apply():
-    global _backend_sdp, _backend_name
+    global _backend_sdp, _backend_name, _vision_status
     import sys
 
     probe = sys.modules.get("ComfyUI-OmniXPU.probe")
@@ -1466,5 +1476,10 @@ def apply():
     # Also register via the official API
     if hasattr(attn_mod, "register_attention_function"):
         attn_mod.register_attention_function("omnixpu", attention_omni)
+
+    if _backend_name == "cute":
+        from . import vision_attention
+        vision_attention.install(_backend_sdp)
+        _vision_status = vision_attention.status
 
     return True, None

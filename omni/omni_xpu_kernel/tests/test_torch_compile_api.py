@@ -38,7 +38,7 @@ APIS = {
                "rms_kitchen_rope1_", "rms_kitchen_rope", "rms_kitchen_rope_", "rms_kitchen_rope_split_half1",
                "rms_kitchen_rope_split_half1_", "rms_kitchen_rope_split_half", "rms_kitchen_rope_split_half_",
                "apply_ltx_split_rope_direct"),
-    "cute": ("sdp", "sdp_bhld_d120", "sdp_bhld_d128", "sdp_wan22_cross", "sdp_minimax_h3_vae_d64", "sol_attn"),
+    "cute": ("sdp", "sdp_bhld_d120", "sdp_bhld_d128", "sdp_bhld_fp32_d72", "sdp_wan22_cross", "sdp_minimax_h3_vae_d64", "sol_attn"),
     "sdp": ("sdp",),
     "linear": ("onednn_w8a16_fp8", "try_onednn_w8a16_fp8"),
     "layout": ("cat_pad_bmg",),
@@ -294,6 +294,9 @@ def case(api, *, dtype=torch.bfloat16, rows=3):
             k = torch.randn_like(q)
             v = _rand((1, 37, 32, 192), torch.float16)[..., 128:].transpose(1, 2)
             return function, (q, k, v), {}
+        if name == "sdp_bhld_fp32_d72":
+            q = _rand((1, 32, 4, 72), torch.float32).transpose(1, 2)
+            return function, (q, torch.randn_like(q), torch.randn_like(q)), {}
         if name.startswith("sdp_bhld"):
             dim = int(name[-3:])
             q = _rand((1, 32, 4, dim), dtype).transpose(1, 2)
@@ -396,7 +399,7 @@ def test_public_tensor_inventory_has_no_unclassified_api():
     assert controls == RUNTIME_CONTROLS
     assert not controls.intersection(API_NAMES)
     assert actual == set(API_NAMES)
-    assert len(actual) == 97
+    assert len(actual) == 98
 
 
 @pytest.mark.parametrize("api", API_NAMES)
