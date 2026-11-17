@@ -248,6 +248,8 @@ def _load_patch(
 
     comfy = types.ModuleType("comfy")
     comfy.__path__ = []
+    model_management = types.ModuleType("comfy.model_management")
+    comfy.model_management = model_management
     ldm = types.ModuleType("comfy.ldm")
     ldm.__path__ = []
     modules = types.ModuleType("comfy.ldm.modules")
@@ -325,6 +327,7 @@ def _load_patch(
     probe.sdp = Esimd
     for name, module in (
         ("comfy", comfy),
+        ("comfy.model_management", model_management),
         ("comfy.ldm", ldm),
         ("comfy.ldm.modules", modules),
         ("comfy.ldm.modules.attention", attention),
