@@ -340,12 +340,85 @@ def _load_patch(
         f"{adapters.__name__}.attention",
         _ADAPTERS / "attention.py",
     )
+    if expected_apply is None:
+        return patch, attention, calls
     result = patch.apply()
     if expected_apply:
         assert result == (True, None)
     else:
         assert result[0] is False
     return patch, attention, calls
+
+
+@pytest.mark.parametrize("native,error,free_memory", [
+    (True, False, 0), (False, False, 1 << 40), (False, False, 0), (True, True, 0),
+])
+def test_raw_cute_backend_vision_without_python_package(
+    monkeypatch, tmp_path, native, error, free_memory,
+):
+    patch, attention, calls = _load_patch(monkeypatch, expected_apply=None)
+    monkeypatch.setitem(sys.modules, "omni_xpu_kernel", None)
+    extension = tmp_path / "raw-cute.so"
+    extension.touch()
+    monkeypatch.setenv("OMNI_CUTE_FMHA_SO", str(extension))
+    monkeypatch.setattr(torch.ops, "load_library", lambda path: None)
+    ops = types.SimpleNamespace(sdp=lambda q, k, v: q)
+
+    def native_attention(q, k, v):
+        calls.append("vision_cute")
+        if error:
+            raise RuntimeError("native vision failure")
+        return q
+
+    if native:
+        ops.sdp_bhld_fp32_d72 = native_attention
+    monkeypatch.setattr(torch.ops, "cute_fmha", ops)
+
+    class VisionAttention:
+        def forward(self, x, cu_seqlens, position_embeddings, optimized_attention=None):
+            return optimized_attention(
+                x, x, x, x.shape[1], skip_reshape=True, skip_output_reshape=True,
+            )
+
+    text_encoders = types.ModuleType("comfy.text_encoders")
+    qwen35 = types.ModuleType("comfy.text_encoders.qwen35")
+    qwen35.Qwen35VisionAttention = VisionAttention
+    text_encoders.qwen35 = qwen35
+    monkeypatch.setitem(sys.modules, text_encoders.__name__, text_encoders)
+    monkeypatch.setitem(sys.modules, qwen35.__name__, qwen35)
+    monkeypatch.setattr(sys.modules["comfy.model_management"], "get_free_memory", lambda device: free_memory, raising=False)
+
+    def sub_quad(*args, **kwargs):
+        calls.append("sub_quad")
+        return "sub-quad-output"
+
+    attention.attention_sub_quad = sub_quad
+    _load_module("omnixpu_attention_test.adapters.vision_attention", _ADAPTERS / "vision_attention.py")
+
+    class VisionTensor(_FakeTensor):
+        ndim = property(lambda self: len(self.shape))
+
+        def stride(self, dim=None):
+            return self._stride if dim is None else self._stride[dim]
+
+        def element_size(self):
+            return 4
+
+    assert patch.apply() == (True, None)
+    x = VisionTensor(seq=32, heads=2, dim_head=72, dtype=torch.float32)
+    run = lambda: VisionAttention().forward(x, None, None, attention.attention_pytorch)
+    if error:
+        with pytest.raises(RuntimeError, match="native vision failure"):
+            run()
+        assert "torch" not in calls
+    else:
+        output = run()
+        if native:
+            assert output is x
+            assert calls == ["vision_cute"]
+        else:
+            assert output == ("torch-output" if free_memory else "sub-quad-output")
+            assert calls == (["torch"] if free_memory else ["sub_quad"])
 
 
 @pytest.mark.parametrize(

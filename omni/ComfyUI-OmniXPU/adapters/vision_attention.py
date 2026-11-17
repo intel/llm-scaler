@@ -20,7 +20,7 @@ def _dense_score_bytes(q, k, heads, skip_reshape):
     return batch * heads * lq * lkv * q.element_size()
 
 
-def install():
+def install(backend):
     from comfy import model_management
     from comfy.ldm.modules import attention
     try:
@@ -28,7 +28,6 @@ def install():
     except ImportError:
         _state["reason"] = "Qwen3.5 vision module unavailable"
         return
-    from omni_xpu_kernel import cute
 
     cls = getattr(qwen35, "Qwen35VisionAttention", None)
     if cls is None:
@@ -38,7 +37,7 @@ def install():
     if getattr(original, "_omnixpu_vision_attention", False):
         return
     stock = (attention.attention_pytorch, attention.attention_basic)
-    capable = getattr(cute, "supports_fp32_d72_bhld", lambda: False)()
+    capable = getattr(backend, "supports_fp32_d72_bhld", lambda: False)()
     _state.update(installed=True, kernel_available=bool(capable))
 
     def dispatch(upstream, q, k, v, heads, **kwargs):
@@ -71,7 +70,7 @@ def install():
                      route, tuple(q.shape), capable)
         if native:
             # Native errors propagate; they must not silently disable a fast path.
-            out = cute.sdp_bhld_fp32_d72(q, k, v)
+            out = backend.sdp_bhld_fp32_d72(q, k, v)
             if kwargs.get("skip_output_reshape", False):
                 return out
             return out.transpose(1, 2).reshape(q.shape[0], q.shape[2], -1)

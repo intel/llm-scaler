@@ -750,6 +750,14 @@ def _load_cute_backend():
 
         class _Wrap:
             @staticmethod
+            def supports_fp32_d72_bhld():
+                return hasattr(torch.ops.cute_fmha, "sdp_bhld_fp32_d72")
+
+            @staticmethod
+            def sdp_bhld_fp32_d72(q, k, v):
+                return torch.ops.cute_fmha.sdp_bhld_fp32_d72(q, k, v)
+
+            @staticmethod
             def sdp(q, k, v):
                 return fn(q, k, v)
 
@@ -1471,7 +1479,7 @@ def apply():
 
     if _backend_name == "cute":
         from . import vision_attention
-        vision_attention.install()
+        vision_attention.install(_backend_sdp)
         _vision_status = vision_attention.status
 
     return True, None
