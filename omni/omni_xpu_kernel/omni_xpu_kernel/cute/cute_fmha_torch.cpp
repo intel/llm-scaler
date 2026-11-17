@@ -411,16 +411,22 @@ at::Tensor sdp_bhld_fp32_d72(
               v.size(2) == Lkv, "cute_fmha: FP32 D72 Q/K/V shape mismatch");
   TORCH_CHECK(q.stride(3) == 1 && k.stride(3) == 1 && v.stride(3) == 1,
               "cute_fmha: FP32 D72 requires unit channel stride");
+  // Lkv is checked int32, so sum(exp(score-max)) < 2^31. Scale V by
+  // 2^-32 to bound the unnormalized P*V below FLT_MAX/2, preserving tiny P.
+  // Do this once outside FMHA's Q-tile loop; inputs remain unmodified.
+  auto scaled_v = at::mul(v, 0x1p-32f);
   auto out = at::empty({B, Lq, H, D}, q.options());
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
   // D72 fills five 16-wide V tiles (80 columns) instead of six.
   run_d128_tile<float, 2, 256, 16, 8, 16, 80, 32>(
-      q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(),
+      q.data_ptr(), k.data_ptr(), scaled_v.data_ptr(), out.data_ptr(),
       B, H, Lq, Lkv, D, scale,
       q.stride(2), q.stride(1), q.stride(0),
       k.stride(2), k.stride(1), k.stride(0),
-      v.stride(2), v.stride(1), v.stride(0),
+      scaled_v.stride(2), scaled_v.stride(1), scaled_v.stride(0),
       out.stride(1), out.stride(2), out.stride(0));
+  // Restore the exact power of two only after softmax normalization.
+  out.mul_(0x1p32f);
   return out.permute({0, 2, 1, 3});
 }
 

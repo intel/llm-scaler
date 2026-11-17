@@ -1,5 +1,6 @@
 """FP64 oracles for the FP32-input vision attention entry point."""
 import pytest
+import math
 import torch
 import torch.nn.functional as F
 
@@ -55,3 +56,28 @@ def test_fp32_d72_extreme_values_follow_reference(value):
     assert torch.equal(out.isinf(), ref.isinf())
     finite = ref.isfinite()
     torch.testing.assert_close(out[finite], ref[finite], atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("length,value", [(32, 2.0**123), (65, -2.0**126)])
+def test_fp32_d72_repeated_large_values_remain_finite(length, value):
+    _require_kernel()
+    q = torch.zeros(1, 2, 17, 72, device="xpu")
+    k = torch.zeros(1, 2, length, 72, device="xpu")
+    v = torch.full_like(k, value)
+    out = cute.sdp_bhld_fp32_d72(q, k, v)
+    assert out.isfinite().all()
+    torch.testing.assert_close(out, torch.full_like(q, value), atol=0, rtol=1e-5)
+
+
+def test_fp32_d72_tiny_weights_keep_large_v_contributions():
+    _require_kernel()
+    q = torch.zeros(1, 2, 17, 72, device="xpu")
+    q[..., 0] = 1
+    k = torch.zeros(1, 2, 32, 72, device="xpu")
+    k[:, :, 1:, 0] = -134 * math.log(2) * math.sqrt(72)
+    v = torch.full_like(k, 2.0**123)
+    v[:, :, 0] = 0
+    # Scaling P itself underflows these weights to zero in TF32, losing an
+    # otherwise finite ~0.01514 contribution. Scaling V preserves it.
+    out = cute.sdp_bhld_fp32_d72(q, k, v)
+    torch.testing.assert_close(out.cpu().double(), _reference(q, k, v), atol=1e-4, rtol=1e-4)
