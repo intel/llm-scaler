@@ -111,7 +111,7 @@ to use upstream full-precision H3 projections. See the
 for the precision policy and shared H3 scope.
 
 Mono Decode XPU is pinned to
-[`b155da66cc1b47d642c7ec599c7f396c98f9e7ac`](https://github.com/xiangyuT/comfy-mono-decode-xpu/commit/b155da66cc1b47d642c7ec599c7f396c98f9e7ac).
+[`8d6a155596418d0258adf3001e746a7a50ab45a7`](https://github.com/xiangyuT/comfy-mono-decode-xpu/commit/8d6a155596418d0258adf3001e746a7a50ab45a7).
 Its separate `mono-decode` stage builds the native extension for `XPU_TARGET`
 with the project's `build_icpx.sh` single compiler invocation. It does not use
 `install.py`, which skips compilation when a build sandbox has no XPU. A build

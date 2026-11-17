@@ -138,7 +138,7 @@ this option to `0`.
 
 Set `MONO_DECODE_XPU=0` to disable the recommended stack. Explicit per-piece
 settings override that master switch; the experimental graph path remains off.
-See the node's [environment reference](https://github.com/xiangyuT/comfy-mono-decode-xpu/blob/b155da66cc1b47d642c7ec599c7f396c98f9e7ac/docs/ENV.md)
+See the node's [environment reference](https://github.com/xiangyuT/comfy-mono-decode-xpu/blob/8d6a155596418d0258adf3001e746a7a50ab45a7/docs/ENV.md)
 for individual controls and counters. ComfyUI's memory mode and transfer policy
 are selected independently through its existing arguments.
 

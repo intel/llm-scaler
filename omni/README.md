@@ -163,7 +163,7 @@ The focused source build selects:
   Kitchen and the packaged `omni_xpu_kernel` XPU operators; see
   [usage and legacy-node migration](docs/SPARSE_ATTENTION.md);
 - [ComfyUI-OmniXPU](ComfyUI-OmniXPU/README.md);
-- [Mono Decode XPU](https://github.com/xiangyuT/comfy-mono-decode-xpu/commit/b155da66cc1b47d642c7ec599c7f396c98f9e7ac)
+- [Mono Decode XPU](https://github.com/xiangyuT/comfy-mono-decode-xpu/commit/8d6a155596418d0258adf3001e746a7a50ab45a7)
   for Qwen3.5-9B W4A8 prompt-enhancement decode, enabled by default as a standard
   custom node; see [usage and controls](docs/COMFYUI.md#prompt-enhancement-decode);
 - ComfyUI v0.45.0 integrated Node Manager plus pinned VideoHelperSuite,
