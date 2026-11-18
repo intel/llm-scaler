@@ -16,10 +16,10 @@ The current image supports Intel Arc B-series/Battlemage GPUs. `build.sh`
 assigns the `-comfyui-bmg` suffix to local builds because their native binaries
 are AOT-compiled for BMG. Published BMG releases use
 `intel/llm-scaler-omni:<version>` without a flavor or target suffix.
-[`0.2.0-b2`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.2.0-b2/images/sha256-cc127efc23f8d6033d00e9d759468241ef478562ba63a56bb1dd8e83bbab46e3)
-is published. The current development version, `0.2.0-b3`, is available only
+[`0.2.0-b3`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.2.0-b3/images/sha256-084744e5f69218e4fb2c8106429a951ca63e44f2f8d8677b28a1ba181c8e7b6d)
+is published. The current development version, `0.2.0-b4`, is available only
 as a source build. The command above produces
-`llm-scaler-omni:0.2.0-b3-comfyui-bmg`.
+`llm-scaler-omni:0.2.0-b4-comfyui-bmg`.
 
 The supported environment overrides are:
 
@@ -241,7 +241,7 @@ the destination XPU.
 Run the validator inside the final container:
 
 ```bash
-IMAGE=llm-scaler-omni:0.2.0-b3-comfyui-bmg
+IMAGE=llm-scaler-omni:0.2.0-b4-comfyui-bmg
 
 sudo docker run --rm \
     --device=/dev/dri \

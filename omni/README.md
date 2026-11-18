@@ -6,9 +6,9 @@ default image is a single-XPU ComfyUI environment with target-specific
 ComfyUI integration layer.
 
 > [!IMPORTANT]
-> The current `0.2.0-b3` beta preview is available only as a source build. The
-> published ComfyUI image is `intel/llm-scaler-omni:0.2.0-b2`. This source build is
-> experimental and focused on single-XPU ComfyUI workloads, and does not replace
+> The published ComfyUI image is [`intel/llm-scaler-omni:0.2.0-b3`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.2.0-b3/images/sha256-084744e5f69218e4fb2c8106429a951ca63e44f2f8d8677b28a1ba181c8e7b6d).
+> Source builds target `0.2.0-b4`, the next development version. This source build
+> is experimental and focused on single-XPU ComfyUI workloads, and does not replace
 > the broader b8 image. For SGLang Diffusion, Raylight, or other multi-XPU
 > scenarios, use the published
 > [`intel/llm-scaler-omni:0.1.0-b8`](https://github.com/intel/llm-scaler/releases/tag/omni-0.1.0-b8)
@@ -16,7 +16,14 @@ ComfyUI integration layer.
 
 ## Getting Started with the Omni Docker Image
 
-Build from the `omni` directory:
+Download the published BMG image:
+
+```bash
+docker pull intel/llm-scaler-omni:0.2.0-b3
+```
+
+To build the `0.2.0-b4` development version from source, run from the `omni`
+directory:
 
 ```bash
 cd omni
@@ -41,20 +48,20 @@ intel/llm-scaler-omni:<version>
 ```
 
 The published BMG image is
-[`intel/llm-scaler-omni:0.2.0-b2`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.2.0-b2/images/sha256-cc127efc23f8d6033d00e9d759468241ef478562ba63a56bb1dd8e83bbab46e3).
+[`intel/llm-scaler-omni:0.2.0-b3`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.2.0-b3/images/sha256-084744e5f69218e4fb2c8106429a951ca63e44f2f8d8677b28a1ba181c8e7b6d).
 The source-build command above produces the development tag
-`llm-scaler-omni:0.2.0-b3-comfyui-bmg`; `0.2.0-b3` has not been published.
-The component pins below describe this source build. Published tags are listed
-in [Releases](../Releases.md). The development version is defined in
-`omni_xpu_kernel/omni_xpu_kernel/_version.py`.
+`llm-scaler-omni:0.2.0-b4-comfyui-bmg`; `0.2.0-b4` has not been published.
+The component pins below describe this source build. The development version
+is defined in `omni_xpu_kernel/omni_xpu_kernel/_version.py`.
 
 ### Validate the image
 
 Run the supplied acceptance script against the final image with the GPU device
-exposed:
+exposed. This example uses the published image; use
+`llm-scaler-omni:0.2.0-b4-comfyui-bmg` to validate your development build:
 
 ```bash
-IMAGE=llm-scaler-omni:0.2.0-b3-comfyui-bmg
+IMAGE=intel/llm-scaler-omni:0.2.0-b3
 
 sudo docker run --rm \
     --device=/dev/dri \
@@ -64,7 +71,7 @@ sudo docker run --rm \
 
 The check verifies package identity, the Torch ABI, native AOT target, clean
 source provenance, dependencies, XPU availability, and required Kitchen
-capabilities. This source-built image supports BMG.
+capabilities. The image supports BMG.
 
 ### Run ComfyUI
 
@@ -72,7 +79,7 @@ Mount the existing ComfyUI model directory rather than copying models into the
 image:
 
 ```bash
-IMAGE=llm-scaler-omni:0.2.0-b3-comfyui-bmg
+IMAGE=intel/llm-scaler-omni:0.2.0-b3
 CONTAINER_NAME=comfyui
 COMFYUI_MODEL_DIR=/path/to/comfyui_models
 COMFYUI_INPUT_DIR=/path/to/comfyui_input
