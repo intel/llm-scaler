@@ -2,14 +2,9 @@
 
 本文保留 ComfyUI Intel Portable 0.34.0 的安装、运行时策略和历史验收记录。
 
-> **源码版本更新 — 2026-11-18。** 当前 Omni 开发源码构建版本为 `0.2.0-b4`，
-> native wheel 使用 `0.2.0b4+torch<minor>.<target>`。Windows b4 尚未构建或验收；
-> 下方 b3 源码说明及 b2 wheel 文件名、SHA、验收记录保留历史身份。
-> 当前构建方法见 [Windows WHL 指南](../omni_xpu_kernel/WHL_BUILD_INSTALL.md)。
-
-> **历史源码版本说明 — 2026-10-20。** 当时 Omni 源码构建版本已更新为
-> `0.2.0-b3`，native wheel 使用 `0.2.0b3+torch<minor>.<target>`。
-> 本页的 b2 wheel 文件名、SHA 和验收记录保留历史身份，不代表 b3 已验收。
+> **源码版本更新 — 2026-11-18。** 当前 Omni 源码构建版本已更新为
+> `0.2.0-b4`，native wheel 使用 `0.2.0b4+torch<minor>.<target>`。
+> 本页的 b2 wheel 文件名、SHA 和验收记录保留历史身份，不代表 b4 已验收。
 > 新版本构建与安装方式见 [Windows WHL 指南](../omni_xpu_kernel/WHL_BUILD_INSTALL.md)。
 
 升级到 ComfyUI 0.35.0 或更高版本时，可以参考本文的 Windows 安装与运行时

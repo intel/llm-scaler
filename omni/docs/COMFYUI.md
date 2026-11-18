@@ -7,13 +7,12 @@ bundled in the image.
 
 Mount an existing ComfyUI model directory and start ComfyUI directly. This is
 the recommended default when the workflow fits in XPU memory. The following
-uses the published image
-[`intel/llm-scaler-omni:0.2.0-b3`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.2.0-b3/images/sha256-084744e5f69218e4fb2c8106429a951ca63e44f2f8d8677b28a1ba181c8e7b6d).
-For the `0.2.0-b4` development source build described in
-[`../README.md`](../README.md), set `IMAGE=llm-scaler-omni:0.2.0-b4-comfyui-bmg`.
+uses the local image produced by the source-build command in
+[`../README.md`](../README.md). The source version is `0.2.0-b4`; the published
+image is [`intel/llm-scaler-omni:0.2.0-b3`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.2.0-b3/images/sha256-084744e5f69218e4fb2c8106429a951ca63e44f2f8d8677b28a1ba181c8e7b6d).
 
 ```bash
-IMAGE=intel/llm-scaler-omni:0.2.0-b3
+IMAGE=llm-scaler-omni:0.2.0-b4-comfyui-bmg
 CONTAINER_NAME=comfyui
 
 sudo docker run -itd \
@@ -34,7 +33,7 @@ sudo docker run -itd \
         --user-directory /data/user
 ```
 
-The image supports Intel Arc B-series/Battlemage GPUs.
+This source-built image supports Intel Arc B-series/Battlemage GPUs.
 
 The default server is available at `http://127.0.0.1:8188`. Append
 `--listen 0.0.0.0` when remote access is required, and append
