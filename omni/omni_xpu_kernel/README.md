@@ -57,8 +57,8 @@ a version is not a validation claim. The generated wheel uses a PEP 440 local
 version such as:
 
 ```text
-omni_xpu_kernel-0.2.0b3+torch214.bmg
-omni_xpu_kernel-0.2.0b3+torch214.ptlh
+omni_xpu_kernel-0.2.0b4+torch214.bmg
+omni_xpu_kernel-0.2.0b4+torch214.ptlh
 ```
 
 Build and install a different wheel for every Torch/GPU pair. The wheel

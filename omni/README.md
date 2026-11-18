@@ -6,8 +6,8 @@ default image is a single-XPU ComfyUI environment with target-specific
 ComfyUI integration layer.
 
 > [!IMPORTANT]
-> The current `0.2.0-b3` beta preview is available only as a source build. The
-> published ComfyUI image is `intel/llm-scaler-omni:0.2.0-b2`. This source build is
+> The current `0.2.0-b4` beta preview is available only as a source build. The
+> published ComfyUI image is `intel/llm-scaler-omni:0.2.0-b3`. This source build is
 > experimental and focused on single-XPU ComfyUI workloads, and does not replace
 > the broader b8 image. For SGLang Diffusion, Raylight, or other multi-XPU
 > scenarios, use the published
@@ -41,9 +41,9 @@ intel/llm-scaler-omni:<version>
 ```
 
 The published BMG image is
-[`intel/llm-scaler-omni:0.2.0-b2`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.2.0-b2/images/sha256-cc127efc23f8d6033d00e9d759468241ef478562ba63a56bb1dd8e83bbab46e3).
+[`intel/llm-scaler-omni:0.2.0-b3`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.2.0-b3/images/sha256-084744e5f69218e4fb2c8106429a951ca63e44f2f8d8677b28a1ba181c8e7b6d).
 The source-build command above produces the development tag
-`llm-scaler-omni:0.2.0-b3-comfyui-bmg`; `0.2.0-b3` has not been published.
+`llm-scaler-omni:0.2.0-b4-comfyui-bmg`; `0.2.0-b4` has not been published.
 The component pins below describe this source build. Published tags are listed
 in [Releases](../Releases.md). The development version is defined in
 `omni_xpu_kernel/omni_xpu_kernel/_version.py`.
@@ -54,7 +54,7 @@ Run the supplied acceptance script against the final image with the GPU device
 exposed:
 
 ```bash
-IMAGE=llm-scaler-omni:0.2.0-b3-comfyui-bmg
+IMAGE=llm-scaler-omni:0.2.0-b4-comfyui-bmg
 
 sudo docker run --rm \
     --device=/dev/dri \
@@ -72,7 +72,7 @@ Mount the existing ComfyUI model directory rather than copying models into the
 image:
 
 ```bash
-IMAGE=llm-scaler-omni:0.2.0-b3-comfyui-bmg
+IMAGE=llm-scaler-omni:0.2.0-b4-comfyui-bmg
 CONTAINER_NAME=comfyui
 COMFYUI_MODEL_DIR=/path/to/comfyui_models
 COMFYUI_INPUT_DIR=/path/to/comfyui_input

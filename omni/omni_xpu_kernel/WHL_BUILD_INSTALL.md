@@ -1,10 +1,10 @@
 # omni_xpu_kernel Windows WHL 构建与 Portable 安装
 
-> **源码版本更新 — 2026-10-20。** 当前源码的 image / native wheel 基础版本为
-> `0.2.0-b3` / `0.2.0b3`，例如 Torch 2.14 BMG wheel 为
-> `0.2.0b3+torch214.bmg`。下方 2026-10-09 通知与各节的 b2 wheel 文件名、
+> **源码版本更新 — 2026-11-18。** 当前源码的 image / native wheel 基础版本为
+> `0.2.0-b4` / `0.2.0b4`，例如 Torch 2.14 BMG wheel 为
+> `0.2.0b4+torch214.bmg`。下方 2026-10-09 通知与各节的 b2 wheel 文件名、
 > SHA 和验收记录保留为历史身份；从当前源码构建时，应按实际 Torch/target
-> 选择 b3 wheel。Windows b3 wheel 尚未完成构建与安装态验收。
+> 选择 b4 wheel。Windows b4 wheel 尚未完成构建与安装态验收。
 
 > **Windows oneDNN 选择说明 — 2026-10-30。** 下列版本组合和 v3.12.3 源码构建
 > 步骤供配置环境时参考，不是构建版本白名单。使用 `DNNLROOT` 或显式路径选择
